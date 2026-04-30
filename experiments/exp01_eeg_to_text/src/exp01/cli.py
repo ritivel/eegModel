@@ -107,7 +107,7 @@ def _parse_cfg_key(key: str):
 
 
 def _step_overrides(args) -> dict:
-    """CLI ``--stage{1,2,3}-steps`` -> kwargs for CellConfig."""
+    """CLI overrides for CellConfig."""
     out = {}
     for stage in (1, 2, 3):
         v = getattr(args, f"stage{stage}_steps", None)
@@ -115,8 +115,14 @@ def _step_overrides(args) -> dict:
             out[f"stage{stage}_steps"] = int(v)
     if getattr(args, "batch_size", None) is not None:
         out["batch_size"] = int(args.batch_size)
+    if getattr(args, "grad_accum", None) is not None:
+        out["grad_accum"] = int(args.grad_accum)
+    if getattr(args, "num_workers", None) is not None:
+        out["num_workers"] = int(args.num_workers)
     if getattr(args, "no_lora", False):
         out["use_lora_in_stage3"] = False
+    if getattr(args, "no_grad_checkpoint", False):
+        out["use_gradient_checkpointing"] = False
     return out
 
 
@@ -284,8 +290,14 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
     for k, v in (step_overrides or {}).items():
         if k == "use_lora_in_stage3" and v is False:
             extra_args.append("--no-lora")
+        elif k == "use_gradient_checkpointing" and v is False:
+            extra_args.append("--no-grad-checkpoint")
         elif k == "batch_size":
             extra_args += ["--batch-size", str(v)]
+        elif k == "grad_accum":
+            extra_args += ["--grad-accum", str(v)]
+        elif k == "num_workers":
+            extra_args += ["--num-workers", str(v)]
         elif k.startswith("stage") and k.endswith("_steps"):
             extra_args += [f"--{k.replace('_', '-')}", str(v)]
 
@@ -417,8 +429,14 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--stage2-steps", type=int, default=None)
         p.add_argument("--stage3-steps", type=int, default=None)
         p.add_argument("--batch-size", type=int, default=None)
+        p.add_argument("--grad-accum", type=int, default=None)
+        p.add_argument("--num-workers", type=int, default=None,
+                       help="DataLoader worker processes (default 4)")
         p.add_argument("--no-lora", action="store_true",
                        help="Skip Stage 3 LoRA SFT")
+        p.add_argument("--no-grad-checkpoint", action="store_true",
+                       help="Disable gradient checkpointing on Gemma "
+                            "(faster but uses more memory; safe for soft-prompt cells on H100 80GB)")
 
     sp = sub.add_parser("train")
     sp.add_argument("cfg_key", help="encoder.bridge.input.fold (e.g. reve.linear.eeg.0)")

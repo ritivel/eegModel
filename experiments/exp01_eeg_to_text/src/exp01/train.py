@@ -120,9 +120,10 @@ def train(cfg: CellConfig) -> Path | None:
 
     def loader(ds, shuffle):
         return DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=shuffle, num_workers=2,
+            ds, batch_size=cfg.batch_size, shuffle=shuffle,
+            num_workers=cfg.num_workers,
             collate_fn=lambda b: _collate(b, tokenizer, target_sr=target_sr),
-            pin_memory=True,
+            pin_memory=True, persistent_workers=cfg.num_workers > 0,
         )
 
     train_dl = loader(train_ds, True)
@@ -219,7 +220,10 @@ def _run_stage(
         loss_acc = 0.0
         for _ in range(grad_accum):
             batch = next(it)
-            batch = {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in batch.items()}
+            batch = {
+                k: (v.to("cuda", non_blocking=True) if torch.is_tensor(v) else v)
+                for k, v in batch.items()
+            }
             out = model(
                 eeg=batch["eeg"], sr=batch["sr"], channels=batch["channels"],
                 text_input_ids=batch["text_input_ids"],

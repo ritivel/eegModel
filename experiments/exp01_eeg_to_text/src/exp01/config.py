@@ -80,6 +80,17 @@ class CellConfig:
     grad_accum: int = 4
     seed: int = 1234
 
+    # Activation checkpointing trades ~30-40% throughput for ~50% less memory.
+    # Soft-prompt cells (linear / qformer) fit comfortably on 80 GB H100 with
+    # bs=8 *without* checkpointing — turn it off for those. Vocab cells need
+    # it because the trainable extended embedding table eats 5+ GB extra of
+    # AdamW state.
+    use_gradient_checkpointing: bool = True
+
+    # DataLoader worker processes. Bumped from 2 -> 4 because larger batches
+    # need more parallel parquet decoding to keep the GPU fed.
+    num_workers: int = 4
+
     # Reproducibility
     split_seed: int = 20260430
 

@@ -130,13 +130,20 @@ def evaluate_cell(cfg: CellConfig, *, ckpt_path: Path | None = None) -> dict:
 
     tokenizer = model.dec.tokenizer
     target_sr = model.encoder.spec.native_sr
-    dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2,
-                    collate_fn=lambda b: _collate(b, tokenizer, target_sr=target_sr))
+    dl = DataLoader(
+        test_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers,
+        collate_fn=lambda b: _collate(b, tokenizer, target_sr=target_sr),
+        pin_memory=True, persistent_workers=cfg.num_workers > 0,
+    )
 
     # Collect predictions + metadata for every example.
     preds: list[dict] = []
     for batch in dl:
-        b_gpu = {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in batch.items()}
+        b_gpu = {
+            k: (v.to("cuda", non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in batch.items()
+        }
         try:
             gens = model.generate(eeg=b_gpu["eeg"], sr=b_gpu["sr"], channels=b_gpu["channels"])
         except Exception as e:

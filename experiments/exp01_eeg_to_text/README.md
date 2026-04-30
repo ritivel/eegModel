@@ -132,13 +132,13 @@ under `runs/<cell_id>/` still capture everything).
 ## Hyperparameters that often need tuning
 
 - `CellConfig.batch_size` × `grad_accum` — peaks at ~50 GB on H100 80 GB with
-  defaults (8 × 4); halve `batch_size` for 40 GB cards.
+defaults (8 × 4); halve `batch_size` for 40 GB cards.
 - `stage1_steps / stage2_steps / stage3_steps` — defaults are 2 k / 6 k / 4 k;
-  the smoke target is 20 / 20 / 10.
+the smoke target is 20 / 20 / 10.
 - `qformer_queries` (default 32) — tradeoff between context length and
-  bridge capacity for the Q-Former cells.
+bridge capacity for the Q-Former cells.
 - `rvq_codebook` (default 8192) — only relevant for off-diagonal vocab cells
-  (REVE × vocab and DIVER-1 × vocab).
+(REVE × vocab and DIVER-1 × vocab).
 
 ## Diagnostic commands
 
@@ -148,3 +148,4 @@ ls $EXP01_DATA_ROOT/runs/   # cells that have at least one stage checkpoint
 tail -f $EXP01_DATA_ROOT/runs/<cell_id>/log.jsonl  # live per-step training log
 python -c "import pyarrow.parquet as pq; pq.read_table('$EXP01_DATA_ROOT/eval/<cell_id>/predictions.parquet').to_pandas().head()"
 ```
+

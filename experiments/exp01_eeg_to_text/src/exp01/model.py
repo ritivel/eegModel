@@ -21,9 +21,9 @@ class EEG2Text(nn.Module):
         # Decoder. Frozen at construction; LoRA applied in stage 3 by the trainer.
         self.dec = decoder.load_decoder(cfg.decoder)
         decoder.freeze(self.dec.model)
-        # Activation checkpointing to fit ~5B-param Gemma 4 + a trainable
-        # extended embedding table on a single 80 GB H100.
-        if hasattr(self.dec.model, "gradient_checkpointing_enable"):
+        # Activation checkpointing trades throughput for memory; opt-in via
+        # CellConfig so soft-prompt cells (which fit easily) can run faster.
+        if cfg.use_gradient_checkpointing and hasattr(self.dec.model, "gradient_checkpointing_enable"):
             try:
                 self.dec.model.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False}
