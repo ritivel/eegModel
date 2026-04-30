@@ -69,7 +69,32 @@ Single-cell helpers for debugging:
 ```bash
 exp01 train reve.linear.eeg.0     # train one cell (encoder.bridge.input.fold)
 exp01 eval  reve.linear.eeg.0     # evaluate one cell
+
+# Override step counts / batch size / LoRA at the CLI:
+exp01 train reve.linear.eeg.0 --stage1-steps 100 --stage2-steps 400 --stage3-steps 200 --batch-size 1
+exp01 train tfm.vocab.eeg.0 --no-lora
 ```
+
+## Multi-machine pilot
+
+`exp01 pilot --parallel` round-robins one cell per visible GPU. To shard the
+pilot across two machines:
+
+```bash
+# Box A (8 GPUs): 5 cells in parallel.
+exp01 pilot --parallel \
+    --cells reve.linear.eeg.0,reve.qformer.eeg.0,reve.vocab.eeg.0,tfm.linear.eeg.0,tfm.qformer.eeg.0 \
+    --stage1-steps 100 --stage2-steps 400 --stage3-steps 200 --batch-size 1
+
+# Box B (1 GPU): the remaining cell.
+exp01 pilot --cells tfm.vocab.eeg.0 \
+    --stage1-steps 100 --stage2-steps 400 --stage3-steps 200 --batch-size 1
+```
+
+Both boxes log to the same W&B project (`exp01-eeg-to-text`); cell IDs are
+unique so the runs interleave naturally. `metrics.json` and
+`predictions.parquet` for each cell live under each box's
+`$EXP01_DATA_ROOT/eval/<cell_id>/` — collect them with `scp` or `rsync`.
 
 ## What lands where (per cell)
 
