@@ -1,42 +1,43 @@
-"""Local single-box storage layout.
+"""Local single-box storage layout (exp01).
 
-Everything lives under ``$EXP01_DATA_ROOT`` (default ``./data``):
+Thin wrapper around :mod:`eeg_common.storage` that binds an :class:`Storage`
+instance to ``$EXP01_DATA_ROOT`` (default ``./data``) and re-exports the
+old module-level constants and helpers so existing call-sites keep working.
 
-  $EXP01_DATA_ROOT/
-    hf/                          HuggingFace cache (models + dataset)
-    splits/                      per-fold split JSONs
-    runs/<cell_id>/              live training checkpoints + jsonl logs +
-                                 sample_gens.jsonl, stats.jsonl
-    eval/<cell_id>/              metrics.json + predictions.parquet
-    wandb/                       wandb local run dirs (synced to cloud)
+Layout::
+
+    $EXP01_DATA_ROOT/
+      hf/                          HuggingFace cache (models + dataset)
+      splits/                      per-fold split JSONs
+      runs/<cell_id>/              live training checkpoints + jsonl logs
+      eval/<cell_id>/              metrics.json + predictions.parquet
+      wandb/                       wandb local run dirs (synced to cloud)
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-DATA_ROOT = Path(os.environ.get("EXP01_DATA_ROOT", "./data")).expanduser().resolve()
+from eeg_common import storage as _common
+from eeg_common.storage import Storage
 
-HF_CACHE = DATA_ROOT / "hf"
-WANDB_DIR = DATA_ROOT / "wandb"
-SPLITS = DATA_ROOT / "splits"
-RUNS = DATA_ROOT / "runs"
-EVAL = DATA_ROOT / "eval"
+STORAGE: Storage = _common.from_env("EXP01_DATA_ROOT")
+
+DATA_ROOT: Path = STORAGE.data_root
+HF_CACHE: Path = STORAGE.hf_cache
+WANDB_DIR: Path = STORAGE.wandb_dir
+SPLITS: Path = STORAGE.splits
+RUNS: Path = STORAGE.runs
+EVAL: Path = STORAGE.eval
 
 
 def ensure_dirs() -> None:
-    for p in (HF_CACHE, WANDB_DIR, SPLITS, RUNS, EVAL):
-        p.mkdir(parents=True, exist_ok=True)
+    STORAGE.ensure_dirs()
 
 
 def cell_run_dir(cell_id: str) -> Path:
-    p = RUNS / cell_id
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return STORAGE.cell_run_dir(cell_id)
 
 
 def cell_eval_dir(cell_id: str) -> Path:
-    p = EVAL / cell_id
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return STORAGE.cell_eval_dir(cell_id)

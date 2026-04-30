@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exp02-eeg-ctc"
+version = "0.1.0"
+description = "Exp02 — single-stage end-to-end CTC training on top of pretrained EEG foundation models (REVE / TFM-Tokenizer / DIVER-1). Replaces exp01's 3-stage soft-prompt + frozen-LM curriculum with the standard ASR recipe (Wav2Vec2 + CTC + SpecAugment + CR-CTC + beam search + KenLM rescore). Mandatory §4.3 noise-twin matched pairs per Jo et al. (2024)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pavan Kalyan Tankala" }]
+
+# Shared building blocks (storage, preprocessing, splits, data, encoders) live
+# in the eeg-common package — installed editable from packages/eeg_common.
+dependencies = [
+  "eeg-common",
+  "torch>=2.4",
+  "transformers>=5.5",
+  "huggingface_hub>=0.25",
+  "safetensors>=0.4",
+  "einops>=0.8",
+  "scipy>=1.13",
+  "numpy>=1.26,<3",
+  "pyarrow>=16",
+  "scikit-learn>=1.4",
+  "sacrebleu>=2.4",
+  "rouge-score>=0.1.2",
+  "bert-score>=0.3.13",
+  "linear_attention_transformer>=0.19",
+  "wandb>=0.18",
+
+  # CTC-specific
+  "sentencepiece>=0.2",      # BPE-1k tokenizer (Wav2Vec2 / Whisper standard)
+
+  # Beam search + LM rescore. pyctcdecode picks up the optional kenlm wheel.
+  "pyctcdecode>=0.5",
+  "kenlm; python_version >= '3.10'",
+]
+
+[project.scripts]
+exp02 = "exp02.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eeg-common"
+version = "0.1.0"
+description = "Shared building blocks for the eegModel experiments: storage paths, EEG preprocessing pipelines, ZuCo / DERCo / EMMT data loaders, and pretrained-encoder loaders (REVE / TFM-Tokenizer / DIVER-1)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pavan Kalyan Tankala" }]
+
+dependencies = [
+  "torch>=2.4",
+  "transformers>=5.5",
+  "huggingface_hub>=0.25",
+  "safetensors>=0.4",
+  "einops>=0.8",
+  "scipy>=1.13",
+  "numpy>=1.26,<3",
+  "pyarrow>=16",
+  "peft>=0.12",
+  "linear_attention_transformer>=0.19",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

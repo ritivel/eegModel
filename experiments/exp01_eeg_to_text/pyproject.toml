@@ -12,7 +12,11 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Pavan Kalyan Tankala" }]
 
 # Hard floors: transformers>=5.5 ships Gemma 4; torch>=2.4 ships nn.RMSNorm.
+# Shared building blocks (storage, preprocessing, splits, data, encoders) live
+# in the eeg-common package — installed editable from packages/eeg_common via
+# the workspace setup (uv pip install -e ../../packages/eeg_common && uv pip install -e .).
 dependencies = [
+  "eeg-common",
   "torch>=2.4",
   "transformers>=5.5",
   "accelerate>=1.0",
