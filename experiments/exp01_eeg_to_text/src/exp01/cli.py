@@ -106,17 +106,31 @@ def _parse_cfg_key(key: str):
     return {"encoder": enc, "bridge": br, "input": inp, "fold": int(fold)}
 
 
+def _step_overrides(args) -> dict:
+    """CLI ``--stage{1,2,3}-steps`` -> kwargs for CellConfig."""
+    out = {}
+    for stage in (1, 2, 3):
+        v = getattr(args, f"stage{stage}_steps", None)
+        if v is not None:
+            out[f"stage{stage}_steps"] = int(v)
+    if getattr(args, "batch_size", None) is not None:
+        out["batch_size"] = int(args.batch_size)
+    if getattr(args, "no_lora", False):
+        out["use_lora_in_stage3"] = False
+    return out
+
+
 def _cmd_train(args):
     from .config import CellConfig
     from . import train as trainmod
-    cfg = CellConfig(**_parse_cfg_key(args.cfg_key))
+    cfg = CellConfig(**_parse_cfg_key(args.cfg_key), **_step_overrides(args))
     trainmod.train(cfg)
 
 
 def _cmd_eval(args):
     from .config import CellConfig
     from . import eval as evalmod
-    cfg = CellConfig(**_parse_cfg_key(args.cfg_key))
+    cfg = CellConfig(**_parse_cfg_key(args.cfg_key), **_step_overrides(args))
     summary = evalmod.evaluate_cell(cfg)
     for k, v in summary["scores"].items():
         print(f"  {k:>15s}: {v['mean']:.3f} [{v['ci_lo']:.3f}, {v['ci_hi']:.3f}]")
@@ -197,21 +211,31 @@ def _cmd_smoke(args):
 
 def _cmd_pilot(args):
     """§5.1 Phase 1: fold 0, EEG only, all (encoder × bridge) cells in the
-    selected encoder set. ``--parallel`` runs one cell per visible GPU."""
-    from .config import pilot_cells
+    selected encoder set. ``--parallel`` runs one cell per visible GPU.
+    ``--cells`` overrides which cells to run (comma-separated cfg_keys)."""
+    from .config import CellConfig, pilot_cells
 
     encs = tuple(e.strip() for e in args.encoders.split(",") if e.strip())
-    cells = pilot_cells(encoders=encs)
+    if args.cells:
+        keys = [c.strip() for c in args.cells.split(",") if c.strip()]
+        cells = [CellConfig(**_parse_cfg_key(k), **_step_overrides(args)) for k in keys]
+    else:
+        cells = [
+            CellConfig(encoder=c.encoder, bridge=c.bridge, input=c.input,
+                       fold=c.fold, decoder=c.decoder, **_step_overrides(args))
+            for c in pilot_cells(encoders=encs)
+        ]
 
     if args.parallel:
-        _run_parallel([c.cfg_key for c in cells], header="Pilot")
+        _run_parallel([c.cfg_key for c in cells], header="Pilot",
+                      step_overrides=_step_overrides(args))
         return
 
     from . import eval as evalmod
     from . import train as trainmod
     import traceback as _tb
 
-    print(f"Pilot: {len(cells)} cells (encoders={encs}), running sequentially.")
+    print(f"Pilot: {len(cells)} cells, running sequentially.")
     results = []
     for cfg in cells:
         print(f"\n=========== {cfg.cell_id} ===========", flush=True)
@@ -235,55 +259,65 @@ def _cmd_pilot(args):
             print(f"  {cid:<55s}  BLEU-1={b:.3f}  ROUGE-1-F={r:.3f}")
 
 
-def _run_parallel(cfg_keys: list[str], *, header: str):
+def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | None = None):
     """Spawn one ``exp01 train+eval`` subprocess per GPU, sharded round-robin
     across visible GPUs. Each process writes its own log to
     ``$EXP01_DATA_ROOT/runs/<cell_id>/run.log``.
     """
     import os
+    import shlex
     import subprocess
     import time
 
     n_gpus = _detect_gpu_count()
     if n_gpus == 0:
         raise SystemExit("No GPUs visible; --parallel requires at least one CUDA device.")
-    print(f"{header}: {len(cfg_keys)} cells across {n_gpus} GPU(s) (round-robin).")
+    print(f"{header}: {len(cfg_keys)} cells across {n_gpus} GPU(s) (round-robin).", flush=True)
 
     from . import storage
     storage.ensure_dirs()
 
+    extra_args = []
+    for k, v in (step_overrides or {}).items():
+        if k == "use_lora_in_stage3" and v is False:
+            extra_args.append("--no-lora")
+        elif k == "batch_size":
+            extra_args += ["--batch-size", str(v)]
+        elif k.startswith("stage") and k.endswith("_steps"):
+            extra_args += [f"--{k.replace('_', '-')}", str(v)]
+    extra = " " + " ".join(shlex.quote(a) for a in extra_args) if extra_args else ""
+
     procs = {}
-    queue = list(enumerate(cfg_keys))
+    queue = list(cfg_keys)
     next_gpu = 0
     completed = []
 
     while queue or procs:
-        # Fill GPUs.
         while queue and len(procs) < n_gpus:
-            i, key = queue.pop(0)
+            key = queue.pop(0)
             cell_id = _cfg_key_to_id(key)
             log_path = storage.RUNS / cell_id / "run.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(next_gpu % n_gpus)
-            cmd = ["exp01", "train", key]
-            cmd2 = ["exp01", "eval", key]
-            print(f"  [GPU{env['CUDA_VISIBLE_DEVICES']}] launching train+eval {cell_id}", flush=True)
-            with open(log_path, "w") as f:
-                p = subprocess.Popen(
-                    f"set -e; {' '.join(cmd)}; {' '.join(cmd2)}",
-                    shell=True, env=env, stdout=f, stderr=subprocess.STDOUT,
-                )
-            procs[p.pid] = (p, cell_id, log_path, env["CUDA_VISIBLE_DEVICES"])
+            shell_cmd = (f"set -e; "
+                         f"exp01 train {shlex.quote(key)}{extra} && "
+                         f"exp01 eval  {shlex.quote(key)}{extra}")
+            print(f"  [GPU{env['CUDA_VISIBLE_DEVICES']}] launching {cell_id}", flush=True)
+            f = open(log_path, "w")
+            p = subprocess.Popen(shell_cmd, shell=True, env=env,
+                                 stdout=f, stderr=subprocess.STDOUT)
+            procs[p.pid] = (p, cell_id, log_path, env["CUDA_VISIBLE_DEVICES"], f)
             next_gpu += 1
 
-        # Wait for any to finish.
-        time.sleep(5)
+        time.sleep(10)
         done = [pid for pid, (p, *_rest) in procs.items() if p.poll() is not None]
         for pid in done:
-            p, cell_id, log_path, gpu = procs.pop(pid)
+            p, cell_id, log_path, gpu, f = procs.pop(pid)
+            f.close()
             ok = p.returncode == 0
-            print(f"  [GPU{gpu}] {'OK ' if ok else 'FAIL'} {cell_id} (rc={p.returncode}); log: {log_path}", flush=True)
+            print(f"  [GPU{gpu}] {'OK ' if ok else 'FAIL'} {cell_id} (rc={p.returncode}); "
+                  f"log: {log_path}", flush=True)
             completed.append((cell_id, ok))
 
     print(f"\n=== {header} summary: {sum(1 for _, ok in completed if ok)}/{len(completed)} succeeded ===")
@@ -366,19 +400,32 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("inspect-channels").set_defaults(func=_cmd_inspect_channels)
     sub.add_parser("smoke").set_defaults(func=_cmd_smoke)
 
+    def _step_flags(p):
+        p.add_argument("--stage1-steps", type=int, default=None)
+        p.add_argument("--stage2-steps", type=int, default=None)
+        p.add_argument("--stage3-steps", type=int, default=None)
+        p.add_argument("--batch-size", type=int, default=None)
+        p.add_argument("--no-lora", action="store_true",
+                       help="Skip Stage 3 LoRA SFT")
+
     sp = sub.add_parser("train")
     sp.add_argument("cfg_key", help="encoder.bridge.input.fold (e.g. reve.linear.eeg.0)")
+    _step_flags(sp)
     sp.set_defaults(func=_cmd_train)
 
     sp = sub.add_parser("eval")
     sp.add_argument("cfg_key")
+    _step_flags(sp)
     sp.set_defaults(func=_cmd_eval)
 
     sp = sub.add_parser("pilot")
     sp.add_argument("--encoders", default="reve,tfm",
                     help="comma-separated subset of {reve,diver1,tfm}")
+    sp.add_argument("--cells", default=None,
+                    help="comma-separated cfg_keys (overrides --encoders)")
     sp.add_argument("--parallel", action="store_true",
                     help="Run one cell per visible GPU (round-robin) as subprocesses")
+    _step_flags(sp)
     sp.set_defaults(func=_cmd_pilot)
 
     sp = sub.add_parser("full")
