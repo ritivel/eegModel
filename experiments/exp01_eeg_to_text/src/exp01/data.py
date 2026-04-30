@@ -297,6 +297,17 @@ class EEGSentenceDataset:
         # Index = (file_idx, row_group_idx, row_in_group_idx) for every row
         # that survives the filters. Row-group bookkeeping matters because
         # ZuCo parquets sometimes have multiple row groups.
+        #
+        # IMPORTANT: at filter-time we read ONLY cheap metadata columns
+        # (sentence_text, participant_id, num_channels, num_words). Reading
+        # ``word_eeg_segments`` here would load ~500 MB per DERCo row group
+        # because each row carries 372–451 × 32-ch × ~100-sample fragments
+        # — that turned the constructor into a multi-minute hang. We trust
+        # the schema invariant for the 3 word-level-only sources (DERCo /
+        # EMMT / eeg_sem_relev): every row in those parquets has a populated
+        # ``word_eeg_segments``. The shape-degenerate check moves to
+        # ``__getitem__`` so a stray malformed row just returns a tiny
+        # placeholder rather than blocking the whole filter scan.
         self._index: list[tuple[int, int, int]] = []
         per_source_kept: dict[str, int] = {}
         per_source_total: dict[str, int] = {}
@@ -311,14 +322,9 @@ class EEGSentenceDataset:
             kept = 0; total = 0
             for rg_idx in range(pf.num_row_groups):
                 try:
-                    cols = ["sentence_text", "participant_id",
-                            "num_channels", "num_words"]
-                    if word_level_source:
-                        # We need to peek at word_eeg_segments to know whether
-                        # the row has any EEG at all. Keep this read narrow
-                        # (only for the ~2k rows in DERCo/EMMT/sem_relev).
-                        cols.append("word_eeg_segments")
-                    t = pf.read_row_group(rg_idx, columns=cols)
+                    t = pf.read_row_group(
+                        rg_idx, columns=["sentence_text", "participant_id",
+                                         "num_channels", "num_words"])
                 except Exception as e:
                     print(f"[data] WARN: failed to read rg{rg_idx} of {f.name}: {e}",
                           flush=True)
@@ -327,13 +333,9 @@ class EEGSentenceDataset:
                 pids = t["participant_id"].to_pylist()
                 ncs = t["num_channels"].to_pylist()
                 nws = t["num_words"].to_pylist()
-                if word_level_source:
-                    word_segs = t["word_eeg_segments"].to_pylist()
-                else:
-                    word_segs = [None] * len(texts)
                 total += len(texts)
-                for ri_in_rg, (text, pid, nc, nw, ws) in enumerate(
-                        zip(texts, pids, ncs, nws, word_segs)):
+                for ri_in_rg, (text, pid, nc, nw) in enumerate(
+                        zip(texts, pids, ncs, nws)):
                     if self.subject_filter and str(pid) not in self.subject_filter:
                         continue
                     if self.sentence_filter and _hash(text or "") not in self.sentence_filter:
@@ -341,15 +343,14 @@ class EEGSentenceDataset:
                     if (nc or 0) < 2:
                         per_file_degenerate += 1
                         continue
-                    if word_level_source:
-                        # Accept iff at least one word segment is non-empty.
-                        if not ws or not any(seg for seg in ws):
-                            per_file_degenerate += 1
-                            continue
-                    else:
-                        if (nw or 0) < 1:
-                            per_file_degenerate += 1
-                            continue
+                    if not word_level_source and (nw or 0) < 1:
+                        # ZuCo rows drop on num_words<1 (likely a row whose
+                        # alignment failed during the original conversion).
+                        # For the 3 word-only sources we KEEP the row even
+                        # when num_words==0 because the column is unreliable
+                        # there — see audit in next_experiments.md §2.
+                        per_file_degenerate += 1
+                        continue
                     self._index.append((fi, rg_idx, ri_in_rg))
                     kept += 1
             per_source_kept[src] = per_source_kept.get(src, 0) + kept
@@ -437,7 +438,13 @@ def _row_to_array(row: dict):
     """Extract a (channels, time) float32 array from a unified-schema row.
 
     Prefers ``sentence_eeg`` (channels-first, full sentence) when available
-    (ZuCo); falls back to concatenating ``word_eeg_segments`` along time.
+    (ZuCo); falls back to concatenating ``word_eeg_segments`` along time
+    (DERCo, EMMT, eeg_sem_relev — see §2 of next_experiments.md). A row
+    whose neither column has usable EEG returns a (n_channels, min_T)
+    zero placeholder so the collator's pad step doesn't crash; the
+    pre-fix ``num_channels<2`` filter at construction time should already
+    have dropped these, so the placeholder is just a defence-in-depth
+    against malformed shards.
     """
     if row.get("sentence_eeg"):
         # list[list[float]] of shape [channels][time]
@@ -445,14 +452,23 @@ def _row_to_array(row: dict):
 
     segs = row.get("word_eeg_segments") or []
     arrs = []
+    n_channels_seen = 0
     for w in segs:
         if not w:
             continue
         a = np.asarray(w, dtype="float32")  # (channels, time_w)
         if a.ndim == 2:
             arrs.append(a)
+            n_channels_seen = max(n_channels_seen, a.shape[0])
     if not arrs:
-        # 1-channel zero placeholder; collator will skip.
-        return np.zeros((1, 1), dtype="float32")
+        # placeholder: collator will pad up to min_T=200; keeps shapes sane.
+        c = max(int(row.get("num_channels") or 1), 1)
+        return np.zeros((c, 1), dtype="float32")
+    if len({a.shape[0] for a in arrs}) > 1:
+        # DERCo / sem_relev: all segs SHOULD share channel count, but if a
+        # subset is malformed, drop the bad ones and concatenate the rest.
+        arrs = [a for a in arrs if a.shape[0] == n_channels_seen]
+        if not arrs:
+            return np.zeros((n_channels_seen, 1), dtype="float32")
     # All segments share channels by construction; widths vary. Concatenate.
     return np.concatenate(arrs, axis=1)
