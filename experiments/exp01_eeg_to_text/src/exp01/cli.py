@@ -133,6 +133,8 @@ def _cmd_smoke(args):
                    stage1_steps=20, stage2_steps=20, stage3_steps=10,
                    batch_size=2, grad_accum=1),
     ]
+    import traceback as _tb
+
     fails = []
     for cfg in cells:
         print(f"\n========== SMOKE: {cfg.cell_id} ==========\n", flush=True)
@@ -142,6 +144,7 @@ def _cmd_smoke(args):
         except Exception as e:
             fails.append((cfg.cell_id, repr(e)))
             print(f"FAILED: {e}", flush=True)
+            _tb.print_exc()
             continue
 
         run_dir = storage.cell_run_dir(cfg.cell_id)
@@ -191,6 +194,8 @@ def _cmd_pilot(args):
     cells = pilot_cells(encoders=encs)
     print(f"Pilot: {len(cells)} cells (encoders={encs}), running sequentially.")
 
+    import traceback as _tb
+
     results = []
     for cfg in cells:
         print(f"\n=========== {cfg.cell_id} ===========", flush=True)
@@ -201,6 +206,7 @@ def _cmd_pilot(args):
                             summary["scores"]["rouge1_f"]["mean"]))
         except Exception as e:
             print(f"  FAIL: {type(e).__name__}: {e}", flush=True)
+            _tb.print_exc()
             results.append((cfg.cell_id, None, None))
 
     print("\n=== Pilot ranking (BLEU-1) ===")

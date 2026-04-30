@@ -74,13 +74,20 @@ class REVEEncoder(EEGEncoder):
         positions = self.pos_bank(norm_channels)                  # (C, 3)
         positions = positions.to(eeg.device).unsqueeze(0).expand(eeg.size(0), -1, -1)
         out = self.model(eeg, positions)
-        # REVE's forward can return a raw Tensor or a dict / ModelOutput
-        # depending on the version. Normalise to (B, T_seq, D).
+        # REVE's forward returns either a raw Tensor or a HF ModelOutput.
+        # Native shape is ``(B, C, T_patches, D)`` (one token per channel ×
+        # patch); flatten to ``(B, C * T_patches, D)`` so downstream bridges
+        # see a single sequence dim.
         if isinstance(out, torch.Tensor):
-            return out
-        if isinstance(out, dict):
-            return out.get("last_hidden_state", out.get("hidden_states", out))
-        return getattr(out, "last_hidden_state", out)
+            feats = out
+        elif isinstance(out, dict):
+            feats = out.get("last_hidden_state", out.get("hidden_states", out))
+        else:
+            feats = getattr(out, "last_hidden_state", out)
+        if feats.dim() == 4:
+            B, C, T_p, D = feats.shape
+            feats = feats.reshape(B, C * T_p, D)
+        return feats
 
 
 def _normalize_channel_for_reve(name: str) -> str:
