@@ -1,11 +1,23 @@
-"""End-to-end EEG2Text wrapper. Composes encoder + bridge + decoder."""
+"""End-to-end EEG2Text wrapper. Composes encoder + bridge + decoder.
+
+Three forward paths:
+  * Soft-prompt (linear / qformer): encoder -> bridge -> Gemma `inputs_embeds`
+    via an embed-layer hook (PLE-safe). Trains LM cross-entropy on the text.
+  * Vocab (vocab / RVQ + vocab): encoder -> discrete ids -> Gemma input_ids
+    using an extended embedding table.
+  * **CTC** (ctc): encoder -> CTC head over a small character vocabulary.
+    No decoder LM in the loop during training. Trains ``F.ctc_loss``;
+    decode at eval time with greedy CTC. This is the ASR-style track —
+    by construction it can't lapse onto an LM prior because there is no
+    LM. See chars.py and bridges.CTCBridge for details.
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from . import bridges, decoder, encoders
+from . import bridges, chars, decoder, encoders
 from .config import CellConfig
 
 
@@ -18,18 +30,20 @@ class EEG2Text(nn.Module):
         self.encoder = encoders.load_encoder(cfg.encoder)
         decoder.freeze(self.encoder)
 
-        # Decoder. Frozen at construction; LoRA applied in stage 3 by the trainer.
-        self.dec = decoder.load_decoder(cfg.decoder)
-        decoder.freeze(self.dec.model)
-        # Activation checkpointing trades throughput for memory; opt-in via
-        # CellConfig so soft-prompt cells (which fit easily) can run faster.
-        if cfg.use_gradient_checkpointing and hasattr(self.dec.model, "gradient_checkpointing_enable"):
-            try:
-                self.dec.model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False}
-                )
-            except TypeError:
-                self.dec.model.gradient_checkpointing_enable()
+        # Decoder loading is conditional. CTC cells don't need an LM at all,
+        # so we save ~5 GB of weights + the ~2 s tokenizer load.
+        self.is_ctc = cfg.bridge == "ctc"
+        self.dec = None
+        if not self.is_ctc:
+            self.dec = decoder.load_decoder(cfg.decoder)
+            decoder.freeze(self.dec.model)
+            if cfg.use_gradient_checkpointing and hasattr(self.dec.model, "gradient_checkpointing_enable"):
+                try:
+                    self.dec.model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+                except TypeError:
+                    self.dec.model.gradient_checkpointing_enable()
 
         # Vocab extension is required for vocab bridges.
         self.vocab_offset = 0
@@ -42,13 +56,17 @@ class EEG2Text(nn.Module):
         if cfg.bridge == "vocab" and not self.encoder.spec.discrete:
             self.rvq = bridges.RVQHead(d_in=self.encoder.spec.feature_dim, codebook_size=cfg.rvq_codebook)
 
+        # ``d_lm`` is irrelevant for CTC (no LM); set to 0 so the bridge
+        # factory doesn't waste params on a non-existent projection.
+        d_lm = self.dec.embed_dim if self.dec is not None else 0
         self.bridge = bridges.build_bridge(
             kind=cfg.bridge,
             d_in=self.encoder.spec.feature_dim,
-            d_lm=self.dec.embed_dim,
+            d_lm=d_lm,
             n_queries=cfg.qformer_queries,
             codebook_size=self._codebook_size(),
             vocab_offset=self.vocab_offset,
+            ctc_vocab_size=chars.VOCAB_SIZE if self.is_ctc else 0,
         )
 
     def _codebook_size(self) -> int:
@@ -65,15 +83,21 @@ class EEG2Text(nn.Module):
         eeg: torch.Tensor,         # (B, C, T) float
         sr: float,                 # batch-wise sampling rate
         channels: list[str],       # batch-wise channel names
-        text_input_ids: torch.LongTensor,   # (B, L)
-        text_attention_mask: torch.LongTensor,
-        labels: torch.LongTensor,           # (B, L) with -100 on prompt tokens
+        text_input_ids: torch.LongTensor,   # (B, L)   ignored for CTC
+        text_attention_mask: torch.LongTensor,        # ignored for CTC
+        labels: torch.LongTensor,                     # ignored for CTC
+        text: list[str] | None = None,                # required for CTC
     ):
         # 1) Encoder features.
         with torch.no_grad():
             feats = self.encoder.encode(eeg, sr, channels)   # (B, T_seq, d_in)
 
-        # 2) Bridge.
+        # 2) Bridge / loss path.
+        if self.cfg.bridge == "ctc":
+            tag, logits = self.bridge(feats)              # (B, T_seq, V)
+            self._stash_aux_ctc(logits=logits, text=text)
+            return _CTCForwardOutput(logits=logits)
+
         if self.cfg.bridge == "vocab":
             if self.encoder.spec.discrete:
                 ids = self.encoder.tokenize(eeg, sr, channels)
@@ -220,6 +244,12 @@ class EEG2Text(nn.Module):
     @torch.no_grad()
     def generate(self, eeg, sr, channels, *, max_new_tokens: int = 64) -> list[str]:
         feats = self.encoder.encode(eeg, sr, channels)
+        if self.cfg.bridge == "ctc":
+            tag, logits = self.bridge(feats)                  # (B, T, V)
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            ids_per_row = chars.ctc_greedy_decode(log_probs)
+            return [chars.decode_ids(ids) for ids in ids_per_row]
+
         if self.cfg.bridge == "vocab":
             if self.encoder.spec.discrete:
                 ids = self.encoder.tokenize(eeg, sr, channels)
@@ -281,6 +311,10 @@ class EEG2Text(nn.Module):
           gradients for the *original* (frozen) rows — the new rows learn,
           the old rows don't (no AdamW updates because grad is identically 0).
         - Off-diagonal vocab (REVE/DIVER-1 × vocab): also train the RVQ head.
+        - **CTC**: just the bridge (Transformer + head). No LM / no RVQ.
+          The same param set is used for stages 1, 2, 3 — the 3-stage
+          schedule is meaningless for CTC, but we honour the contract so
+          the trainer doesn't have to special-case the cell.
         """
         ps = list(self.bridge.parameters())
         if self.rvq is not None:
@@ -303,9 +337,49 @@ class EEG2Text(nn.Module):
         """Stage 2 — frozen-LM SFT: same as Stage 1 (bridge / RVQ / new vocab
         rows). The "frozen-LM" name refers to the *pretrained* Gemma weights
         staying frozen; new vocab rows for vocab cells are still trained.
+        For CTC: same as Stage 1 (no LM in the loop anyway).
         """
         return self.trainables_stage1()
 
     def trainables_stage3(self):
-        """Stage 3 — LoRA SFT: PEFT-injected LoRA params + bridge."""
+        """Stage 3 — LoRA SFT: PEFT-injected LoRA params + bridge.
+
+        For CTC there is no LM and therefore no LoRA — return the same
+        bridge params as stages 1/2 so AdamW keeps refining them. We
+        rely on ``cfg.use_lora_in_stage3=False`` (set automatically for
+        CTC cells in CellConfig) to skip the LoRA-attach step in train.py.
+        """
+        if self.cfg.bridge == "ctc":
+            return self.trainables_stage1()
         return [p for p in self.parameters() if p.requires_grad]
+
+    # ------------------------------------------------------------------
+    # CTC-specific aux stash: keep the latest logits + targets so the
+    # trainer can compute F.ctc_loss without changing the public forward
+    # signature.
+    # ------------------------------------------------------------------
+
+    def _stash_aux_ctc(self, *, logits: torch.Tensor, text: list[str] | None) -> None:
+        self._last_aux = {
+            "ctc_logits": logits,
+            "ctc_text": text,
+            "bridge_pooled": None,
+            "text_pooled": None,
+            "commit_loss": 0.0,
+        }
+
+
+class _CTCForwardOutput:
+    """Drop-in replacement for HF's CausalLMOutput in the CTC path.
+
+    The trainer expects ``out.loss`` on the return value, but for CTC
+    we compute the loss in the trainer itself (it needs target lengths
+    that aren't known here). So this container just carries the logits
+    and exposes a sentinel ``loss=None`` — the trainer detects ``None``
+    and uses ``F.ctc_loss(...)`` instead.
+    """
+    __slots__ = ("loss", "logits")
+
+    def __init__(self, logits: torch.Tensor):
+        self.loss = None
+        self.logits = logits

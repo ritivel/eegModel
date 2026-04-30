@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from . import data, decoder, preprocessing, storage
+from . import chars, data, decoder, preprocessing, storage
 from .config import CellConfig
 from .model import EEG2Text
 
@@ -139,7 +139,21 @@ def train(cfg: CellConfig) -> Path | None:
     )
 
     model = EEG2Text(cfg).to("cuda")
-    tokenizer = model.dec.tokenizer
+    # CTC cells run without a decoder LM, so there's no Gemma tokenizer
+    # available. We still need *some* tokenizer for the collator's text
+    # padding pipeline (the LM-loss path uses these tensors); for CTC
+    # they're computed but unused. Use Gemma's tokenizer regardless —
+    # it's just used to pad ``text_input_ids`` to a uniform length, the
+    # actual CTC targets are character-encoded in the trainer below.
+    if model.dec is not None:
+        tokenizer = model.dec.tokenizer
+    else:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.decoder, cache_dir=str(storage.HF_CACHE), padding_side="left",
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
     target_sr = model.encoder.spec.native_sr
 
     def loader(ds, shuffle):
@@ -160,8 +174,10 @@ def train(cfg: CellConfig) -> Path | None:
         "event": "init", "n_train": len(train_ds), "n_dev": len(dev_ds),
         "encoder_feature_dim": model.encoder.spec.feature_dim,
         "encoder_native_sr": model.encoder.spec.native_sr,
-        "decoder_vocab_size": model.dec.vocab_size,
+        "decoder_vocab_size": (model.dec.vocab_size if model.dec is not None
+                               else chars.VOCAB_SIZE),
         "vocab_offset": model.vocab_offset,
+        "is_ctc": model.is_ctc,
         "trainable_params_stage1": _count(model.trainables_stage1()),
     }) + "\n")
     log.flush()
@@ -199,8 +215,22 @@ def train(cfg: CellConfig) -> Path | None:
     _save(model, cfg, run_dir / "model_stage2.pt", log, wb, name="stage2")
 
     # ---- Stage 3: LoRA SFT (optional) --------------------------------------
-    if cfg.use_lora_in_stage3:
+    # CTC cells skip LoRA entirely: no LM in the loop. We instead reuse the
+    # stage-3 budget on the same CTC bridge params at the same low LR — gives
+    # a fine-tuning tail that matches what the soft-prompt cells do.
+    if cfg.use_lora_in_stage3 and not model.is_ctc:
         model.dec.model = decoder.attach_lora(model.dec.model, r=cfg.lora_r, alpha=cfg.lora_alpha)
+        _run_stage(
+            model=model, dl=train_dl,
+            params=model.trainables_stage3(),
+            steps=cfg.stage3_steps, lr=cfg.stage3_lr,
+            grad_accum=cfg.grad_accum, log=log, samples_log=samples_log,
+            stats_log=stats_log, wb=wb, name="stage3",
+            dev_samples=dev_samples, generate_every=max(1, cfg.stage3_steps // 4),
+            align_weight=0.0, align_temperature=cfg.stage1_align_temperature,
+            rvq_commit_weight=0.0,
+        )
+    elif model.is_ctc and cfg.stage3_steps > 0:
         _run_stage(
             model=model, dl=train_dl,
             params=model.trainables_stage3(),
@@ -253,6 +283,8 @@ def _run_stage(
         "rvq_commit_weight": rvq_commit_weight,
     }) + "\n"); log.flush()
 
+    is_ctc = getattr(model, "is_ctc", False)
+
     for step in range(1, steps + 1):
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
@@ -269,7 +301,30 @@ def _run_stage(
                 text_input_ids=batch["text_input_ids"],
                 text_attention_mask=batch["text_attention_mask"],
                 labels=batch["labels"],
+                text=batch.get("text"),
             )
+
+            if is_ctc:
+                # F.ctc_loss expects log-probabilities of shape (T, B, V),
+                # plus 1-D targets and per-row input/target lengths.
+                logits = out.logits                                 # (B, T, V)
+                B, T, _ = logits.shape
+                log_probs = torch.log_softmax(logits.float(), dim=-1).transpose(0, 1)
+                input_lengths = torch.full((B,), T, dtype=torch.long,
+                                           device=logits.device)
+                targets, target_lengths = chars.encode_batch(
+                    batch["text"], device=logits.device)
+                # ``zero_infinity=True`` defends against impossibly short
+                # input frames vs target lengths (otherwise CTC returns inf).
+                lm_loss = F.ctc_loss(
+                    log_probs, targets, input_lengths, target_lengths,
+                    blank=chars.BLANK_ID, zero_infinity=True,
+                )
+                (lm_loss / grad_accum).backward()
+                loss_acc += float(lm_loss.detach())
+                # CTC has no align / commit / RVQ losses.
+                continue
+
             lm_loss = out.loss
             extra = []
 

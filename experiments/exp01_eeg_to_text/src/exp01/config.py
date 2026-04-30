@@ -13,7 +13,7 @@ from typing import Literal
 # ---- Closed sets -------------------------------------------------------------
 
 Encoder = Literal["reve", "diver1", "tfm"]
-Bridge = Literal["linear", "qformer", "vocab"]
+Bridge = Literal["linear", "qformer", "vocab", "ctc"]
 Input = Literal["eeg", "noise_train", "noise_test"]  # Jo et al. (2024) §4.3
 
 # ---- Model registry ----------------------------------------------------------

@@ -146,15 +146,69 @@ class RVQHead(nn.Module):
 
 
 # ============================================================================
+# 5. CTC head — ASR-style direct EEG -> text-token decoding
+# ============================================================================
+
+
+class CTCBridge(nn.Module):
+    """ASR-style CTC head over encoder features.
+
+    Maps encoder features ``(B, T_seq, D)`` to per-frame log-probabilities
+    over a small character vocabulary (see ``chars.py``), then training
+    minimises ``F.ctc_loss``. There is **no decoder LM in the loop during
+    training** — so the LM-prior trap that dominates the soft-prompt
+    cells (matched-pair §4.3 result in results.md) is impossible by
+    construction. If the EEG carries any information about the text, the
+    CTC matrix will reflect it.
+
+    Architecture:
+      RMSNorm -> Linear(D -> hidden) -> n_layers x TransformerEncoderLayer
+      -> Linear(hidden, vocab_size)
+
+    Returns ``("ctc_logits", logits)`` where logits has shape
+    ``(B, T_seq, vocab_size)`` (not log-softmaxed; trainer applies
+    ``log_softmax`` and feeds to ``F.ctc_loss``).
+    """
+
+    def __init__(self, d_in: int, vocab_size: int, *,
+                 hidden: int = 512, n_layers: int = 2, n_heads: int = 8,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.norm = nn.RMSNorm(d_in)
+        self.proj_in = nn.Linear(d_in, hidden, bias=False)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=n_heads, dim_feedforward=4 * hidden,
+            dropout=dropout, batch_first=True, norm_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.head = nn.Linear(hidden, vocab_size)
+
+    def forward(self, features: torch.Tensor) -> tuple[str, torch.Tensor]:
+        # features: (B, T_seq, D)
+        x = self.norm(features)
+        x = self.proj_in(x)
+        x = self.encoder(x)
+        logits = self.head(x)
+        return ("ctc_logits", logits)
+
+
+# ============================================================================
 # Factory
 # ============================================================================
 
 
-def build_bridge(*, kind: str, d_in: int, d_lm: int, n_queries: int, codebook_size: int, vocab_offset: int):
+def build_bridge(*, kind: str, d_in: int, d_lm: int, n_queries: int,
+                 codebook_size: int, vocab_offset: int,
+                 ctc_vocab_size: int = 0):
     if kind == "linear":
         return LinearBridge(d_in=d_in, d_lm=d_lm, n_soft_tokens=n_queries)
     if kind == "qformer":
         return QFormerBridge(d_in=d_in, d_lm=d_lm, n_queries=n_queries)
     if kind == "vocab":
         return VocabBridge(codebook_size=codebook_size, vocab_offset=vocab_offset)
+    if kind == "ctc":
+        if ctc_vocab_size <= 0:
+            raise ValueError("CTC bridge requires ctc_vocab_size > 0")
+        return CTCBridge(d_in=d_in, vocab_size=ctc_vocab_size)
     raise ValueError(f"unknown bridge: {kind}")

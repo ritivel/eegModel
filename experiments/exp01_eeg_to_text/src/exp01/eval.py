@@ -48,20 +48,67 @@ def _sentence_rouge1(hyp: str, ref: str, scorer) -> float:
     return float(scorer.score(ref, hyp)["rouge1"].fmeasure)
 
 
+def _edit_distance(a: list, b: list) -> int:
+    """Levenshtein distance. Used by CER (chars) and WER (words)."""
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    la, lb = len(a), len(b)
+    prev = list(range(lb + 1))
+    cur = [0] * (lb + 1)
+    for i in range(1, la + 1):
+        cur[0] = i
+        ai = a[i - 1]
+        for j in range(1, lb + 1):
+            cur[j] = min(
+                prev[j] + 1,
+                cur[j - 1] + 1,
+                prev[j - 1] + (0 if ai == b[j - 1] else 1),
+            )
+        prev, cur = cur, prev
+    return prev[lb]
+
+
+def _sentence_cer(hyp: str, ref: str) -> float:
+    h = hyp.lower()
+    r = ref.lower()
+    if not r:
+        return 0.0 if not h else 1.0
+    return _edit_distance(list(h), list(r)) / max(1, len(r))
+
+
+def _sentence_wer(hyp: str, ref: str) -> float:
+    h = hyp.lower().split()
+    r = ref.lower().split()
+    if not r:
+        return 0.0 if not h else 1.0
+    return _edit_distance(h, r) / max(1, len(r))
+
+
 def per_sentence_scores(hyps: list[str], refs: list[str]) -> dict[str, np.ndarray]:
-    """All six metrics at the sentence level. BERTScore failures are
-    tolerated — they just mark that metric as missing in the summary."""
+    """Per-sentence metrics. BLEU-1..4, ROUGE-1-F, BERTScore-F1, CER, WER.
+    BERTScore failures are tolerated — they just mark that metric as missing.
+
+    CER + WER are added so the CTC track has its native quality metric
+    (CER is the right diagnostic for character-level CTC; the noise
+    baseline should sit at ~CER=1 because the CTC head, with no LM
+    inside, has no language prior to fall back to)."""
     from rouge_score.rouge_scorer import RougeScorer
 
     rouge = RougeScorer(["rouge1"], use_stemmer=True)
 
     out: dict[str, list[float]] = {f"bleu{n}": [] for n in (1, 2, 3, 4)}
     out["rouge1_f"] = []
+    out["cer"] = []
+    out["wer"] = []
 
     for h, r in zip(hyps, refs):
         for n in (1, 2, 3, 4):
             out[f"bleu{n}"].append(_sentence_bleu(h, r, n))
         out["rouge1_f"].append(_sentence_rouge1(h, r, rouge))
+        out["cer"].append(_sentence_cer(h, r))
+        out["wer"].append(_sentence_wer(h, r))
 
     try:
         from bert_score import score as bertscore
@@ -136,9 +183,10 @@ def evaluate_cell(cfg: CellConfig, *, ckpt_path: Path | None = None) -> dict:
     # prefix — including the trained extended-vocab embedding rows. Without
     # re-attaching LoRA here, ``load_state_dict(strict=False)`` silently drops
     # ALL of those keys and eval runs on a fresh-from-pretrained decoder with
-    # random vocab rows + zero LoRA. Detect that case and rewrap.
+    # random vocab rows + zero LoRA. Detect that case and rewrap. CTC cells
+    # don't have a decoder, so this branch is skipped for them.
     has_lora_keys = any("lora_" in k for k in sd.keys())
-    if has_lora_keys:
+    if has_lora_keys and not model.is_ctc:
         model.dec.model = decoder.attach_lora(
             model.dec.model, r=cfg.lora_r, alpha=cfg.lora_alpha
         )
@@ -164,7 +212,18 @@ def evaluate_cell(cfg: CellConfig, *, ckpt_path: Path | None = None) -> dict:
             print(f"[eval]   first 5 unexpected: {unexpected[:5]}", flush=True)
     model.eval()
 
-    tokenizer = model.dec.tokenizer
+    # CTC cells don't load a decoder; use the configured Gemma tokenizer
+    # purely for the collator's text-padding step (the actual CTC targets
+    # are character-encoded inside the loss function).
+    if model.dec is not None:
+        tokenizer = model.dec.tokenizer
+    else:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.decoder, cache_dir=str(storage.HF_CACHE), padding_side="left",
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
     target_sr = model.encoder.spec.native_sr
     dl = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
