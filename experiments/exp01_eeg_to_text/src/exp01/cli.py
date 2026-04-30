@@ -260,12 +260,15 @@ def _cmd_pilot(args):
 
 
 def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | None = None):
-    """Spawn one ``exp01 train+eval`` subprocess per GPU, sharded round-robin
-    across visible GPUs. Each process writes its own log to
+    """Spawn one ``train+eval`` subprocess per GPU, sharded round-robin across
+    visible GPUs. Each process writes its own log to
     ``$EXP01_DATA_ROOT/runs/<cell_id>/run.log``.
+
+    Uses ``sys.executable -m exp01.cli`` so the subprocess works regardless of
+    whether the ``exp01`` console script is on PATH.
     """
     import os
-    import shlex
+    import sys
     import subprocess
     import time
 
@@ -277,7 +280,7 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
     from . import storage
     storage.ensure_dirs()
 
-    extra_args = []
+    extra_args: list[str] = []
     for k, v in (step_overrides or {}).items():
         if k == "use_lora_in_stage3" and v is False:
             extra_args.append("--no-lora")
@@ -285,12 +288,11 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
             extra_args += ["--batch-size", str(v)]
         elif k.startswith("stage") and k.endswith("_steps"):
             extra_args += [f"--{k.replace('_', '-')}", str(v)]
-    extra = " " + " ".join(shlex.quote(a) for a in extra_args) if extra_args else ""
 
-    procs = {}
+    procs: dict[int, tuple] = {}
     queue = list(cfg_keys)
     next_gpu = 0
-    completed = []
+    completed: list[tuple[str, bool]] = []
 
     while queue or procs:
         while queue and len(procs) < n_gpus:
@@ -300,11 +302,16 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
             log_path.parent.mkdir(parents=True, exist_ok=True)
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(next_gpu % n_gpus)
-            shell_cmd = (f"set -e; "
-                         f"exp01 train {shlex.quote(key)}{extra} && "
-                         f"exp01 eval  {shlex.quote(key)}{extra}")
-            print(f"  [GPU{env['CUDA_VISIBLE_DEVICES']}] launching {cell_id}", flush=True)
+            train_cmd = [sys.executable, "-m", "exp01.cli", "train", key] + extra_args
+            eval_cmd  = [sys.executable, "-m", "exp01.cli", "eval",  key] + extra_args
             f = open(log_path, "w")
+            print(f"  [GPU{env['CUDA_VISIBLE_DEVICES']}] launching {cell_id}", flush=True)
+            # Run train; on success, run eval. We do this via a tiny shell
+            # one-liner so a single Popen tracks the whole pipeline.
+            shell_cmd = " && ".join([
+                _quote_argv(train_cmd),
+                _quote_argv(eval_cmd),
+            ])
             p = subprocess.Popen(shell_cmd, shell=True, env=env,
                                  stdout=f, stderr=subprocess.STDOUT)
             procs[p.pid] = (p, cell_id, log_path, env["CUDA_VISIBLE_DEVICES"], f)
@@ -323,6 +330,11 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
     print(f"\n=== {header} summary: {sum(1 for _, ok in completed if ok)}/{len(completed)} succeeded ===")
     for cid, ok in completed:
         print(f"  {'OK ' if ok else 'FAIL'} {cid}")
+
+
+def _quote_argv(argv: list[str]) -> str:
+    import shlex
+    return " ".join(shlex.quote(a) for a in argv)
 
 
 def _detect_gpu_count() -> int:
