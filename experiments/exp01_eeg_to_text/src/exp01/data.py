@@ -250,9 +250,13 @@ class EEGSentenceDataset:
         # ZuCo parquets sometimes have multiple row groups; doing
         # ``read_row_group(0)`` for every row was the source of the original
         # IndexError.
+        # We additionally pre-filter on the cheap ``num_channels`` /
+        # ``num_words`` columns to drop degenerate rows whose EEG would
+        # collapse to a (1, 1) placeholder in ``_row_to_array``.
         self._index: list[tuple[int, int, int]] = []
         per_file_kept = []
         per_file_total = []
+        per_file_degenerate = 0
         for fi, f in enumerate(files):
             try:
                 pf = pq.ParquetFile(f)
@@ -263,17 +267,24 @@ class EEGSentenceDataset:
             kept = 0; total = 0
             for rg_idx in range(pf.num_row_groups):
                 try:
-                    t = pf.read_row_group(rg_idx, columns=["sentence_text", "participant_id"])
+                    t = pf.read_row_group(
+                        rg_idx, columns=["sentence_text", "participant_id",
+                                         "num_channels", "num_words"])
                 except Exception as e:
                     print(f"[data] WARN: failed to read rg{rg_idx} of {f.name}: {e}", flush=True)
                     continue
                 texts = t["sentence_text"].to_pylist()
                 pids = t["participant_id"].to_pylist()
+                ncs = t["num_channels"].to_pylist()
+                nws = t["num_words"].to_pylist()
                 total += len(texts)
-                for ri_in_rg, (text, pid) in enumerate(zip(texts, pids)):
+                for ri_in_rg, (text, pid, nc, nw) in enumerate(zip(texts, pids, ncs, nws)):
                     if self.subject_filter and str(pid) not in self.subject_filter:
                         continue
                     if self.sentence_filter and _hash(text or "") not in self.sentence_filter:
+                        continue
+                    if (nc or 0) < 2 or (nw or 0) < 1:
+                        per_file_degenerate += 1
                         continue
                     self._index.append((fi, rg_idx, ri_in_rg))
                     kept += 1
@@ -283,7 +294,8 @@ class EEGSentenceDataset:
         n_files_with_data = sum(1 for k in per_file_kept if k > 0)
         print(
             f"[data] EEGSentenceDataset: {len(self._index)} rows kept from "
-            f"{n_files_with_data}/{len(files)} files (total scanned={sum(per_file_total)}); "
+            f"{n_files_with_data}/{len(files)} files (total scanned={sum(per_file_total)}, "
+            f"degenerate dropped={per_file_degenerate}); "
             f"subject_filter={'set('+str(len(self.subject_filter))+')' if self.subject_filter else 'None'}, "
             f"sentence_filter={'set('+str(len(self.sentence_filter))+')' if self.sentence_filter else 'None'}, "
             f"noise={self.noise}",

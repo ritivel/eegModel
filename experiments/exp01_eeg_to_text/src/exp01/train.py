@@ -30,9 +30,13 @@ from .model import EEG2Text
 # ============================================================================
 
 
-def _collate(rows: list[dict], tokenizer, *, target_sr: int | None, max_text_tokens: int = 96):
+def _collate(rows: list[dict], tokenizer, *, target_sr: int | None,
+             max_text_tokens: int = 96, min_T: int = 200):
     """Right-pad to (B, Cmax, Tmax). Per-row time resample to ``target_sr``
-    (when set) so mixed-source batches share a single sampling rate.
+    (when set) so mixed-source batches share a single sampling rate. Time
+    axis is also padded up to ``min_T`` (default 200 — REVE's patch_size,
+    one second at 200 Hz) so even short sentences make it through encoders
+    that require a minimum window.
     """
     Bsz = len(rows)
     eeg_arrs = []
@@ -46,7 +50,7 @@ def _collate(rows: list[dict], tokenizer, *, target_sr: int | None, max_text_tok
         eeg_arrs.append(a)
 
     Cmax = max(a.shape[0] for a in eeg_arrs)
-    Tmax = max(a.shape[1] for a in eeg_arrs)
+    Tmax = max(min_T, max(a.shape[1] for a in eeg_arrs))
     eeg = torch.zeros(Bsz, Cmax, Tmax, dtype=torch.float32)
     for i, a in enumerate(eeg_arrs):
         c, t = a.shape
