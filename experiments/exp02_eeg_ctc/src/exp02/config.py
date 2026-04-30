@@ -155,6 +155,11 @@ class CTCConfig:
     save_every_frac: float = 0.5
     split_seed: int = 20260430
 
+    # Free-form short tag appended to the cell_id (e.g. ``"aug"``,
+    # ``"big-batch"``). Lets wave-2 augmented cells live alongside wave-1
+    # baselines without colliding on the run / eval dirs.
+    tag: str = ""
+
     # -----------------------------------------------------------------
     # Derived
     # -----------------------------------------------------------------
@@ -169,6 +174,8 @@ class CTCConfig:
             suffix += "_elora"
         if not self.specaugment:
             suffix += "_nosa"
+        if self.tag:
+            suffix += f"_{self.tag}"
         return (f"{self.encoder}_{self.vocab}_{self.variant}_{self.input}"
                 f"_fold{self.fold}{prep}{suffix}")
 

@@ -156,7 +156,7 @@ _INT_OVERRIDE_FIELDS = (
     "encoder_warmup_freeze_steps", "num_workers",
     "signal_aug_freq_mask_n", "signal_aug_time_warp_segments",
 )
-_STR_OVERRIDE_FIELDS = ("text_aug_paraphrase_path",)
+_STR_OVERRIDE_FIELDS = ("text_aug_paraphrase_path", "tag")
 
 
 def _cli_overrides(args) -> dict:
@@ -575,6 +575,9 @@ def _step_flags(p):
                    help="Probability of substituting a paraphrase as the CTC target per row.")
     p.add_argument("--text-aug-paraphrase-path", default=None,
                    help="Path to paraphrases parquet (default: $EXP02_DATA_ROOT/text_aug/paraphrases.parquet).")
+    p.add_argument("--tag", default=None,
+                   help="Free-form suffix appended to cell_id (e.g. 'aug', 'big-batch'). "
+                        "Lets a re-parametrised cell live alongside its baseline.")
 
 
 def main(argv: list[str] | None = None) -> None:
