@@ -197,17 +197,21 @@ def _cmd_smoke(args):
 
 def _cmd_pilot(args):
     """§5.1 Phase 1: fold 0, EEG only, all (encoder × bridge) cells in the
-    selected encoder set."""
-    from . import eval as evalmod
-    from . import train as trainmod
+    selected encoder set. ``--parallel`` runs one cell per visible GPU."""
     from .config import pilot_cells
 
     encs = tuple(e.strip() for e in args.encoders.split(",") if e.strip())
     cells = pilot_cells(encoders=encs)
-    print(f"Pilot: {len(cells)} cells (encoders={encs}), running sequentially.")
 
+    if args.parallel:
+        _run_parallel([c.cfg_key for c in cells], header="Pilot")
+        return
+
+    from . import eval as evalmod
+    from . import train as trainmod
     import traceback as _tb
 
+    print(f"Pilot: {len(cells)} cells (encoders={encs}), running sequentially.")
     results = []
     for cfg in cells:
         print(f"\n=========== {cfg.cell_id} ===========", flush=True)
@@ -229,6 +233,77 @@ def _cmd_pilot(args):
             print(f"  {cid:<55s}  FAILED")
         else:
             print(f"  {cid:<55s}  BLEU-1={b:.3f}  ROUGE-1-F={r:.3f}")
+
+
+def _run_parallel(cfg_keys: list[str], *, header: str):
+    """Spawn one ``exp01 train+eval`` subprocess per GPU, sharded round-robin
+    across visible GPUs. Each process writes its own log to
+    ``$EXP01_DATA_ROOT/runs/<cell_id>/run.log``.
+    """
+    import os
+    import subprocess
+    import time
+
+    n_gpus = _detect_gpu_count()
+    if n_gpus == 0:
+        raise SystemExit("No GPUs visible; --parallel requires at least one CUDA device.")
+    print(f"{header}: {len(cfg_keys)} cells across {n_gpus} GPU(s) (round-robin).")
+
+    from . import storage
+    storage.ensure_dirs()
+
+    procs = {}
+    queue = list(enumerate(cfg_keys))
+    next_gpu = 0
+    completed = []
+
+    while queue or procs:
+        # Fill GPUs.
+        while queue and len(procs) < n_gpus:
+            i, key = queue.pop(0)
+            cell_id = _cfg_key_to_id(key)
+            log_path = storage.RUNS / cell_id / "run.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(next_gpu % n_gpus)
+            cmd = ["exp01", "train", key]
+            cmd2 = ["exp01", "eval", key]
+            print(f"  [GPU{env['CUDA_VISIBLE_DEVICES']}] launching train+eval {cell_id}", flush=True)
+            with open(log_path, "w") as f:
+                p = subprocess.Popen(
+                    f"set -e; {' '.join(cmd)}; {' '.join(cmd2)}",
+                    shell=True, env=env, stdout=f, stderr=subprocess.STDOUT,
+                )
+            procs[p.pid] = (p, cell_id, log_path, env["CUDA_VISIBLE_DEVICES"])
+            next_gpu += 1
+
+        # Wait for any to finish.
+        time.sleep(5)
+        done = [pid for pid, (p, *_rest) in procs.items() if p.poll() is not None]
+        for pid in done:
+            p, cell_id, log_path, gpu = procs.pop(pid)
+            ok = p.returncode == 0
+            print(f"  [GPU{gpu}] {'OK ' if ok else 'FAIL'} {cell_id} (rc={p.returncode}); log: {log_path}", flush=True)
+            completed.append((cell_id, ok))
+
+    print(f"\n=== {header} summary: {sum(1 for _, ok in completed if ok)}/{len(completed)} succeeded ===")
+    for cid, ok in completed:
+        print(f"  {'OK ' if ok else 'FAIL'} {cid}")
+
+
+def _detect_gpu_count() -> int:
+    try:
+        import torch
+        return torch.cuda.device_count()
+    except Exception:
+        return 0
+
+
+def _cfg_key_to_id(key: str) -> str:
+    """Build the same cell_id as CellConfig without instantiating it (so we
+    don't pay model-load cost just to plan logs)."""
+    from .config import CellConfig
+    return CellConfig(**_parse_cfg_key(key)).cell_id
 
 
 def _cmd_full(args):
@@ -302,6 +377,8 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("pilot")
     sp.add_argument("--encoders", default="reve,tfm",
                     help="comma-separated subset of {reve,diver1,tfm}")
+    sp.add_argument("--parallel", action="store_true",
+                    help="Run one cell per visible GPU (round-robin) as subprocesses")
     sp.set_defaults(func=_cmd_pilot)
 
     sp = sub.add_parser("full")

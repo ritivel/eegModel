@@ -87,6 +87,11 @@ class CellConfig:
     def cell_id(self) -> str:
         return f"{self.encoder}_{self.bridge}_{self.input}_fold{self.fold}_dec-{self._dec_short()}"
 
+    @property
+    def cfg_key(self) -> str:
+        """Round-trip key for `exp01 train CFG_KEY` etc."""
+        return f"{self.encoder}.{self.bridge}.{self.input}.{self.fold}"
+
     def _dec_short(self) -> str:
         # google/gemma-4-E2B-it -> gemma4-e2b
         s = self.decoder.split("/")[-1].lower()
