@@ -49,9 +49,9 @@ def _sentence_rouge1(hyp: str, ref: str, scorer) -> float:
 
 
 def per_sentence_scores(hyps: list[str], refs: list[str]) -> dict[str, np.ndarray]:
-    """All six metrics at the sentence level."""
+    """All six metrics at the sentence level. BERTScore failures are
+    tolerated — they just mark that metric as missing in the summary."""
     from rouge_score.rouge_scorer import RougeScorer
-    from bert_score import score as bertscore
 
     rouge = RougeScorer(["rouge1"], use_stemmer=True)
 
@@ -63,9 +63,15 @@ def per_sentence_scores(hyps: list[str], refs: list[str]) -> dict[str, np.ndarra
             out[f"bleu{n}"].append(_sentence_bleu(h, r, n))
         out["rouge1_f"].append(_sentence_rouge1(h, r, rouge))
 
-    _, _, F1 = bertscore(hyps, refs, model_type="roberta-large", lang="en",
-                         rescale_with_baseline=True, verbose=False)
-    out["bertscore_f1"] = F1.numpy().tolist()
+    try:
+        from bert_score import score as bertscore
+        _, _, F1 = bertscore(hyps, refs, model_type="roberta-large", lang="en",
+                             rescale_with_baseline=True, verbose=False)
+        out["bertscore_f1"] = F1.numpy().tolist()
+    except Exception as e:
+        print(f"[eval] BERTScore failed ({type(e).__name__}: {e}); "
+              f"setting bertscore_f1 to NaN.", flush=True)
+        out["bertscore_f1"] = [float("nan")] * len(hyps)
 
     return {k: np.asarray(v, dtype=np.float64) for k, v in out.items()}
 
@@ -76,11 +82,13 @@ def per_sentence_scores(hyps: list[str], refs: list[str]) -> dict[str, np.ndarra
 
 
 def bootstrap_ci(values: np.ndarray, *, n: int = BOOTSTRAP_N, alpha: float = 0.05, seed: int = 0):
+    if len(values) == 0 or np.all(np.isnan(values)):
+        return float("nan"), float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, len(values), size=(n, len(values)))
-    means = values[idx].mean(axis=1)
-    lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
-    return float(values.mean()), float(lo), float(hi)
+    means = np.nanmean(values[idx], axis=1)
+    lo, hi = np.nanquantile(means, [alpha / 2, 1 - alpha / 2])
+    return float(np.nanmean(values)), float(lo), float(hi)
 
 
 def permutation_paired(eeg: np.ndarray, noise: np.ndarray, *, n: int = PERMUTATION_N, seed: int = 0) -> float:
