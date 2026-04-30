@@ -319,6 +319,14 @@ class EEGSentenceDataset:
                 print(f"[data] WARN: failed to open {f.name}: {e}", flush=True)
                 continue
             word_level_source = src in self._WORD_LEVEL_ONLY_SOURCES
+            # The sentence-hash filter is built over ZuCo unique sentences
+            # (see make_folds). It MUST NOT be applied to non-ZuCo sources
+            # because their sentences will never hash into that ZuCo-only
+            # set — applying it dropped 100% of DERCo/EMMT/eeg_sem_relev
+            # rows even after the subject-pool fix. Non-ZuCo rows always
+            # belong to "train" (they're never in dev/test by design,
+            # because test_subjects are ZuCo-only per Yin et al. §4.1).
+            apply_sentence_filter_here = src in ZUCO_SOURCES
             kept = 0; total = 0
             for rg_idx in range(pf.num_row_groups):
                 try:
@@ -338,7 +346,8 @@ class EEGSentenceDataset:
                         zip(texts, pids, ncs, nws)):
                     if self.subject_filter and str(pid) not in self.subject_filter:
                         continue
-                    if self.sentence_filter and _hash(text or "") not in self.sentence_filter:
+                    if (apply_sentence_filter_here and self.sentence_filter
+                            and _hash(text or "") not in self.sentence_filter):
                         continue
                     if (nc or 0) < 2:
                         per_file_degenerate += 1
