@@ -27,33 +27,44 @@ from . import storage
 def _assemble_zuco_corpus(out_path: Path, *, fold: int = 0) -> int:
     """Write ZuCo training-fold sentence references to ``out_path``.
 
-    Returns the number of lines written.
+    Reads ``sentence_text`` and ``participant_id`` columns *only* via parquet
+    (not :class:`EEGSentenceDataset`, which would load + preprocess the full
+    EEG per row → ~30 minutes for ZuCo train). Filters by the same
+    train-subject and train-sentence-hash sets the dataset would use.
+
+    Returns the number of unique lines written.
     """
-    from eeg_common.splits import load_fold
-    from eeg_common.data import EEGSentenceDataset, ZUCO_SOURCES
+    import pyarrow.parquet as pq
+
+    from eeg_common.data import shard_paths, ZUCO_SOURCES
+    from eeg_common.splits import load_fold, sent_hash
 
     fold_split = load_fold(storage.STORAGE, fold)
-    ds = EEGSentenceDataset(
-        storage.STORAGE,
-        sources=ZUCO_SOURCES,
-        subject_filter=fold_split.train_subjects,
-        sentence_filter=fold_split.train_sent_hashes,
-        eval_only=True,
-    )
+    train_subjects = set(fold_split.train_subjects)
+    train_sent_hashes = set(fold_split.train_sent_hashes)
+
     seen: set[str] = set()
     n = 0
     with open(out_path, "a") as f:
-        for i in range(len(ds)):
-            row = ds[i]
-            text = (row.get("text") or "").strip()
-            if not text:
-                continue
-            key = " ".join(text.lower().split())
-            if key in seen:
-                continue
-            seen.add(key)
-            f.write(text + "\n")
-            n += 1
+        for src in ZUCO_SOURCES:
+            for path in shard_paths(storage.STORAGE, src):
+                t = pq.read_table(path,
+                                  columns=["sentence_text", "participant_id"])
+                texts = t["sentence_text"].to_pylist()
+                pids = t["participant_id"].to_pylist()
+                for text, pid in zip(texts, pids):
+                    if not text:
+                        continue
+                    if str(pid) not in train_subjects:
+                        continue
+                    if sent_hash(text) not in train_sent_hashes:
+                        continue
+                    key = " ".join(text.lower().split())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    f.write(text + "\n")
+                    n += 1
     return n
 
 
