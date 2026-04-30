@@ -2,35 +2,39 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 
 from . import storage
 
 
-@dataclass
-class LoadedDecoder:
-    model: nn.Module
-    tokenizer: object
-    embed_dim: int
-    vocab_size: int
+class LoadedDecoder(nn.Module):
+    """Wraps a Gemma 4 IT model + tokenizer.
+
+    Subclassing ``nn.Module`` matters because the tokenizer is held as a
+    plain attribute (it isn't a Module) while ``self.model`` is registered
+    as a submodule — so ``EEG2Text(...).to("cuda")`` recursively moves
+    Gemma's weights too.
+    """
+
+    def __init__(self, model_id: str, *, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=str(storage.HF_CACHE))
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            cache_dir=str(storage.HF_CACHE),
+            torch_dtype=dtype,
+            attn_implementation="sdpa",
+        )
+        embed = self.model.get_input_embeddings()
+        self.embed_dim = embed.embedding_dim
+        self.vocab_size = embed.num_embeddings
 
 
 def load_decoder(model_id: str = "google/gemma-4-E2B-it", *, dtype: torch.dtype = torch.bfloat16) -> LoadedDecoder:
-    """Load a Gemma 4 IT model + tokenizer from the hot HF cache."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(model_id, cache_dir=str(storage.HF_CACHE))
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        cache_dir=str(storage.HF_CACHE),
-        torch_dtype=dtype,
-        attn_implementation="sdpa",
-    )
-    embed = model.get_input_embeddings()
-    return LoadedDecoder(model=model, tokenizer=tok, embed_dim=embed.embedding_dim, vocab_size=embed.num_embeddings)
+    return LoadedDecoder(model_id, dtype=dtype)
 
 
 def freeze(model: nn.Module) -> nn.Module:
