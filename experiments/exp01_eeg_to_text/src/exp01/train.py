@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from . import data, decoder, storage
+from . import data, decoder, preprocessing, storage
 from .config import CellConfig
 from .model import EEG2Text
 
@@ -100,6 +100,13 @@ def train(cfg: CellConfig) -> Path | None:
         (run_dir / "uses_checkpoint_from.txt").write_text(str(twin))
         return None
 
+    # Per-row preprocessing pipeline. Default ``v1`` is a no-op (preserves
+    # the Apr-30 pilot's behaviour); ``v2`` resolves to encoder-specific
+    # REVE/TFM recipes (bandpass + notch + 200 Hz polyphase resample +
+    # per-recording z-score + 15-σ clip). See ``preprocessing.for_encoder``.
+    pp_spec = (preprocessing.for_encoder(cfg.preprocess, cfg.encoder)
+               if cfg.preprocess != "v1" else None)
+
     # Subject-independent: train sees only training subjects; inputs become
     # noise only when ``cfg.input == "noise_train"`` (Jo et al. §4.3).
     train_ds = data.EEGSentenceDataset(
@@ -107,12 +114,14 @@ def train(cfg: CellConfig) -> Path | None:
         subject_filter=fold.train_subjects,
         sentence_filter=fold.train_sent_hashes,
         noise="gauss" if cfg.input == "noise_train" else None,
+        preprocess=pp_spec,
     )
     dev_ds = data.EEGSentenceDataset(
         sources=data.ZUCO_SOURCES,
         subject_filter=fold.dev_subjects,
         sentence_filter=fold.dev_sent_hashes,
         noise="gauss" if cfg.input == "noise_train" else None,
+        preprocess=pp_spec,
     )
 
     model = EEG2Text(cfg).to("cuda")

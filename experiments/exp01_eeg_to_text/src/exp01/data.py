@@ -18,7 +18,7 @@ from typing import Iterable
 
 import numpy as np
 
-from . import storage
+from . import preprocessing, storage
 
 DATASET_REPO = "tankalapavankalyan/exp01-eeg-to-text-sentences"
 
@@ -100,19 +100,31 @@ def _hash(text: str) -> str:
     return hashlib.sha1(_norm(text).encode("utf-8")).hexdigest()[:16]
 
 
-def make_folds(*, n_folds: int = 5, n_test: int = 3, n_dev: int = 3, seed: int = 20260430) -> list[FoldSplit]:
+def make_folds(*, n_folds: int = 5, n_test: int = 3, n_dev: int = 3, seed: int = 20260430,
+               include_non_zuco_in_train_pool: bool = True) -> list[FoldSplit]:
     """Compute LNSO subject folds + Yin unique-sentence assignment.
 
-    The unique-sentence pool is split 80/10/10 once; the same text-level
-    partition is reused across folds so cross-fold variance is purely from
-    *which subjects* are held out, not *which sentences*. This matches §4.1+§4.2.
+    The unique-sentence pool is split 80/10/10 once over ZUCO_SOURCES; the same
+    text-level partition is reused across folds so cross-fold variance is purely
+    from *which subjects* are held out, not *which sentences*. Test subjects
+    are restricted to ZuCo (per Yin et al. 2024 / our §4 protocol).
+
+    Bug-fix: previously the *training-subject pool* was also restricted to
+    ZuCo subjects, which silently dropped DERCo (~ACB71/DGR11/...), EMMT
+    (P09/P10/...), and ``eeg_sem_relev`` (TRPB101/...) participants — meaning
+    the model trained on ZuCo only despite the README claiming "all 8 sources".
+    With ``include_non_zuco_in_train_pool=True`` (the default) we add those
+    subjects to ``train_subjects`` as well so the row-filter step in
+    ``EEGSentenceDataset`` actually keeps them.
     """
+    import glob
     import random
     import pyarrow.parquet as pq
 
     storage.ensure_dirs()
 
-    # Step 1: collect unique normalised sentences and their subject sets.
+    # Step 1: collect unique normalised sentences and their subject sets
+    # (ZuCo only; this defines test/dev sentence partitions).
     text_to_subjects: dict[str, set[str]] = {}
     n_total_files = sum(len(shard_paths(src)) for src in ZUCO_SOURCES)
     print(f"[splits] scanning {n_total_files} ZuCo shards (sentence_text + participant_id)", flush=True)
@@ -142,22 +154,43 @@ def make_folds(*, n_folds: int = 5, n_test: int = 3, n_dev: int = 3, seed: int =
     dev_t = frozenset(_hash(s) for s in unique[train_cut:dev_cut])
     test_t = frozenset(_hash(s) for s in unique[dev_cut:])
 
-    # Step 2: fold subjects. Pool is derived from the actual ``participant_id``
-    # values observed in the parquets (matches what ``EEGSentenceDataset`` will
-    # filter against at training time).
-    all_subjects: set[str] = set()
+    # Step 2: build the test/dev rotation pool from ZuCo subjects only.
+    zuco_pool: set[str] = set()
     for subjects in text_to_subjects.values():
-        all_subjects.update(subjects)
-    pool = sorted(all_subjects)
-    print(f"[splits] subject pool: {len(pool)} subjects: {pool}", flush=True)
+        zuco_pool.update(subjects)
+    zuco_pool_sorted = sorted(zuco_pool)
+    print(f"[splits] ZuCo subject pool: {len(zuco_pool_sorted)} subjects: {zuco_pool_sorted}",
+          flush=True)
+
+    # Step 3: scan non-ZuCo sources for their participant ids (to add to the
+    # train pool only — they never go into test/dev).
+    non_zuco_subjects: set[str] = set()
+    if include_non_zuco_in_train_pool:
+        for src in ALL_SOURCES:
+            if src in ZUCO_SOURCES:
+                continue
+            for path in shard_paths(src):
+                try:
+                    t = pq.read_table(path, columns=["participant_id"])
+                except Exception as e:
+                    print(f"[splits] WARN: could not read {path.name}: {e}", flush=True)
+                    continue
+                for p in t["participant_id"].to_pylist():
+                    if p:
+                        non_zuco_subjects.add(str(p))
+        print(f"[splits] non-ZuCo (train-only) subjects: {len(non_zuco_subjects)}",
+              flush=True)
+
     folds = []
     for i in range(n_folds):
         rng_fold = random.Random(seed + i)
-        shuffled = pool[:]
+        shuffled = zuco_pool_sorted[:]
         rng_fold.shuffle(shuffled)
         test_s = tuple(shuffled[:n_test])
         dev_s = tuple(shuffled[n_test : n_test + n_dev])
-        train_s = tuple(s for s in pool if s not in test_s and s not in dev_s)
+        train_zuco = [s for s in zuco_pool_sorted
+                      if s not in test_s and s not in dev_s]
+        train_s = tuple(train_zuco) + tuple(sorted(non_zuco_subjects))
         folds.append(
             FoldSplit(
                 fold=i,
@@ -225,7 +258,18 @@ class EEGSentenceDataset:
             set (used to apply the Yin unique-sentence partition).
         noise: ``None`` for raw EEG, ``"gauss"`` for the Jo et al. noise twin
             (per-channel zero-mean Gaussian with the EEG's per-channel std).
+        preprocess: a ``preprocessing.PreprocessSpec`` applied per row before
+            the noise twin step. ``None`` keeps the v1 behaviour (no
+            preprocessing in this module — the collator does linear-interp
+            resample later).
     """
+
+    # Sources whose ``sentence_eeg`` column is ``None`` (the EEG only lives in
+    # ``word_eeg_segments``). For these we DON'T apply the ``num_words<1``
+    # filter — we accept them as long as ``word_eeg_segments`` is non-empty,
+    # because the parquet schema stores ``num_words=0`` for some shards even
+    # though hundreds of word segments are present.
+    _WORD_LEVEL_ONLY_SOURCES = frozenset({"derco_preprocessed", "emmt", "eeg_sem_relev"})
 
     def __init__(
         self,
@@ -234,6 +278,7 @@ class EEGSentenceDataset:
         sentence_filter: Iterable[str] | None = None,
         noise: str | None = None,
         eval_only: bool = False,
+        preprocess: "preprocessing.PreprocessSpec | None" = None,
     ):
         import pyarrow.parquet as pq
 
@@ -241,78 +286,100 @@ class EEGSentenceDataset:
         self.sentence_filter = set(sentence_filter) if sentence_filter else None
         self.noise = noise
         self.eval_only = eval_only
+        self.preprocess = preprocess
 
-        files: list[Path] = []
+        files: list[tuple[Path, str]] = []  # (path, source_name)
         for src in sources:
-            files.extend(shard_paths(src))
+            for p in shard_paths(src):
+                files.append((p, src))
         self.files = files
 
         # Index = (file_idx, row_group_idx, row_in_group_idx) for every row
         # that survives the filters. Row-group bookkeeping matters because
-        # ZuCo parquets sometimes have multiple row groups; doing
-        # ``read_row_group(0)`` for every row was the source of the original
-        # IndexError.
-        # We additionally pre-filter on the cheap ``num_channels`` /
-        # ``num_words`` columns to drop degenerate rows whose EEG would
-        # collapse to a (1, 1) placeholder in ``_row_to_array``.
+        # ZuCo parquets sometimes have multiple row groups.
         self._index: list[tuple[int, int, int]] = []
-        per_file_kept = []
-        per_file_total = []
+        per_source_kept: dict[str, int] = {}
+        per_source_total: dict[str, int] = {}
         per_file_degenerate = 0
-        for fi, f in enumerate(files):
+        for fi, (f, src) in enumerate(files):
             try:
                 pf = pq.ParquetFile(f)
             except Exception as e:
                 print(f"[data] WARN: failed to open {f.name}: {e}", flush=True)
-                per_file_kept.append(0); per_file_total.append(0)
                 continue
+            word_level_source = src in self._WORD_LEVEL_ONLY_SOURCES
             kept = 0; total = 0
             for rg_idx in range(pf.num_row_groups):
                 try:
-                    t = pf.read_row_group(
-                        rg_idx, columns=["sentence_text", "participant_id",
-                                         "num_channels", "num_words"])
+                    cols = ["sentence_text", "participant_id",
+                            "num_channels", "num_words"]
+                    if word_level_source:
+                        # We need to peek at word_eeg_segments to know whether
+                        # the row has any EEG at all. Keep this read narrow
+                        # (only for the ~2k rows in DERCo/EMMT/sem_relev).
+                        cols.append("word_eeg_segments")
+                    t = pf.read_row_group(rg_idx, columns=cols)
                 except Exception as e:
-                    print(f"[data] WARN: failed to read rg{rg_idx} of {f.name}: {e}", flush=True)
+                    print(f"[data] WARN: failed to read rg{rg_idx} of {f.name}: {e}",
+                          flush=True)
                     continue
                 texts = t["sentence_text"].to_pylist()
                 pids = t["participant_id"].to_pylist()
                 ncs = t["num_channels"].to_pylist()
                 nws = t["num_words"].to_pylist()
+                if word_level_source:
+                    word_segs = t["word_eeg_segments"].to_pylist()
+                else:
+                    word_segs = [None] * len(texts)
                 total += len(texts)
-                for ri_in_rg, (text, pid, nc, nw) in enumerate(zip(texts, pids, ncs, nws)):
+                for ri_in_rg, (text, pid, nc, nw, ws) in enumerate(
+                        zip(texts, pids, ncs, nws, word_segs)):
                     if self.subject_filter and str(pid) not in self.subject_filter:
                         continue
                     if self.sentence_filter and _hash(text or "") not in self.sentence_filter:
                         continue
-                    if (nc or 0) < 2 or (nw or 0) < 1:
+                    if (nc or 0) < 2:
                         per_file_degenerate += 1
                         continue
+                    if word_level_source:
+                        # Accept iff at least one word segment is non-empty.
+                        if not ws or not any(seg for seg in ws):
+                            per_file_degenerate += 1
+                            continue
+                    else:
+                        if (nw or 0) < 1:
+                            per_file_degenerate += 1
+                            continue
                     self._index.append((fi, rg_idx, ri_in_rg))
                     kept += 1
-            per_file_kept.append(kept); per_file_total.append(total)
+            per_source_kept[src] = per_source_kept.get(src, 0) + kept
+            per_source_total[src] = per_source_total.get(src, 0) + total
 
         # Loud diagnostic: helps catch silent split / filter issues fast.
-        n_files_with_data = sum(1 for k in per_file_kept if k > 0)
+        per_source_str = ", ".join(
+            f"{s}={per_source_kept.get(s, 0)}/{per_source_total.get(s, 0)}"
+            for s in sources
+        )
         print(
-            f"[data] EEGSentenceDataset: {len(self._index)} rows kept from "
-            f"{n_files_with_data}/{len(files)} files (total scanned={sum(per_file_total)}, "
-            f"degenerate dropped={per_file_degenerate}); "
+            f"[data] EEGSentenceDataset: {len(self._index)} rows kept "
+            f"(degenerate dropped={per_file_degenerate}); "
+            f"per-source kept/total: {per_source_str}; "
             f"subject_filter={'set('+str(len(self.subject_filter))+')' if self.subject_filter else 'None'}, "
             f"sentence_filter={'set('+str(len(self.sentence_filter))+')' if self.sentence_filter else 'None'}, "
-            f"noise={self.noise}",
+            f"noise={self.noise}, preprocess={self.preprocess.name if self.preprocess else 'None'}",
             flush=True,
         )
         if not self._index:
             # Surface the first 3 source files' subject/sentence samples so
             # the user can see what the filter saw.
-            for fi, f in enumerate(files[:3]):
+            for fi, (f, src) in enumerate(files[:3]):
                 try:
                     pf = pq.ParquetFile(f)
                     t = pf.read_row_group(0, columns=["sentence_text", "participant_id"])
                     sample_pids = sorted({str(p) for p in t["participant_id"].to_pylist()})[:5]
                     sample_texts = [s for s in t["sentence_text"].to_pylist() if s][:2]
-                    print(f"[data]   {f.name}: pids={sample_pids} texts={sample_texts}", flush=True)
+                    print(f"[data]   {f.name}: pids={sample_pids} texts={sample_texts}",
+                          flush=True)
                 except Exception as e:
                     print(f"[data]   {f.name}: <{e}>", flush=True)
 
@@ -326,7 +393,7 @@ class EEGSentenceDataset:
 
         fi, rg_idx, ri_in_rg = self._index[i]
         if fi not in self._cache:
-            self._cache[fi] = pq.ParquetFile(self.files[fi])
+            self._cache[fi] = pq.ParquetFile(self.files[fi][0])
         cols = [
             "sentence_text",
             "participant_id",
@@ -342,7 +409,14 @@ class EEGSentenceDataset:
                .slice(ri_in_rg, 1)
                .to_pylist()[0])
 
-        eeg = _row_to_array(row)  # (channels, time) float32
+        eeg = _row_to_array(row)               # (channels, time) float32
+        sr = float(row["sampling_rate_hz"])
+
+        # Apply preprocessing BEFORE the noise twin so the noise has the same
+        # post-pipeline statistics as the EEG (matched-pair fairness).
+        if self.preprocess is not None:
+            eeg, sr = self.preprocess.apply(eeg, sr)
+
         if self.noise:
             mu = eeg.mean(axis=1, keepdims=True)
             sd = eeg.std(axis=1, keepdims=True) + 1e-6
@@ -351,7 +425,7 @@ class EEGSentenceDataset:
 
         return {
             "eeg": eeg,
-            "sr": float(row["sampling_rate_hz"]),
+            "sr": sr,
             "channels": list(row["channel_names"] or []),
             "text": str(row["sentence_text"]),
             "participant_id": str(row["participant_id"]),

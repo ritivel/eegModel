@@ -123,6 +123,10 @@ def _step_overrides(args) -> dict:
         out["use_lora_in_stage3"] = False
     if getattr(args, "no_grad_checkpoint", False):
         out["use_gradient_checkpointing"] = False
+    if getattr(args, "preprocess", None):
+        out["preprocess"] = args.preprocess
+    if getattr(args, "decoder", None):
+        out["decoder"] = args.decoder
     return out
 
 
@@ -311,6 +315,10 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
             extra_args += ["--grad-accum", str(v)]
         elif k == "num_workers":
             extra_args += ["--num-workers", str(v)]
+        elif k == "preprocess":
+            extra_args += ["--preprocess", str(v)]
+        elif k == "decoder":
+            extra_args += ["--decoder", str(v)]
         elif k.startswith("stage") and k.endswith("_steps"):
             extra_args += [f"--{k.replace('_', '-')}", str(v)]
 
@@ -450,6 +458,14 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--no-grad-checkpoint", action="store_true",
                        help="Disable gradient checkpointing on Gemma "
                             "(faster but uses more memory; safe for soft-prompt cells on H100 80GB)")
+        p.add_argument("--preprocess", default=None,
+                       choices=("v1", "v2", "v2_reve", "v2_tfm", "v2_dk25"),
+                       help="Per-row EEG preprocessing pipeline. v1 (default, no-op), "
+                            "v2 (encoder-aware: REVE/TFM recipes); see preprocessing.py")
+        p.add_argument("--decoder", default=None,
+                       help="HF decoder model id (overrides CellConfig.decoder). "
+                            "e.g. facebook/bart-base, google/flan-t5-base, "
+                            "google/gemma-3-1b-it for smaller-LM ablations.")
 
     sp = sub.add_parser("train")
     sp.add_argument("cfg_key", help="encoder.bridge.input.fold (e.g. reve.linear.eeg.0)")

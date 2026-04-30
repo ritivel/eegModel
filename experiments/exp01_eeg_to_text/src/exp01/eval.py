@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from . import data, decoder, storage
+from . import data, decoder, preprocessing, storage
 from .config import CellConfig
 from .model import EEG2Text
 from .train import _collate
@@ -110,11 +110,15 @@ def evaluate_cell(cfg: CellConfig, *, ckpt_path: Path | None = None) -> dict:
     storage.ensure_dirs()
     fold = data.load_fold(cfg.fold)
 
+    pp_spec = (preprocessing.for_encoder(cfg.preprocess, cfg.encoder)
+               if cfg.preprocess != "v1" else None)
+
     test_ds = data.EEGSentenceDataset(
         sources=data.ZUCO_SOURCES,
         subject_filter=fold.test_subjects,
         sentence_filter=fold.test_sent_hashes,
         noise="gauss" if cfg.input in ("noise_train", "noise_test") else None,
+        preprocess=pp_spec,
     )
 
     model = EEG2Text(cfg).to("cuda")

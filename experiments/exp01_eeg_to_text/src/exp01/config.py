@@ -57,6 +57,13 @@ class CellConfig:
     decoder: str = "google/gemma-4-E2B-it"
     use_lora_in_stage3: bool = True
 
+    # Per-row preprocessing pipeline. ``"v1"`` (default for backwards-compat)
+    # is a no-op — the collator does linear-interp resample. ``"v2"`` resolves
+    # to the encoder-specific REVE/TFM recipe (bandpass + notch + 200 Hz
+    # polyphase resample + per-recording z-score + 15-σ clip). See
+    # ``preprocessing.py`` for the full recipe and citations.
+    preprocess: Literal["v1", "v2", "v2_reve", "v2_tfm", "v2_dk25"] = "v1"
+
     # Bridge-specific knobs
     qformer_queries: int = 32
     rvq_codebook: int = 8192  # for off-diagonal vocab-extension cells
@@ -110,7 +117,9 @@ class CellConfig:
 
     @property
     def cell_id(self) -> str:
-        return f"{self.encoder}_{self.bridge}_{self.input}_fold{self.fold}_dec-{self._dec_short()}"
+        prep = "" if self.preprocess == "v1" else f"_pp-{self.preprocess.replace('_', '-')}"
+        return (f"{self.encoder}_{self.bridge}_{self.input}_fold{self.fold}"
+                f"{prep}_dec-{self._dec_short()}")
 
     @property
     def cfg_key(self) -> str:
