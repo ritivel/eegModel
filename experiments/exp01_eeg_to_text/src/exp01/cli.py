@@ -281,7 +281,20 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
     n_gpus = _detect_gpu_count()
     if n_gpus == 0:
         raise SystemExit("No GPUs visible; --parallel requires at least one CUDA device.")
-    print(f"{header}: {len(cfg_keys)} cells across {n_gpus} GPU(s) (round-robin).", flush=True)
+
+    # Map round-robin indices into the actual physical GPU IDs the parent
+    # process is allowed to see. Without this, when this CLI is launched
+    # under e.g. CUDA_VISIBLE_DEVICES=4,5 the children would inherit
+    # CUDA_VISIBLE_DEVICES=0,1 (raw integers) and end up on physical GPUs
+    # 0 and 1 instead of 4 and 5.
+    parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if parent_visible:
+        physical_gpus = [g.strip() for g in parent_visible.split(",") if g.strip()]
+    else:
+        physical_gpus = [str(i) for i in range(n_gpus)]
+    n_gpus = min(n_gpus, len(physical_gpus))
+    print(f"{header}: {len(cfg_keys)} cells across {n_gpus} GPU(s) "
+          f"(physical: {physical_gpus[:n_gpus]}).", flush=True)
 
     from . import storage
     storage.ensure_dirs()
@@ -313,7 +326,7 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
             log_path = storage.RUNS / cell_id / "run.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(next_gpu % n_gpus)
+            env["CUDA_VISIBLE_DEVICES"] = physical_gpus[next_gpu % n_gpus]
             train_cmd = [sys.executable, "-m", "exp01.cli", "train", key] + extra_args
             eval_cmd  = [sys.executable, "-m", "exp01.cli", "eval",  key] + extra_args
             f = open(log_path, "w")
