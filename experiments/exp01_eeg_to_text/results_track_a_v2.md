@@ -110,6 +110,43 @@ prefix that nudges Gemma into a more concentrated mode. Either way,
 **the EEG cells need to clear ≈0.126 BLEU-1 with disjoint CIs to count
 as decoding from EEG**.
 
+### 2.1.1 First two §4.3 EEG-vs-noise gaps — vocab cells (finished 21:11 IST)
+
+The two vocab cells were the first Track-A cells to wrap (smaller models,
+stage-3 LoRA finished early). Both **fail §4.3 in V2** the same way they
+failed in V1.
+
+
+| cell | BLEU-1 | vs noise V2 (0.126) | ROUGE-1-F | CER | WER | n_unique / 257 |
+| ---- | ------ | ------------------- | --------- | --- | --- | -------------- |
+| `reve.linear.noise_train.0` v2 (Box B) | **0.1263** [0.1190, 0.1339] | (the floor) | 0.1277 | n/a | n/a | 18 |
+| `reve.vocab.eeg.0` v2 | 0.1125 [0.1056, 0.1199] | **below noise** (CIs barely touch) | 0.1196 | 2.40 | 3.06 | 33 |
+| `tfm.vocab.eeg.0` v2 | 0.0951 [0.0893, 0.1012] | **below noise, CIs disjoint** | 0.1065 | 2.60 | 3.51 | 25 |
+
+
+CER values around 2.4–2.6 mean the average edit distance between
+hypothesis and reference is 2.4–2.6× the *length of the reference* —
+essentially zero textual overlap. The dev-time `'HeHeHeHe…'` collapse
+seen in §3.4 turns out to be a small-set artefact: at test time both
+vocab cells produce LM-prior biographies, e.g.:
+
+> **REF:** *"Ultimately feels empty and unsatisfying, like swallowing a Communion wafer…"*
+> **HYP (`reve.vocab`):** *"He was born in the United States in 1931 in the town of New York City. He attend…"*
+>
+> **REF:** *"The Movie will reach far beyond its core demographic."*
+> **HYP (`tfm.vocab`):** *"He was a member of the British Royal Family. He was the son of Prince Edward, Du…"*
+
+The vocab path was already failing §4.3 in V1; **V2 preprocessing
+doesn't rescue it**. The pathology is in the vocab-extension path
+itself — the new embedding rows learn to project EEG into a tight
+cluster that Gemma reads as "produce a Wikipedia-shaped biography".
+The codebook commit_loss for `reve.vocab` flat-lined at ~30 (not
+converging), which is consistent.
+
+The 6 soft-prompt cells are still running (~21:30–21:35 IST ETA)
+and are the more interesting test of whether V2 alone can close the
+§4.3 gap — see §2.2.
+
 ### 2.2 Per-cell training trajectory (snapshot at 20:46 IST)
 
 For each cell, latest stage / step / LM loss + (where applicable)
