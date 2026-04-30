@@ -21,6 +21,15 @@ class EEG2Text(nn.Module):
         # Decoder. Frozen at construction; LoRA applied in stage 3 by the trainer.
         self.dec = decoder.load_decoder(cfg.decoder)
         decoder.freeze(self.dec.model)
+        # Activation checkpointing to fit ~5B-param Gemma 4 + a trainable
+        # extended embedding table on a single 80 GB H100.
+        if hasattr(self.dec.model, "gradient_checkpointing_enable"):
+            try:
+                self.dec.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                self.dec.model.gradient_checkpointing_enable()
 
         # Vocab extension is required for vocab bridges.
         self.vocab_offset = 0
@@ -206,7 +215,10 @@ class EEG2Text(nn.Module):
         - Linear / Q-Former: train the bridge.
         - Vocab: bridge has no params (offset-add only), so train the new
           embedding rows directly. They're the only thing connecting EEG
-          codes to Gemma's hidden space.
+          codes to Gemma's hidden space. We mark the whole embed table as
+          ``requires_grad=True`` and register a backward hook that zeros out
+          gradients for the *original* (frozen) rows — the new rows learn,
+          the old rows don't (no AdamW updates because grad is identically 0).
         - Off-diagonal vocab (REVE/DIVER-1 × vocab): also train the RVQ head.
         """
         ps = list(self.bridge.parameters())
@@ -215,6 +227,14 @@ class EEG2Text(nn.Module):
         if self.cfg.bridge == "vocab":
             embed = self.dec.model.get_input_embeddings()
             embed.weight.requires_grad_(True)
+            offset = self.vocab_offset
+            if not getattr(self, "_grad_mask_installed", False):
+                def _mask_old_rows(grad):
+                    g = grad.clone()
+                    g[:offset] = 0
+                    return g
+                embed.weight.register_hook(_mask_old_rows)
+                self._grad_mask_installed = True
             ps.append(embed.weight)
         return ps
 

@@ -63,7 +63,7 @@ def per_sentence_scores(hyps: list[str], refs: list[str]) -> dict[str, np.ndarra
             out[f"bleu{n}"].append(_sentence_bleu(h, r, n))
         out["rouge1_f"].append(_sentence_rouge1(h, r, rouge))
 
-    _, _, F1 = bertscore(hyps, refs, model_type="roberta-large",
+    _, _, F1 = bertscore(hyps, refs, model_type="roberta-large", lang="en",
                          rescale_with_baseline=True, verbose=False)
     out["bertscore_f1"] = F1.numpy().tolist()
 

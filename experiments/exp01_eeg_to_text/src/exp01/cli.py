@@ -138,10 +138,10 @@ def _cmd_smoke(args):
     cells = [
         CellConfig(encoder="reve", bridge="linear", input="eeg", fold=0,
                    stage1_steps=20, stage2_steps=20, stage3_steps=10,
-                   batch_size=2, grad_accum=1),
+                   batch_size=1, grad_accum=1),
         CellConfig(encoder="tfm", bridge="vocab", input="eeg", fold=0,
                    stage1_steps=20, stage2_steps=20, stage3_steps=10,
-                   batch_size=2, grad_accum=1),
+                   batch_size=1, grad_accum=1),
     ]
     import traceback as _tb
 
