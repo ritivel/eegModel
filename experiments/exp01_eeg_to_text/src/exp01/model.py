@@ -79,6 +79,15 @@ class EEG2Text(nn.Module):
     # ------------------------------------------------------------------
     # Soft-prompt path (Linear / Q-Former)
     # ------------------------------------------------------------------
+    # Gemma 4 (E2B / E4B) uses Per-Layer Embeddings: the model needs
+    # ``input_ids`` so it can look up a separate per-layer embedding table.
+    # Passing ``inputs_embeds`` directly raises a runtime error if the
+    # embeddings don't reverse-map to known token ids. We work around this
+    # by passing ``input_ids`` (with a placeholder token for each EEG slot)
+    # and registering a forward hook on the embedding layer that overwrites
+    # the K placeholder positions with our bridge output. PLE then uses
+    # the placeholder's per-layer embedding, which is a learned constant —
+    # perfectly fine as a tied "EEG slot" per-layer embedding.
 
     def _forward_with_embeds(
         self,
@@ -87,24 +96,38 @@ class EEG2Text(nn.Module):
         text_attention_mask: torch.LongTensor,
         labels: torch.LongTensor,
     ):
-        embed_layer = self.dec.model.get_input_embeddings()
-        text_embeds = embed_layer(text_input_ids)                                # (B, L, d_lm)
-        inputs_embeds = torch.cat([eeg_embeds, text_embeds], dim=1)              # (B, K+L, d_lm)
-        K = eeg_embeds.size(1)
+        B, K, _ = eeg_embeds.shape
+        device = text_input_ids.device
+        pad_id = self._eeg_placeholder_id()
+
+        prefix_ids = torch.full((B, K), pad_id, dtype=text_input_ids.dtype, device=device)
+        full_ids = torch.cat([prefix_ids, text_input_ids], dim=1)
         attn = torch.cat(
-            [torch.ones(text_input_ids.size(0), K, dtype=text_attention_mask.dtype, device=text_attention_mask.device),
+            [torch.ones(B, K, dtype=text_attention_mask.dtype, device=device),
              text_attention_mask], dim=1)
-        # Pad labels with -100 over the K soft-prompt slots so the loss is
-        # only computed on the text continuation.
-        prompt_pad = torch.full(
-            (labels.size(0), K), -100, dtype=labels.dtype, device=labels.device,
-        )
+        prompt_pad = torch.full((B, K), -100, dtype=labels.dtype, device=device)
         full_labels = torch.cat([prompt_pad, labels], dim=1)
-        return self.dec.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn,
-            labels=full_labels,
-        )
+
+        embed_layer = self.dec.model.get_input_embeddings()
+        eeg_cast = eeg_embeds.to(embed_layer.weight.dtype)
+
+        def _hook(_module, _inputs, output):
+            output = output.clone()
+            output[:, :K, :] = eeg_cast
+            return output
+
+        handle = embed_layer.register_forward_hook(_hook)
+        try:
+            return self.dec.model(input_ids=full_ids, attention_mask=attn, labels=full_labels)
+        finally:
+            handle.remove()
+
+    def _eeg_placeholder_id(self) -> int:
+        tok = self.dec.tokenizer
+        for cand in (tok.pad_token_id, tok.unk_token_id, tok.eos_token_id, 0):
+            if cand is not None:
+                return int(cand)
+        return 0
 
     # ------------------------------------------------------------------
     # Vocab-extension path
@@ -144,35 +167,59 @@ class EEG2Text(nn.Module):
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
-        else:
-            _, eeg_embeds = self.bridge(feats)
+            return self.dec.tokenizer.batch_decode(out, skip_special_tokens=True)
+
+        # Soft-prompt path: same hook trick as training so Gemma 4's PLE works.
+        _, eeg_embeds = self.bridge(feats)
+        B, K, _ = eeg_embeds.shape
+        pad_id = self._eeg_placeholder_id()
+        prefix_ids = torch.full((B, K), pad_id, dtype=torch.long, device=eeg.device)
+        embed_layer = self.dec.model.get_input_embeddings()
+        eeg_cast = eeg_embeds.to(embed_layer.weight.dtype)
+
+        def _hook(_module, _inputs, output):
+            output = output.clone()
+            output[:, :K, :] = eeg_cast
+            return output
+
+        handle = embed_layer.register_forward_hook(_hook)
+        try:
             out = self.dec.model.generate(
-                inputs_embeds=eeg_embeds,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
+                input_ids=prefix_ids, max_new_tokens=max_new_tokens, do_sample=False,
             )
-        return self.dec.tokenizer.batch_decode(out, skip_special_tokens=True)
+        finally:
+            handle.remove()
+        # ``out`` includes the K placeholder tokens at the start; strip them.
+        return self.dec.tokenizer.batch_decode(out[:, K:], skip_special_tokens=True)
 
     # ------------------------------------------------------------------
     # Trainable-parameter bookkeeping per stage.
     # ------------------------------------------------------------------
 
     def trainables_stage1(self):
-        """Stage 1 — modality alignment: only the bridge (and RVQ if present)."""
+        """Stage 1 — modality alignment.
+
+        - Linear / Q-Former: train the bridge.
+        - Vocab: bridge has no params (offset-add only), so train the new
+          embedding rows directly. They're the only thing connecting EEG
+          codes to Gemma's hidden space.
+        - Off-diagonal vocab (REVE/DIVER-1 × vocab): also train the RVQ head.
+        """
         ps = list(self.bridge.parameters())
         if self.rvq is not None:
             ps += list(self.rvq.parameters())
-        return ps
-
-    def trainables_stage2(self):
-        """Stage 2 — frozen-LM SFT: bridge stays trainable; if vocab bridge,
-        also unfreeze the new rows of the embedding table."""
-        ps = self.trainables_stage1()
         if self.cfg.bridge == "vocab":
             embed = self.dec.model.get_input_embeddings()
             embed.weight.requires_grad_(True)
             ps.append(embed.weight)
         return ps
+
+    def trainables_stage2(self):
+        """Stage 2 — frozen-LM SFT: same as Stage 1 (bridge / RVQ / new vocab
+        rows). The "frozen-LM" name refers to the *pretrained* Gemma weights
+        staying frozen; new vocab rows for vocab cells are still trained.
+        """
+        return self.trainables_stage1()
 
     def trainables_stage3(self):
         """Stage 3 — LoRA SFT: PEFT-injected LoRA params + bridge."""
