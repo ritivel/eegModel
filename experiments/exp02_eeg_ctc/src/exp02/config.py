@@ -109,12 +109,39 @@ class CTCConfig:
     label_prior_weight: float = 0.0  # set to 0.3 for the vanilla "ctc" variant
     label_prior_ema: float = 0.99
 
-    # ----------- SpecAugment -----------
+    # ----------- SpecAugment (numpy-side, per-row, deterministic per row) -----------
     specaugment: bool = True
     specaug_n_time_masks: int = 2
     specaug_time_mask_ms: int = 200
     specaug_n_chan_masks: int = 2
     specaug_chan_mask_max: int = 8
+
+    # ----------- Signal augmentation (GPU-side, per-step, stochastic) -----------
+    # Each augmentation is applied with probability ``*_p`` (or scaled by its
+    # magnitude) per training step. Defaults are OFF so wave-1 keeps its
+    # current behaviour; wave-2 cells enable subsets via CLI flags.
+    # See ``eeg_common.augment`` for the per-augmentation references.
+    signal_aug_time_shift_max_frac: float = 0.0   # Brain Transformer 2025; recommended 0.05
+    signal_aug_channel_dropout_p: float = 0.0     # Strumiłło 2026; recommended 0.5 with frac=0.1
+    signal_aug_channel_dropout_frac: float = 0.1
+    signal_aug_freq_mask_p: float = 0.0           # FFT-band mask; recommended 0.5 with max_hz=8
+    signal_aug_freq_mask_n: int = 2
+    signal_aug_freq_mask_max_hz: float = 8.0
+    signal_aug_time_warp_p: float = 0.0           # Xu 2026; recommended 0.3
+    signal_aug_time_warp_segments: int = 10
+    signal_aug_time_warp_factor_low: float = 0.6
+    signal_aug_time_warp_factor_high: float = 1.7
+    signal_aug_gaussian_noise_sigma: float = 0.0  # additive on z-scored input; recommended 0.05
+    signal_aug_fourier_surrogate_p: float = 0.0   # Strumiłło 2026; recommended 0.2
+    signal_aug_mixup_alpha: float = 0.0           # Beta(α,α) lambda; recommended 0.2-1.0
+
+    # ----------- Text-target augmentation (LLM paraphrase substitution) -----------
+    # With probability ``text_aug_prob``, the trainer substitutes a random
+    # paraphrase of the reference text as the CTC target. Build the
+    # paraphrase parquet once via ``exp02 build-paraphrases``.
+    # Default empty path / 0 prob = disabled.
+    text_aug_paraphrase_path: str = ""
+    text_aug_prob: float = 0.0
 
     # ----------- Decoder (eval-time) -----------
     decode_beam_width: int = 50

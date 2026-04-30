@@ -46,7 +46,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from eeg_common import preprocessing, splits
+from eeg_common import augment, preprocessing, splits
 from eeg_common.data import ALL_SOURCES, EEGSentenceDataset, ZUCO_SOURCES
 
 from . import chars as chars_mod
@@ -54,6 +54,7 @@ from . import storage
 from .chars import BLANK_ID
 from .config import CTCConfig
 from .model import EEG2CTC
+from .text_augment import ParaphraseLookup
 
 
 # ============================================================================
@@ -62,10 +63,15 @@ from .model import EEG2CTC
 
 
 def _collate(rows: list[dict], *, target_sr: int | None,
-             min_T: int = 200, max_T_seconds: float = 12.0):
+             min_T: int = 200, max_T_seconds: float = 12.0,
+             paraphrase_lookup: "ParaphraseLookup | None" = None,
+             text_aug_prob: float = 0.0,
+             text_aug_rng: "np.random.Generator | None" = None):
     """Right-pad EEG to (B, Cmax, Tmax) and collect texts.
 
-    Same DERCo-safety cap as exp01 (12 s ceiling at the resampled rate).
+    With ``paraphrase_lookup`` set and ``text_aug_prob > 0``, replaces each
+    row's reference text with a random paraphrase of itself with the given
+    probability. The original text is kept in ``orig_text`` for diagnostics.
     """
     Bsz = len(rows)
     eeg_arrs = []
@@ -94,11 +100,19 @@ def _collate(rows: list[dict], *, target_sr: int | None,
     while len(channels) < Cmax:
         channels = list(channels) + [f"ch{len(channels):03d}"]
 
+    orig_text = [r["text"] for r in rows]
+    text = list(orig_text)
+    if paraphrase_lookup is not None and text_aug_prob > 0 and text_aug_rng is not None:
+        for i, t in enumerate(orig_text):
+            if float(text_aug_rng.random()) < text_aug_prob:
+                text[i] = paraphrase_lookup.sample(t, rng=text_aug_rng)
+
     return {
         "eeg": eeg,
         "sr": float(target_sr if target_sr is not None else rows[0]["sr"]),
         "channels": list(channels),
-        "text": [r["text"] for r in rows],
+        "text": text,
+        "orig_text": orig_text,
         "subject_ids": [r["participant_id"] for r in rows],
         "datasets": [r["dataset"] for r in rows],
     }
@@ -225,20 +239,69 @@ def train(cfg: CTCConfig) -> Path:
         eval_only=True,
     )
 
+    # ---- text augmentation (paraphrase lookup; loaded once on main proc) ----
+    paraphrase_lookup: ParaphraseLookup | None = None
+    if cfg.text_aug_prob > 0 and cfg.text_aug_paraphrase_path:
+        path = Path(cfg.text_aug_paraphrase_path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"text-aug paraphrase parquet not found at {path}. "
+                "Build with `exp02 build-paraphrases` first."
+            )
+        paraphrase_lookup = ParaphraseLookup(str(path))
+    text_aug_rng = (np.random.default_rng(seed=cfg.seed)
+                    if paraphrase_lookup is not None else None)
+
+    # ---- signal augmentation config (per-step GPU-side) ----
+    signal_aug_cfg = augment.SignalAugmentConfig(
+        time_shift_max_frac=cfg.signal_aug_time_shift_max_frac,
+        channel_dropout_p=cfg.signal_aug_channel_dropout_p,
+        channel_dropout_frac=cfg.signal_aug_channel_dropout_frac,
+        freq_mask_p=cfg.signal_aug_freq_mask_p,
+        freq_mask_n=cfg.signal_aug_freq_mask_n,
+        freq_mask_max_hz=cfg.signal_aug_freq_mask_max_hz,
+        time_warp_p=cfg.signal_aug_time_warp_p,
+        time_warp_segments=cfg.signal_aug_time_warp_segments,
+        time_warp_factor_low=cfg.signal_aug_time_warp_factor_low,
+        time_warp_factor_high=cfg.signal_aug_time_warp_factor_high,
+        gaussian_noise_sigma=cfg.signal_aug_gaussian_noise_sigma,
+        fourier_surrogate_p=cfg.signal_aug_fourier_surrogate_p,
+        mixup_alpha=cfg.signal_aug_mixup_alpha,
+    )
+    signal_aug_active = any([
+        signal_aug_cfg.time_shift_max_frac > 0,
+        signal_aug_cfg.channel_dropout_p > 0,
+        signal_aug_cfg.freq_mask_p > 0,
+        signal_aug_cfg.time_warp_p > 0,
+        signal_aug_cfg.gaussian_noise_sigma > 0,
+        signal_aug_cfg.fourier_surrogate_p > 0,
+    ])
+    signal_aug_gen = (torch.Generator(device="cuda").manual_seed(cfg.seed)
+                      if signal_aug_active else None)
+
     # ---- model ----
     model = EEG2CTC(cfg, vocab).to("cuda")
     target_sr = model.encoder.spec.native_sr
 
-    def make_loader(ds, *, shuffle: bool):
+    def make_loader(ds, *, shuffle: bool, train: bool):
+        # Only the train loader applies text augmentation; dev/eval always
+        # uses the original references so metrics stay comparable.
+        ploookup = paraphrase_lookup if train else None
+        prob = cfg.text_aug_prob if train else 0.0
+        rng = text_aug_rng if train else None
         return DataLoader(
             ds, batch_size=cfg.batch_size, shuffle=shuffle,
             num_workers=cfg.num_workers,
-            collate_fn=lambda b: _collate(b, target_sr=target_sr),
+            collate_fn=lambda b: _collate(
+                b, target_sr=target_sr,
+                paraphrase_lookup=ploookup, text_aug_prob=prob,
+                text_aug_rng=rng,
+            ),
             pin_memory=True, persistent_workers=cfg.num_workers > 0,
         )
 
-    train_dl = make_loader(train_ds, shuffle=True)
-    dev_bank = _dev_sample_bank(make_loader(dev_ds, shuffle=False), k=16)
+    train_dl = make_loader(train_ds, shuffle=True, train=True)
+    dev_bank = _dev_sample_bank(make_loader(dev_ds, shuffle=False, train=False), k=16)
 
     # ---- optimizer ----
     head_params = model.head_trainable_parameters()
@@ -329,6 +392,13 @@ def train(cfg: CTCConfig) -> Path:
             texts = batch["text"]
             targets, target_lengths = vocab.encode_batch(texts, device="cuda")
 
+            # Per-step GPU-side signal augmentation (independent of dataset's
+            # row-deterministic SpecAugment). Generator advances on each call,
+            # so the two CR-CTC views see different augmentations as well.
+            if signal_aug_active:
+                eeg = augment.apply(eeg, sr, signal_aug_cfg,
+                                    generator=signal_aug_gen)
+
             with torch.amp.autocast("cuda", dtype=autocast_dtype, enabled=(autocast_dtype != torch.float32)):
                 # CR-CTC: two SpecAugmented forward passes. Augmentation is
                 # already baked into ``eeg`` by the dataset (single-shot).
@@ -350,6 +420,18 @@ def train(cfg: CTCConfig) -> Path:
                                               device="cuda")
 
                 feats = model.encoder_features(eeg, sr, channels)
+
+                # Optional feature-space mixup. We mix the encoder features
+                # over the batch dim and combine the matching CTC losses
+                # weighted by lam (standard mixup recipe).
+                mixup_perm: torch.Tensor | None = None
+                mixup_lam: torch.Tensor | None = None
+                if signal_aug_cfg.mixup_alpha > 0:
+                    feats, mixup_perm, mixup_lam = augment.feature_mixup(
+                        feats, alpha=signal_aug_cfg.mixup_alpha,
+                        generator=signal_aug_gen,
+                    )
+
                 out_a = model.head_forward(feats, aed_target_ids=aed_inputs)
 
                 # Update running label prior from this batch's mean log-probs.
@@ -363,11 +445,30 @@ def train(cfg: CTCConfig) -> Path:
                         label_prior = (cfg.label_prior_ema * label_prior
                                        + (1.0 - cfg.label_prior_ema) * batch_prior)
 
-                ctc = _ctc_loss_with_prior(
-                    out_a.logits, targets, target_lengths,
-                    label_prior=label_prior if cfg.label_prior_weight > 0 else None,
-                    label_prior_weight=cfg.label_prior_weight,
-                )
+                if mixup_perm is not None and mixup_lam is not None:
+                    # CTC mixup: weight the two per-sample CTC losses by lam,
+                    # 1-lam. The CTC head saw `feats = lam*A + (1-lam)*A[perm]`,
+                    # so the natural targets are A's targets (weight lam) and
+                    # A[perm]'s targets (weight 1-lam).
+                    targets_perm, target_lengths_perm = vocab.encode_batch(
+                        [texts[int(j.item())] for j in mixup_perm], device="cuda")
+                    ctc_a = _ctc_loss_with_prior(
+                        out_a.logits, targets, target_lengths,
+                        label_prior=label_prior if cfg.label_prior_weight > 0 else None,
+                        label_prior_weight=cfg.label_prior_weight,
+                    )
+                    ctc_b = _ctc_loss_with_prior(
+                        out_a.logits, targets_perm, target_lengths_perm,
+                        label_prior=label_prior if cfg.label_prior_weight > 0 else None,
+                        label_prior_weight=cfg.label_prior_weight,
+                    )
+                    ctc = mixup_lam * ctc_a + (1.0 - mixup_lam) * ctc_b
+                else:
+                    ctc = _ctc_loss_with_prior(
+                        out_a.logits, targets, target_lengths,
+                        label_prior=label_prior if cfg.label_prior_weight > 0 else None,
+                        label_prior_weight=cfg.label_prior_weight,
+                    )
                 loss = ctc
                 loss_acc["ctc"] += float(ctc.detach())
 

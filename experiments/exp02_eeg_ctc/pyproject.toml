@@ -36,6 +36,10 @@ dependencies = [
   # Beam search + LM rescore. pyctcdecode picks up the optional kenlm wheel.
   "pyctcdecode>=0.5",
   "kenlm; python_version >= '3.10'",
+
+  # Text-side augmentation (LLM paraphrase via OpenAI)
+  "openai>=1.40",
+  "datasets>=3.0",   # WikiText streaming for BPE / KenLM corpus
 ]
 
 [project.scripts]

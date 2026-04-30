@@ -101,6 +101,15 @@ def _cmd_build_kenlm(args):
     )
 
 
+def _cmd_build_paraphrases(args):
+    from . import text_augment
+    text_augment.build_paraphrases(
+        n_per_sentence=args.n_per_sentence,
+        concurrency=args.concurrency,
+        model=args.model,
+    )
+
+
 # ============================================================================
 # Train / eval / gap / smoke / pilot
 # ============================================================================
@@ -126,19 +135,44 @@ def _parse_cfg_key(key: str) -> dict:
             "input": inp, "fold": int(fold)}
 
 
+_FLOAT_OVERRIDE_FIELDS = (
+    "head_lr", "encoder_lr",
+    "label_prior_weight", "cr_ctc_kl_weight",
+    "intermediate_ctc_weight", "aed_weight",
+    # Signal-aug knobs
+    "signal_aug_time_shift_max_frac",
+    "signal_aug_channel_dropout_p", "signal_aug_channel_dropout_frac",
+    "signal_aug_freq_mask_p", "signal_aug_freq_mask_max_hz",
+    "signal_aug_time_warp_p",
+    "signal_aug_time_warp_factor_low", "signal_aug_time_warp_factor_high",
+    "signal_aug_gaussian_noise_sigma",
+    "signal_aug_fourier_surrogate_p",
+    "signal_aug_mixup_alpha",
+    # Text-aug
+    "text_aug_prob",
+)
+_INT_OVERRIDE_FIELDS = (
+    "total_steps", "warmup_steps", "batch_size", "grad_accum",
+    "encoder_warmup_freeze_steps", "num_workers",
+    "signal_aug_freq_mask_n", "signal_aug_time_warp_segments",
+)
+_STR_OVERRIDE_FIELDS = ("text_aug_paraphrase_path",)
+
+
 def _cli_overrides(args) -> dict:
     out: dict = {}
-    for name in ("total_steps", "warmup_steps", "batch_size", "grad_accum",
-                 "encoder_warmup_freeze_steps", "num_workers"):
+    for name in _INT_OVERRIDE_FIELDS:
         v = getattr(args, name, None)
         if v is not None:
             out[name] = int(v)
-    for name in ("head_lr", "encoder_lr",
-                 "label_prior_weight", "cr_ctc_kl_weight",
-                 "intermediate_ctc_weight", "aed_weight"):
+    for name in _FLOAT_OVERRIDE_FIELDS:
         v = getattr(args, name, None)
         if v is not None:
             out[name] = float(v)
+    for name in _STR_OVERRIDE_FIELDS:
+        v = getattr(args, name, None)
+        if v is not None:
+            out[name] = str(v)
     if getattr(args, "encoder_finetune", None):
         out["encoder_finetune"] = args.encoder_finetune
     if getattr(args, "preprocess", None):
@@ -435,25 +469,12 @@ def _run_parallel(cells, *, header: str) -> None:
 
 
 # Subset of CTCConfig fields the CLI knows how to override. Anything outside
-# this set will trigger a clear error in ``_diff_args`` so we don't silently
-# drop important deltas.
-_DIFF_ABLE_FIELDS = {
-    "preprocess",
-    "encoder_finetune",
-    "encoder_warmup_freeze_steps",
-    "total_steps",
-    "warmup_steps",
-    "head_lr",
-    "encoder_lr",
-    "batch_size",
-    "grad_accum",
-    "num_workers",
-    "specaugment",
-    "label_prior_weight",
-    "cr_ctc_kl_weight",
-    "intermediate_ctc_weight",
-    "aed_weight",
-}
+# this set that diverges from the cfg-key default will trigger a warning in
+# ``_diff_args`` so we don't silently drop important deltas.
+_DIFF_ABLE_FIELDS = (
+    {"preprocess", "encoder_finetune", "specaugment"}
+    | set(_INT_OVERRIDE_FIELDS) | set(_FLOAT_OVERRIDE_FIELDS) | set(_STR_OVERRIDE_FIELDS)
+)
 
 
 def _diff_args(cfg) -> list[str]:
@@ -535,6 +556,25 @@ def _step_flags(p):
     p.add_argument("--cr-ctc-kl-weight", type=float, default=None)
     p.add_argument("--intermediate-ctc-weight", type=float, default=None)
     p.add_argument("--aed-weight", type=float, default=None)
+    # Signal-aug knobs (default OFF; enable per cell)
+    p.add_argument("--signal-aug-time-shift-max-frac", type=float, default=None)
+    p.add_argument("--signal-aug-channel-dropout-p", type=float, default=None)
+    p.add_argument("--signal-aug-channel-dropout-frac", type=float, default=None)
+    p.add_argument("--signal-aug-freq-mask-p", type=float, default=None)
+    p.add_argument("--signal-aug-freq-mask-n", type=int, default=None)
+    p.add_argument("--signal-aug-freq-mask-max-hz", type=float, default=None)
+    p.add_argument("--signal-aug-time-warp-p", type=float, default=None)
+    p.add_argument("--signal-aug-time-warp-segments", type=int, default=None)
+    p.add_argument("--signal-aug-time-warp-factor-low", type=float, default=None)
+    p.add_argument("--signal-aug-time-warp-factor-high", type=float, default=None)
+    p.add_argument("--signal-aug-gaussian-noise-sigma", type=float, default=None)
+    p.add_argument("--signal-aug-fourier-surrogate-p", type=float, default=None)
+    p.add_argument("--signal-aug-mixup-alpha", type=float, default=None)
+    # Text-aug knobs
+    p.add_argument("--text-aug-prob", type=float, default=None,
+                   help="Probability of substituting a paraphrase as the CTC target per row.")
+    p.add_argument("--text-aug-paraphrase-path", default=None,
+                   help="Path to paraphrases parquet (default: $EXP02_DATA_ROOT/text_aug/paraphrases.parquet).")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -558,6 +598,14 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--fold", type=int, default=0)
     sp.add_argument("--max-wiki-lines", type=int, default=1_000_000)
     sp.set_defaults(func=_cmd_build_kenlm)
+
+    sp = sub.add_parser("build-paraphrases",
+                        help="LLM paraphrase ZuCo train sentences (OpenAI). "
+                             "Idempotent; tops up missing entries.")
+    sp.add_argument("--n-per-sentence", type=int, default=3)
+    sp.add_argument("--concurrency", type=int, default=20)
+    sp.add_argument("--model", default="gpt-4o-mini")
+    sp.set_defaults(func=_cmd_build_paraphrases)
 
     sp = sub.add_parser("train")
     sp.add_argument("cfg_key",
