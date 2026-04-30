@@ -121,6 +121,17 @@ def train(cfg: CellConfig) -> Path | None:
     pp_spec = (preprocessing.for_encoder(cfg.preprocess, cfg.encoder)
                if cfg.preprocess != "v1" else None)
 
+    # SpecAugment kwargs (training only; the dataset checks ``eval_only``).
+    specaug_kwargs = (
+        {
+            "n_time_masks": cfg.specaug_n_time_masks,
+            "time_mask_ms": cfg.specaug_time_mask_ms,
+            "n_chan_masks": cfg.specaug_n_chan_masks,
+            "chan_mask_max": cfg.specaug_chan_mask_max,
+        }
+        if cfg.specaugment else None
+    )
+
     # Subject-independent: train sees only training subjects; inputs become
     # noise only when ``cfg.input == "noise_train"`` (Jo et al. §4.3).
     train_ds = data.EEGSentenceDataset(
@@ -129,6 +140,7 @@ def train(cfg: CellConfig) -> Path | None:
         sentence_filter=fold.train_sent_hashes,
         noise="gauss" if cfg.input == "noise_train" else None,
         preprocess=pp_spec,
+        specaugment=specaug_kwargs,
     )
     dev_ds = data.EEGSentenceDataset(
         sources=data.ZUCO_SOURCES,
@@ -136,9 +148,29 @@ def train(cfg: CellConfig) -> Path | None:
         sentence_filter=fold.dev_sent_hashes,
         noise="gauss" if cfg.input == "noise_train" else None,
         preprocess=pp_spec,
+        eval_only=True,  # never apply specaugment to dev
     )
 
     model = EEG2Text(cfg).to("cuda")
+
+    # Track C: optionally unfreeze the encoder via LoRA on its attention
+    # projections. Done BEFORE .to("cuda") would re-freeze; we need to
+    # call after the EEG2Text constructor froze the encoder, then PEFT
+    # marks the new LoRA adapter weights as trainable.
+    encoder_lora_params: list = []
+    if cfg.use_encoder_lora:
+        encoder_lora_params = model.encoder.attach_lora(
+            r=cfg.encoder_lora_r,
+            alpha=cfg.encoder_lora_alpha,
+            dropout=cfg.encoder_lora_dropout,
+        )
+        model.encoder.to("cuda")
+        # IMPORTANT: encoder.encode() is called inside ``with torch.no_grad()``
+        # in model.py because the encoder was assumed frozen. We need to
+        # disable that no_grad context when LoRA is active so gradients flow
+        # back to the LoRA adapters. We patch this by setting a flag the
+        # model checks.
+        model._encoder_trainable = True
     # CTC cells run without a decoder LM, so there's no Gemma tokenizer
     # available. We still need *some* tokenizer for the collator's text
     # padding pipeline (the LM-loss path uses these tensors); for CTC
@@ -189,9 +221,11 @@ def train(cfg: CellConfig) -> Path | None:
     # Effective contrastive batch size: bs × grad_accum (we average over
     # grad_accum sub-batches; the contrastive loss is computed per sub-batch).
     align_w = cfg.stage1_align_weight if cfg.batch_size >= 2 else 0.0
+    # Track C: include encoder LoRA params in every stage's trainables.
+    s1_params = model.trainables_stage1() + encoder_lora_params
     _run_stage(
         model=model, dl=train_dl,
-        params=model.trainables_stage1(),
+        params=s1_params,
         steps=cfg.stage1_steps, lr=cfg.stage1_lr,
         grad_accum=cfg.grad_accum, log=log, samples_log=samples_log,
         stats_log=stats_log, wb=wb, name="stage1",
@@ -202,9 +236,10 @@ def train(cfg: CellConfig) -> Path | None:
     _save(model, cfg, run_dir / "model_stage1.pt", log, wb, name="stage1")
 
     # ---- Stage 2: frozen-LM SFT --------------------------------------------
+    s2_params = model.trainables_stage2() + encoder_lora_params
     _run_stage(
         model=model, dl=train_dl,
-        params=model.trainables_stage2(),
+        params=s2_params,
         steps=cfg.stage2_steps, lr=cfg.stage2_lr,
         grad_accum=cfg.grad_accum, log=log, samples_log=samples_log,
         stats_log=stats_log, wb=wb, name="stage2",

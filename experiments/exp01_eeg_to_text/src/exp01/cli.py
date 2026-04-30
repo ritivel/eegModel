@@ -127,6 +127,10 @@ def _step_overrides(args) -> dict:
         out["preprocess"] = args.preprocess
     if getattr(args, "decoder", None):
         out["decoder"] = args.decoder
+    if getattr(args, "encoder_lora", False):
+        out["use_encoder_lora"] = True
+    if getattr(args, "specaugment", False):
+        out["specaugment"] = True
     return out
 
 
@@ -319,6 +323,10 @@ def _run_parallel(cfg_keys: list[str], *, header: str, step_overrides: dict | No
             extra_args += ["--preprocess", str(v)]
         elif k == "decoder":
             extra_args += ["--decoder", str(v)]
+        elif k == "use_encoder_lora" and v:
+            extra_args += ["--encoder-lora"]
+        elif k == "specaugment" and v:
+            extra_args += ["--specaugment"]
         elif k.startswith("stage") and k.endswith("_steps"):
             extra_args += [f"--{k.replace('_', '-')}", str(v)]
 
@@ -466,6 +474,14 @@ def main(argv: list[str] | None = None) -> None:
                        help="HF decoder model id (overrides CellConfig.decoder). "
                             "e.g. facebook/bart-base, google/flan-t5-base, "
                             "google/gemma-3-1b-it for smaller-LM ablations.")
+        p.add_argument("--encoder-lora", action="store_true",
+                       help="Track C-1: attach PEFT LoRA on the encoder's "
+                            "attention projections (REVE: to_qkv + to_out per "
+                            "layer). Single biggest leverage move per "
+                            "Wav2Vec2-→-brain transfer paper (arXiv 2501.09459).")
+        p.add_argument("--specaugment", action="store_true",
+                       help="Track C-2: SpecAugment-style time + channel "
+                            "masking on training EEG (Park et al. 2019).")
 
     sp = sub.add_parser("train")
     sp.add_argument("cfg_key", help="encoder.bridge.input.fold (e.g. reve.linear.eeg.0)")

@@ -273,6 +273,70 @@ PIPELINES: dict[str, PreprocessSpec] = {
 }
 
 
+# ============================================================================
+# SpecAugment (Park et al. 2019, arXiv 1904.08779) — time + channel masking
+# ============================================================================
+#
+# The standard ASR regulariser. For our setting:
+#   * "Frequency" axis becomes the *channel* axis (we don't have an STFT in
+#     the model input — encoders compute STFT internally for TFM, raw for
+#     REVE; masking channels still produces the same regularisation effect).
+#   * Time-mask width is parameterised in milliseconds so it scales with
+#     whatever sampling rate the row arrives at.
+#
+# Applied on the *training* path only (Track C-2): the collator detects
+# train mode and calls ``specaugment(eeg, sr, ...)`` per row.
+
+
+def specaugment(eeg: np.ndarray, sr: float, *,
+                 n_time_masks: int = 2, time_mask_ms: int = 200,
+                 n_chan_masks: int = 2, chan_mask_max: int = 8,
+                 rng: "np.random.Generator | None" = None,
+                 ) -> np.ndarray:
+    """Apply SpecAugment-style time + channel masking to a (C, T) EEG row.
+
+    Both masks zero out a contiguous span. Default parameters:
+
+    * ``n_time_masks=2``: two independent time spans
+    * ``time_mask_ms=200``: each span up to 200 ms wide (→ 40 samples at 200 Hz)
+    * ``n_chan_masks=2``: two independent channel spans
+    * ``chan_mask_max=8``: each span up to 8 channels wide
+
+    Use a row-deterministic RNG (seed by ``hash((sub, text))``) at training
+    time to keep augmentations stable across epochs of the same sample —
+    this matches the SpecAugment paper's "single-shot" augmentation
+    convention rather than re-sampling per epoch.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    out = eeg.copy()
+    C, T = out.shape
+
+    # Time masks
+    max_t = max(1, int(round(time_mask_ms * sr / 1000.0)))
+    for _ in range(n_time_masks):
+        if T <= 1: break
+        w = int(rng.integers(0, max(1, min(max_t, T))))
+        if w <= 0: continue
+        start = int(rng.integers(0, max(1, T - w)))
+        out[:, start : start + w] = 0.0
+
+    # Channel masks
+    for _ in range(n_chan_masks):
+        if C <= 1: break
+        w = int(rng.integers(0, max(1, min(chan_mask_max, C))))
+        if w <= 0: continue
+        start = int(rng.integers(0, max(1, C - w)))
+        out[start : start + w, :] = 0.0
+
+    return out
+
+
+# ============================================================================
+# Encoder-aware pipeline resolver
+# ============================================================================
+
+
 def for_encoder(preset: str, encoder: str) -> PreprocessSpec:
     """Resolve `(preset, encoder)` into the concrete spec.
 

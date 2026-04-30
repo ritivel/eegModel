@@ -12,6 +12,11 @@ Each encoder advertises:
 
 Discrete encoders (TFM by default; REVE/DIVER-1 if attached to an RVQ head)
 also expose ``tokenize`` -> LongTensor (B, T_seq) for vocab-extension bridges.
+
+Encoders also expose ``attach_lora()`` (Track C) so the trainer can
+unfreeze a small adapter on the encoder's attention projections — the
+single biggest leverage move per the Wav2Vec2 → brain transfer paper
+(arXiv 2501.09459 Fig 5: full fine-tune > frozen by 15-20% absolute CER).
 """
 
 from __future__ import annotations
@@ -48,6 +53,14 @@ class EEGEncoder(nn.Module):
 
     def tokenize(self, eeg: torch.Tensor, sr: float, channels: list[str]) -> torch.LongTensor:
         raise NotImplementedError(f"{type(self).__name__} is not discrete")
+
+    def attach_lora(self, *, r: int = 8, alpha: int = 16, dropout: float = 0.05):
+        """Wrap the encoder with PEFT LoRA so the trainer can unfreeze it
+        cheaply. Returns the list of newly-trainable parameters (so the
+        caller can append to its optimizer's param list). Default no-op.
+        Subclasses override.
+        """
+        return []
 
 
 # ============================================================================
@@ -89,6 +102,54 @@ class REVEEncoder(EEGEncoder):
             feats = feats.reshape(B, C * T_p, D)
         return feats
 
+
+    def attach_lora(self, *, r: int = 8, alpha: int = 16, dropout: float = 0.05):
+        """Inject PEFT LoRA on REVE's attention projections.
+
+        REVE's per-layer structure (verified by probing brain-bzh/reve-base):
+
+          ``transformer.layers.{i}.0.to_qkv``  Linear(512 -> 1536)  fused Q+K+V
+          ``transformer.layers.{i}.0.to_out``  Linear(512 -> 512)   output projection
+          ``transformer.layers.{i}.1.net.{1,3}``  FFN linears (skipped — overfits)
+
+        We target ``to_qkv`` and ``to_out`` per layer (22 layers × 2 = 44
+        adapter pairs). At r=8: (512+1536) × 8 + (512+512) × 8 = 16384 +
+        8192 ≈ 24k params per adapter pair × 44 = ~1 M trainable params,
+        vs REVE's 69 M total — cheap.
+
+        Returns the new trainable parameter list for the optimizer.
+
+        Reference for the recipe: arXiv 2501.09459 §3.2 "Teaching
+        Wav2Vec2 the Language of the Brain" — full fine-tune of Wav2Vec2
+        beats frozen by 15-20% absolute CER on intracranial brain
+        recordings; LoRA is the lightweight version that recovers most
+        of that gain at <2% of the parameter cost.
+        """
+        from peft import LoraConfig, get_peft_model
+        # The frozen REVE was set requires_grad=False by the EEG2Text
+        # constructor; PEFT will register LoRA modules with requires_grad=True
+        # while keeping the base linear weights frozen.
+        cfg = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            bias="none",
+            # REVE is NOT a CausalLM — the task_type=None path is fine; PEFT
+            # just wraps the targeted Linears with LoRA adapters.
+            task_type=None,
+            target_modules=r".*transformer\.layers\.\d+\.0\.(to_qkv|to_out)$",
+        )
+        wrapped = get_peft_model(self.model, cfg)
+        # Replace self.model with the wrapped PEFT model so subsequent
+        # ``encode()`` calls use the LoRA-augmented forward.
+        self.model = wrapped
+        new_params = [p for p in wrapped.parameters() if p.requires_grad]
+        n_trainable = sum(p.numel() for p in new_params)
+        n_total = sum(p.numel() for p in wrapped.parameters())
+        print(f"[REVE-LoRA] r={r} alpha={alpha} dropout={dropout}; "
+              f"trainable {n_trainable:,} / {n_total:,} "
+              f"({100.0 * n_trainable / max(1, n_total):.2f}%)", flush=True)
+        return new_params
 
     def _safe_positions(self, channel_names: list[str]) -> torch.Tensor:
         """Return a (C, 3) position tensor for ``channel_names``.

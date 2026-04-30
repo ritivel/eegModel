@@ -89,8 +89,14 @@ class EEG2Text(nn.Module):
         text: list[str] | None = None,                # required for CTC
     ):
         # 1) Encoder features.
-        with torch.no_grad():
-            feats = self.encoder.encode(eeg, sr, channels)   # (B, T_seq, d_in)
+        # Track C: if the encoder has LoRA adapters attached, we want
+        # gradients to flow back through it. ``_encoder_trainable`` is set
+        # by train.py after attach_lora.
+        if getattr(self, "_encoder_trainable", False):
+            feats = self.encoder.encode(eeg, sr, channels)
+        else:
+            with torch.no_grad():
+                feats = self.encoder.encode(eeg, sr, channels)   # (B, T_seq, d_in)
 
         # 2) Bridge / loss path.
         if self.cfg.bridge == "ctc":
@@ -243,6 +249,8 @@ class EEG2Text(nn.Module):
 
     @torch.no_grad()
     def generate(self, eeg, sr, channels, *, max_new_tokens: int = 64) -> list[str]:
+        # Encoder LoRA params are still no_grad here (we're in @torch.no_grad
+        # decorator), which is fine for inference.
         feats = self.encoder.encode(eeg, sr, channels)
         if self.cfg.bridge == "ctc":
             tag, logits = self.bridge(feats)                  # (B, T, V)

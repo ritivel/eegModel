@@ -279,7 +279,11 @@ class EEGSentenceDataset:
         noise: str | None = None,
         eval_only: bool = False,
         preprocess: "preprocessing.PreprocessSpec | None" = None,
+        specaugment: dict | None = None,
     ):
+        # ``specaugment`` is a dict of kwargs for ``preprocessing.specaugment``
+        # (or ``None`` to disable). Applied only when ``not eval_only``.
+        self.specaugment_kwargs = specaugment
         import pyarrow.parquet as pq
 
         self.subject_filter = set(subject_filter) if subject_filter else None
@@ -432,6 +436,16 @@ class EEGSentenceDataset:
             sd = eeg.std(axis=1, keepdims=True) + 1e-6
             rng = np.random.default_rng(seed=hash((row["participant_id"], row["sentence_text"])) & 0xFFFFFFFF)
             eeg = (rng.standard_normal(size=eeg.shape).astype("float32") * sd + mu).astype("float32")
+
+        # SpecAugment on training only. Use a row-deterministic RNG so the
+        # mask pattern is stable across epochs of the same sample (matches
+        # the SpecAugment "single-shot" augmentation convention).
+        if self.specaugment_kwargs is not None and not self.eval_only:
+            sa_seed = hash(("specaug", row["participant_id"],
+                            row["sentence_text"])) & 0xFFFFFFFF
+            sa_rng = np.random.default_rng(seed=sa_seed)
+            eeg = preprocessing.specaugment(eeg, sr, rng=sa_rng,
+                                             **self.specaugment_kwargs)
 
         return {
             "eeg": eeg,

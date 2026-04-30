@@ -64,6 +64,27 @@ class CellConfig:
     # ``preprocessing.py`` for the full recipe and citations.
     preprocess: Literal["v1", "v2", "v2_reve", "v2_tfm", "v2_dk25"] = "v1"
 
+    # Track C — ASR-style fixes for the marginal-distribution / blank-collapse
+    # failure modes in soft-prompt + CTC bridges. See results_track_b_ctc.md
+    # §4 for the diagnosis. All default OFF for V1/V2 backwards-compat.
+
+    # Apply LoRA on REVE's attention projections (transformer.layers.{i}.0
+    # .{to_qkv,to_out}). The Wav2Vec2-→-brain transfer paper (arXiv 2501.09459
+    # §3.2 Fig 5) shows full encoder fine-tune beats frozen by 15-20% absolute
+    # CER. LoRA is the lightweight version that recovers most of that gain.
+    use_encoder_lora: bool = False
+    encoder_lora_r: int = 8
+    encoder_lora_alpha: int = 16
+    encoder_lora_dropout: float = 0.05
+
+    # SpecAugment (Park et al. 2019) on the *training* path. Time + channel
+    # masking — standard ASR regulariser; cheap. Auto-disabled at eval.
+    specaugment: bool = False
+    specaug_n_time_masks: int = 2
+    specaug_time_mask_ms: int = 200
+    specaug_n_chan_masks: int = 2
+    specaug_chan_mask_max: int = 8
+
     # Bridge-specific knobs
     qformer_queries: int = 32
     rvq_codebook: int = 8192  # for off-diagonal vocab-extension cells
@@ -118,8 +139,13 @@ class CellConfig:
     @property
     def cell_id(self) -> str:
         prep = "" if self.preprocess == "v1" else f"_pp-{self.preprocess.replace('_', '-')}"
+        suffix = ""
+        if self.use_encoder_lora:
+            suffix += "_elora"
+        if self.specaugment:
+            suffix += "_sa"
         return (f"{self.encoder}_{self.bridge}_{self.input}_fold{self.fold}"
-                f"{prep}_dec-{self._dec_short()}")
+                f"{prep}{suffix}_dec-{self._dec_short()}")
 
     @property
     def cfg_key(self) -> str:
