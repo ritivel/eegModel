@@ -1,0 +1,145 @@
+"""Bridges: encoder features -> decoder input embeddings (or token ids).
+
+All bridges expose a single ``forward(features) -> bridge_output`` where
+``bridge_output`` is one of:
+
+  ``("embed", Tensor[B, K, d_lm])``   for soft-prompt bridges (Linear, Q-Former)
+  ``("ids",   LongTensor[B, K])``     for vocab-extension bridges
+
+The model wrapper (``model.py``) consumes the tagged tuple and routes to
+either ``inputs_embeds=`` (soft-prompt) or ``input_ids=`` (vocab) on the
+Gemma decoder.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+# ============================================================================
+# 1. Linear projector + soft prompt  (LLaVA / Gemma-native)
+# ============================================================================
+
+
+class LinearBridge(nn.Module):
+    """Attention-pool tokens over time, RMSNorm + Linear into d_lm.
+    Byte-identical to ``Gemma4MultimodalEmbedder``: RMSNorm -> Linear.
+    """
+
+    def __init__(self, d_in: int, d_lm: int, n_soft_tokens: int = 32):
+        super().__init__()
+        self.n_soft = n_soft_tokens
+        self.norm = nn.RMSNorm(d_in)
+        self.proj = nn.Linear(d_in, d_lm, bias=False)
+        # Learnable query-bank for fixed-K time pooling.
+        self.queries = nn.Parameter(torch.randn(n_soft_tokens, d_in) * 0.02)
+
+    def forward(self, features: torch.Tensor) -> tuple[str, torch.Tensor]:
+        # features: (B, T_seq, d_in). Cross-attend learnable queries to features.
+        B, T, D = features.shape
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)            # (B, K, D)
+        # Lightweight scaled-dot-product attention (no params).
+        attn = torch.softmax(q @ features.transpose(-1, -2) / (D ** 0.5), dim=-1)
+        pooled = attn @ features                                    # (B, K, D)
+        out = self.proj(self.norm(pooled))                          # (B, K, d_lm)
+        return ("embed", out)
+
+
+# ============================================================================
+# 2. Q-Former  (BLIP-2 / BELT-2)
+# ============================================================================
+
+
+class QFormerBridge(nn.Module):
+    """K learnable queries cross-attend to encoder features through L blocks."""
+
+    def __init__(self, d_in: int, d_lm: int, n_queries: int = 32, n_layers: int = 6, n_heads: int = 8):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(n_queries, d_in) * 0.02)
+        layer = nn.TransformerDecoderLayer(
+            d_model=d_in,
+            nhead=n_heads,
+            dim_feedforward=4 * d_in,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.blocks = nn.TransformerDecoder(layer, num_layers=n_layers)
+        self.proj = nn.Linear(d_in, d_lm, bias=False)
+        self.norm = nn.RMSNorm(d_lm)
+
+    def forward(self, features: torch.Tensor) -> tuple[str, torch.Tensor]:
+        B = features.size(0)
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)          # (B, K, d_in)
+        out = self.blocks(tgt=q, memory=features)                # (B, K, d_in)
+        out = self.norm(self.proj(out))                          # (B, K, d_lm)
+        return ("embed", out)
+
+
+# ============================================================================
+# 3. Vocabulary extension  (NeuroLM-style)
+# ============================================================================
+
+
+class VocabBridge(nn.Module):
+    """Pass-through for already-discrete encoders (TFM).
+
+    The decoder's embedding table must be extended by ``codebook_size`` rows
+    *before* training; ``decoder.py::extend_vocab`` does this once.
+    The bridge then just rebases token ids by the offset so they index the
+    new rows. ``forward`` returns the offset id stream directly.
+    """
+
+    def __init__(self, codebook_size: int, vocab_offset: int):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.vocab_offset = vocab_offset
+
+    def forward(self, tokens: torch.LongTensor) -> tuple[str, torch.LongTensor]:
+        return ("ids", tokens + self.vocab_offset)
+
+
+# ============================================================================
+# 4. RVQ head — turns continuous encoder features into discrete codes for the
+#    off-diagonal (REVE × vocab) and (DIVER-1 × vocab) cells.
+# ============================================================================
+
+
+class RVQHead(nn.Module):
+    """Tiny single-stage VQ over encoder features. Sufficient for the §2.3.2
+    construction that just needs a discrete codebook of comparable size.
+    """
+
+    def __init__(self, d_in: int, codebook_size: int = 8192, decay: float = 0.99):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.codebook = nn.Parameter(torch.randn(codebook_size, d_in) * 0.02)
+        self.decay = decay
+
+    def forward(self, features: torch.Tensor) -> torch.LongTensor:
+        # Nearest-neighbour over the codebook; straight-through gradient is
+        # not needed at inference / vocab-extension time.
+        B, T, D = features.shape
+        f = features.reshape(-1, D)
+        # ||f-c||^2 = ||f||^2 - 2 f.c + ||c||^2
+        d = (f.pow(2).sum(-1, keepdim=True)
+             - 2 * f @ self.codebook.t()
+             + self.codebook.pow(2).sum(-1))
+        ids = d.argmin(dim=-1).reshape(B, T)
+        return ids
+
+
+# ============================================================================
+# Factory
+# ============================================================================
+
+
+def build_bridge(*, kind: str, d_in: int, d_lm: int, n_queries: int, codebook_size: int, vocab_offset: int):
+    if kind == "linear":
+        return LinearBridge(d_in=d_in, d_lm=d_lm, n_soft_tokens=n_queries)
+    if kind == "qformer":
+        return QFormerBridge(d_in=d_in, d_lm=d_lm, n_queries=n_queries)
+    if kind == "vocab":
+        return VocabBridge(codebook_size=codebook_size, vocab_offset=vocab_offset)
+    raise ValueError(f"unknown bridge: {kind}")

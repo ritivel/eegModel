@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exp01-eeg-to-text"
+version = "0.1.0"
+description = "Exp01 — fine-tune three EEG foundation models (REVE / DIVER-1 / TFM-Tokenizer) into open-vocabulary EEG-to-text decoders, evaluated on ZuCo v1+v2 with the Yin et al. unique-sentence + LNSO split and the Jo et al. noise baseline."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pavan Kalyan Tankala" }]
+
+# Hard floors: transformers>=5.5 ships Gemma 4; torch>=2.4 ships nn.RMSNorm.
+dependencies = [
+  "torch>=2.4",
+  "transformers>=5.5",
+  "accelerate>=1.0",
+  "peft>=0.12",
+  "datasets>=3.0",
+  "huggingface_hub>=0.25",
+  "safetensors>=0.4",
+  "einops>=0.8",
+  "scipy>=1.13",
+  "numpy>=1.26,<3",
+  "pyarrow>=16",
+  "scikit-learn>=1.4",
+  "sacrebleu>=2.4",
+  "rouge-score>=0.1.2",
+  "bert-score>=0.3.13",
+  "mne>=1.7",
+  "linear_attention_transformer>=0.19",  # required by TFM-Tokenizer
+  "wandb>=0.18",
+]
+
+[project.scripts]
+exp01 = "exp01.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

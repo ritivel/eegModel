@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.eggs/
+
+# Tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Experiment artifacts (anything under EXP01_DATA_ROOT)
+data/
+*.pt
+*.parquet
+wandb/
+
+# Local secrets / overrides
+.env
+.envrc
