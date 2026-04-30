@@ -64,7 +64,9 @@ def attach_lora(model: nn.Module, *, r: int = 16, alpha: int = 32, dropout: floa
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=r".*self_attn\.(q_proj|k_proj|v_proj|o_proj)(\.linear)?$",
+        # Mandatory ``.linear`` suffix — without it PEFT also picks up the
+        # ``Gemma4ClippableLinear`` wrapper itself (which it can't replace).
+        target_modules=r".*self_attn\.(q_proj|k_proj|v_proj|o_proj)\.linear$",
     )
     return get_peft_model(model, cfg)
 

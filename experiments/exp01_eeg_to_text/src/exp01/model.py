@@ -174,6 +174,7 @@ class EEG2Text(nn.Module):
         B, K, _ = eeg_embeds.shape
         pad_id = self._eeg_placeholder_id()
         prefix_ids = torch.full((B, K), pad_id, dtype=torch.long, device=eeg.device)
+        attn = torch.ones(B, K, dtype=torch.long, device=eeg.device)
         embed_layer = self.dec.model.get_input_embeddings()
         eeg_cast = eeg_embeds.to(embed_layer.weight.dtype)
 
@@ -185,7 +186,10 @@ class EEG2Text(nn.Module):
         handle = embed_layer.register_forward_hook(_hook)
         try:
             out = self.dec.model.generate(
-                input_ids=prefix_ids, max_new_tokens=max_new_tokens, do_sample=False,
+                input_ids=prefix_ids,
+                attention_mask=attn,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
             )
         finally:
             handle.remove()
