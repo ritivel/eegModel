@@ -32,12 +32,21 @@ from .model import EEG2Text
 
 
 def _collate(rows: list[dict], tokenizer, *, target_sr: int | None,
-             max_text_tokens: int = 96, min_T: int = 200):
+             max_text_tokens: int = 96, min_T: int = 200,
+             max_T_seconds: float = 12.0):
     """Right-pad to (B, Cmax, Tmax). Per-row time resample to ``target_sr``
     (when set) so mixed-source batches share a single sampling rate. Time
     axis is also padded up to ``min_T`` (default 200 — REVE's patch_size,
     one second at 200 Hz) so even short sentences make it through encoders
     that require a minimum window.
+
+    DERCo-safety: ``max_T_seconds`` (default 12) caps each row's time axis.
+    DERCo "sentences" are full Grimm fairy tales (372–451 word segments
+    concatenated → 9-minute EEG clips); without this cap, a single batch row
+    can OOM Box A's 80 GB H100 inside TFM-Tokenizer's vocab one_hot
+    (52 GB allocation observed empirically). 12 s at 200 Hz = 2400 samples,
+    well above the ZuCo p99 (~10 s) and below TFM's quadratic-attention floor.
+    Sentences shorter than this are unaffected.
     """
     Bsz = len(rows)
     eeg_arrs = []
@@ -48,6 +57,11 @@ def _collate(rows: list[dict], tokenizer, *, target_sr: int | None,
             x = torch.from_numpy(a).unsqueeze(0)   # (1, C, T)
             x = torch.nn.functional.interpolate(x, size=new_T, mode="linear", align_corners=False)
             a = x.squeeze(0).numpy()
+        # Cap on time axis (DERCo-safety, see docstring).
+        sr_eff = float(target_sr if target_sr is not None else r["sr"])
+        max_T = int(round(max_T_seconds * sr_eff))
+        if a.shape[1] > max_T:
+            a = a[:, :max_T]
         eeg_arrs.append(a)
 
     Cmax = max(a.shape[0] for a in eeg_arrs)

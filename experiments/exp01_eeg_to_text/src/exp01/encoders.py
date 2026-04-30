@@ -71,7 +71,7 @@ class REVEEncoder(EEGEncoder):
     def encode(self, eeg: torch.Tensor, sr: float, channels: list[str]) -> torch.Tensor:
         eeg = _resample(eeg, sr, self.spec.native_sr)
         norm_channels = [_normalize_channel_for_reve(c) for c in channels]
-        positions = self.pos_bank(norm_channels)                  # (C, 3)
+        positions = self._safe_positions(norm_channels)            # (C, 3)
         positions = positions.to(eeg.device).unsqueeze(0).expand(eeg.size(0), -1, -1)
         out = self.model(eeg, positions)
         # REVE's forward returns either a raw Tensor or a HF ModelOutput.
@@ -88,6 +88,39 @@ class REVEEncoder(EEGEncoder):
             B, C, T_p, D = feats.shape
             feats = feats.reshape(B, C * T_p, D)
         return feats
+
+
+    def _safe_positions(self, channel_names: list[str]) -> torch.Tensor:
+        """Return a (C, 3) position tensor for ``channel_names``.
+
+        REVE's stock ``pos_bank`` filters unrecognised names *out* of the
+        result, returning ``(len(matched), 3)`` instead of ``(C, 3)``. When
+        ``len(matched) == 0`` the resulting empty tensor crashes with
+        ``IndexError: tensors used as indices must be long`` (the inner
+        ``self.embedding[indices]`` call fails on the empty float tensor
+        from ``torch.tensor([])``). When ``0 < len(matched) < C`` the
+        downstream encoder forward gets a position-vs-channel-count
+        mismatch.
+
+        Wrap it: look up each channel individually; for unknown channels
+        substitute a fallback position. The fallback is the mean of all
+        recognised positions in the batch (best informationless guess);
+        if every channel is unknown (``eeg_sem_relev`` with anonymised
+        ``ch01..ch32`` names), use the centroid of the entire pos_bank.
+        """
+        mapping = self.pos_bank.mapping
+        embedding = self.pos_bank.embedding              # (N_known, 3)
+        matched_idx = [mapping.get(c) for c in channel_names]
+        recognised = [embedding[i] for i in matched_idx if i is not None]
+        if recognised:
+            fallback = torch.stack(recognised, dim=0).mean(dim=0)
+        else:
+            fallback = embedding.mean(dim=0)
+        out = torch.stack([
+            embedding[i] if i is not None else fallback
+            for i in matched_idx
+        ], dim=0)
+        return out                                       # (C, 3) on pos_bank's device
 
 
 def _normalize_channel_for_reve(name: str) -> str:
