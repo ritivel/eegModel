@@ -109,25 +109,40 @@ class VocabBridge(nn.Module):
 class RVQHead(nn.Module):
     """Tiny single-stage VQ over encoder features. Sufficient for the §2.3.2
     construction that just needs a discrete codebook of comparable size.
+
+    Returns a tuple ``(ids, commit_loss)``. ``ids`` is the discrete code
+    sequence (LongTensor (B, T)). ``commit_loss`` is the standard VQ-VAE
+    commitment loss — added to the LM loss in trainables_stage1 so that the
+    codebook actually moves toward the encoder distribution. Without this,
+    the codebook stays at its random initialisation forever (because integer
+    ids cut the gradient to the LM).
     """
 
-    def __init__(self, d_in: int, codebook_size: int = 8192, decay: float = 0.99):
+    def __init__(self, d_in: int, codebook_size: int = 8192,
+                 commitment_weight: float = 0.25):
         super().__init__()
         self.codebook_size = codebook_size
         self.codebook = nn.Parameter(torch.randn(codebook_size, d_in) * 0.02)
-        self.decay = decay
+        self.commitment_weight = commitment_weight
+        self.last_commit_loss: torch.Tensor | None = None
 
     def forward(self, features: torch.Tensor) -> torch.LongTensor:
-        # Nearest-neighbour over the codebook; straight-through gradient is
-        # not needed at inference / vocab-extension time.
         B, T, D = features.shape
         f = features.reshape(-1, D)
-        # ||f-c||^2 = ||f||^2 - 2 f.c + ||c||^2
+        # ||f-c||^2 = ||f||^2 - 2 f.c + ||c||^2 — argmin over codes.
         d = (f.pow(2).sum(-1, keepdim=True)
              - 2 * f @ self.codebook.t()
              + self.codebook.pow(2).sum(-1))
-        ids = d.argmin(dim=-1).reshape(B, T)
-        return ids
+        ids_flat = d.argmin(dim=-1)
+        # Commitment loss: pull codebook entries toward the encoder
+        # features that select them, and (with a smaller coefficient) pull
+        # encoder features toward their selected code (the latter only
+        # matters if the encoder is trainable; harmless when it's frozen).
+        codes = self.codebook[ids_flat]                                     # (B*T, D)
+        commit = ((codes - f.detach()).pow(2).mean()
+                  + self.commitment_weight * (codes.detach() - f).pow(2).mean())
+        self.last_commit_loss = commit
+        return ids_flat.reshape(B, T)
 
 
 # ============================================================================

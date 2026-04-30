@@ -18,6 +18,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from . import data, decoder, storage
@@ -146,6 +147,9 @@ def train(cfg: CellConfig) -> Path | None:
     dev_samples = _dev_sample_bank(dev_dl, k=16)
 
     # ---- Stage 1: alignment ------------------------------------------------
+    # Effective contrastive batch size: bs × grad_accum (we average over
+    # grad_accum sub-batches; the contrastive loss is computed per sub-batch).
+    align_w = cfg.stage1_align_weight if cfg.batch_size >= 2 else 0.0
     _run_stage(
         model=model, dl=train_dl,
         params=model.trainables_stage1(),
@@ -153,6 +157,8 @@ def train(cfg: CellConfig) -> Path | None:
         grad_accum=cfg.grad_accum, log=log, samples_log=samples_log,
         stats_log=stats_log, wb=wb, name="stage1",
         dev_samples=dev_samples, generate_every=max(1, cfg.stage1_steps // 4),
+        align_weight=align_w, align_temperature=cfg.stage1_align_temperature,
+        rvq_commit_weight=cfg.rvq_commit_weight,
     )
     _save(model, cfg, run_dir / "model_stage1.pt", log, wb, name="stage1")
 
@@ -164,6 +170,8 @@ def train(cfg: CellConfig) -> Path | None:
         grad_accum=cfg.grad_accum, log=log, samples_log=samples_log,
         stats_log=stats_log, wb=wb, name="stage2",
         dev_samples=dev_samples, generate_every=max(1, cfg.stage2_steps // 4),
+        align_weight=0.0, align_temperature=cfg.stage1_align_temperature,
+        rvq_commit_weight=cfg.rvq_commit_weight,
     )
     _save(model, cfg, run_dir / "model_stage2.pt", log, wb, name="stage2")
 
@@ -177,6 +185,8 @@ def train(cfg: CellConfig) -> Path | None:
             grad_accum=cfg.grad_accum, log=log, samples_log=samples_log,
             stats_log=stats_log, wb=wb, name="stage3",
             dev_samples=dev_samples, generate_every=max(1, cfg.stage3_steps // 4),
+            align_weight=0.0, align_temperature=cfg.stage1_align_temperature,
+            rvq_commit_weight=0.0,
         )
 
     # ---- Save final --------------------------------------------------------
@@ -201,6 +211,9 @@ def _run_stage(
     model, dl, params, steps: int, lr: float, grad_accum: int,
     log, samples_log, stats_log, wb,
     name: str, dev_samples: list[dict], generate_every: int,
+    align_weight: float = 0.0,
+    align_temperature: float = 0.07,
+    rvq_commit_weight: float = 0.0,
 ):
     opt = torch.optim.AdamW([p for p in params if p.requires_grad], lr=lr)
     sched = torch.optim.lr_scheduler.LinearLR(
@@ -213,11 +226,15 @@ def _run_stage(
     log.write(json.dumps({
         "event": "stage_start", "stage": name, "steps": steps, "lr": lr,
         "trainable_params": _count(params),
+        "align_weight": align_weight,
+        "rvq_commit_weight": rvq_commit_weight,
     }) + "\n"); log.flush()
 
     for step in range(1, steps + 1):
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
+        align_acc = 0.0
+        commit_acc = 0.0
         for _ in range(grad_accum):
             batch = next(it)
             batch = {
@@ -230,8 +247,25 @@ def _run_stage(
                 text_attention_mask=batch["text_attention_mask"],
                 labels=batch["labels"],
             )
-            (out.loss / grad_accum).backward()
-            loss_acc += float(out.loss.detach())
+            lm_loss = out.loss
+            extra = []
+
+            aux = getattr(model, "_last_aux", None) or {}
+            if align_weight > 0 and aux.get("bridge_pooled") is not None \
+               and aux["bridge_pooled"].size(0) >= 2:
+                a_loss = _infonce_align(
+                    aux["bridge_pooled"], aux["text_pooled"], align_temperature,
+                )
+                extra.append(align_weight * a_loss)
+                align_acc += float(a_loss.detach())
+            commit = aux.get("commit_loss", 0.0)
+            if rvq_commit_weight > 0 and isinstance(commit, torch.Tensor):
+                extra.append(rvq_commit_weight * commit)
+                commit_acc += float(commit.detach())
+
+            total = lm_loss + sum(extra) if extra else lm_loss
+            (total / grad_accum).backward()
+            loss_acc += float(lm_loss.detach())
         gnorm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
         opt.step()
         sched.step()
@@ -241,16 +275,23 @@ def _run_stage(
             payload = {
                 "stage": name, "step": step,
                 "loss": loss_acc / grad_accum,
+                "align_loss": align_acc / grad_accum,
+                "commit_loss": commit_acc / grad_accum,
                 "grad_norm": gnorm,
                 "lr": lr_now,
                 "elapsed": round(time.time() - t0, 1),
             }
             log.write(json.dumps(payload) + "\n"); log.flush()
             if wb is not None:
-                wb.log({f"{name}/loss": payload["loss"],
-                        f"{name}/grad_norm": gnorm,
-                        f"{name}/lr": lr_now,
-                        "stage": _stage_idx(name), "step": step})
+                wb_payload = {f"{name}/loss": payload["loss"],
+                              f"{name}/grad_norm": gnorm,
+                              f"{name}/lr": lr_now,
+                              "stage": _stage_idx(name), "step": step}
+                if align_weight > 0:
+                    wb_payload[f"{name}/align_loss"] = payload["align_loss"]
+                if rvq_commit_weight > 0:
+                    wb_payload[f"{name}/commit_loss"] = payload["commit_loss"]
+                wb.log(wb_payload)
 
         # Periodic sample generations (debug)
         if step % generate_every == 0 or step == steps:
@@ -259,6 +300,25 @@ def _run_stage(
             _log_feature_stats(model, dev_samples, stats_log, wb,
                                stage=name, step=step)
             model.train()  # generate() flips to eval
+
+
+def _infonce_align(bridge_pooled: torch.Tensor, text_pooled: torch.Tensor,
+                   temperature: float) -> torch.Tensor:
+    """Symmetric CLIP-style InfoNCE between bridge and text pooled vectors.
+
+    bridge_pooled: (B, d) — has gradient through the bridge / RVQ / new
+                   embed rows.
+    text_pooled:   (B, d) — frozen text-token embeddings (no grad).
+    Returns a scalar loss that the trainer scales by ``align_weight``.
+
+    Compute in fp32 for numerical stability (Gemma runs in bf16).
+    """
+    b = F.normalize(bridge_pooled.float(), dim=-1)
+    t = F.normalize(text_pooled.float(), dim=-1)
+    logits = b @ t.t() / max(temperature, 1e-6)
+    targets = torch.arange(b.size(0), device=b.device)
+    return 0.5 * (F.cross_entropy(logits, targets)
+                  + F.cross_entropy(logits.t(), targets))
 
 
 # ============================================================================

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+
 from . import storage
 
 DATASET_REPO = "tankalapavankalyan/exp01-eeg-to-text-sentences"
@@ -363,8 +365,6 @@ def _row_to_array(row: dict):
     Prefers ``sentence_eeg`` (channels-first, full sentence) when available
     (ZuCo); falls back to concatenating ``word_eeg_segments`` along time.
     """
-    import numpy as np
-
     if row.get("sentence_eeg"):
         # list[list[float]] of shape [channels][time]
         return np.asarray(row["sentence_eeg"], dtype="float32")

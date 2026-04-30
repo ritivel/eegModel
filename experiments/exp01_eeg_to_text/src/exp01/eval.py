@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from . import data, storage
+from . import data, decoder, storage
 from .config import CellConfig
 from .model import EEG2Text
 from .train import _collate
@@ -125,7 +125,39 @@ def evaluate_cell(cfg: CellConfig, *, ckpt_path: Path | None = None) -> dict:
         else:
             ckpt_path = storage.RUNS / cfg.cell_id / "model.pt"
     state = torch.load(ckpt_path, map_location="cuda")
-    model.load_state_dict(state["state_dict"], strict=False)
+    sd = state["state_dict"]
+
+    # If the checkpoint was saved AFTER ``train.py`` attached LoRA (i.e. stage 3
+    # ran), every decoder key is renamed under PEFT's ``base_model.model.``
+    # prefix — including the trained extended-vocab embedding rows. Without
+    # re-attaching LoRA here, ``load_state_dict(strict=False)`` silently drops
+    # ALL of those keys and eval runs on a fresh-from-pretrained decoder with
+    # random vocab rows + zero LoRA. Detect that case and rewrap.
+    has_lora_keys = any("lora_" in k for k in sd.keys())
+    if has_lora_keys:
+        model.dec.model = decoder.attach_lora(
+            model.dec.model, r=cfg.lora_r, alpha=cfg.lora_alpha
+        )
+        model.to("cuda")
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # Loud diagnostic so this class of bug shouts instead of fails silently.
+    if missing or unexpected:
+        # The PEFT-wrapped state dict contains some auxiliary buffers (e.g.
+        # ``base_model.model.lm_head.weight`` is tied to the embedding) that
+        # legitimately don't appear in the live module's state_dict, so a
+        # handful of "unexpected" is OK — but we surface counts so anything
+        # in the hundreds (the previous silent-failure mode) gets noticed.
+        print(
+            f"[eval] load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}, "
+            f"saved={len(sd)}, has_lora_keys={has_lora_keys}",
+            flush=True,
+        )
+        if len(missing) > 50 or len(unexpected) > 50:
+            print(f"[eval] WARNING: large key mismatch — eval may be running on the wrong weights",
+                  flush=True)
+            print(f"[eval]   first 5 missing:    {missing[:5]}", flush=True)
+            print(f"[eval]   first 5 unexpected: {unexpected[:5]}", flush=True)
     model.eval()
 
     tokenizer = model.dec.tokenizer

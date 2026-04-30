@@ -80,10 +80,65 @@ class EEG2Text(nn.Module):
             else:
                 ids = self.rvq(feats)
             tag, eeg_ids = self.bridge(ids)
-            return self._forward_with_ids(eeg_ids, text_input_ids, text_attention_mask, labels)
+            out = self._forward_with_ids(eeg_ids, text_input_ids, text_attention_mask, labels)
+            self._stash_aux(eeg_ids=eeg_ids, eeg_embeds=None,
+                            text_input_ids=text_input_ids,
+                            text_attention_mask=text_attention_mask)
+            return out
 
         tag, eeg_embeds = self.bridge(feats)
-        return self._forward_with_embeds(eeg_embeds, text_input_ids, text_attention_mask, labels)
+        out = self._forward_with_embeds(eeg_embeds, text_input_ids, text_attention_mask, labels)
+        self._stash_aux(eeg_ids=None, eeg_embeds=eeg_embeds,
+                        text_input_ids=text_input_ids,
+                        text_attention_mask=text_attention_mask)
+        return out
+
+    # ------------------------------------------------------------------
+    # Auxiliary tensors for contrastive alignment loss + RVQ commitment.
+    # Stashed on ``self._last_aux`` after each forward so the trainer can
+    # read them without changing the HF-style forward return type.
+    # ``bridge_pooled``: (B, d_lm), sentence-pooled bridge output (in d_lm).
+    # ``text_pooled``  : (B, d_lm), sentence-pooled frozen text embeddings.
+    # ``commit_loss``  : scalar tensor or 0.0 (only nonzero for off-diagonal
+    #                    vocab cells with a continuous encoder + RVQ).
+    # ------------------------------------------------------------------
+
+    def _stash_aux(
+        self,
+        *,
+        eeg_ids: torch.LongTensor | None,
+        eeg_embeds: torch.Tensor | None,
+        text_input_ids: torch.LongTensor,
+        text_attention_mask: torch.LongTensor,
+    ) -> None:
+        embed_layer = self.dec.model.get_input_embeddings()
+        with torch.no_grad():
+            text_emb = embed_layer(text_input_ids)                # (B, L, d_lm)
+            tmask = text_attention_mask.to(text_emb.dtype).unsqueeze(-1)
+            text_pooled = (text_emb * tmask).sum(dim=1) / tmask.sum(dim=1).clamp(min=1)
+
+        if eeg_embeds is not None:
+            bridge_pooled = eeg_embeds.to(text_emb.dtype).mean(dim=1)
+        else:
+            assert eeg_ids is not None
+            # NOTE: deliberately NOT inside no_grad — for vocab cells in
+            # stages 1+2 the new vocab rows of the embed table are trainable,
+            # and we want the alignment loss to push them toward text-token
+            # geometry. The backward hook installed in trainables_stage1 zeros
+            # gradients on the old (frozen) rows, so only the new EEG-vocab
+            # rows actually learn from this signal.
+            eeg_emb = embed_layer(eeg_ids)                       # (B, K, d_lm)
+            bridge_pooled = eeg_emb.mean(dim=1)
+
+        commit_loss: torch.Tensor | float = 0.0
+        if self.rvq is not None and self.rvq.last_commit_loss is not None:
+            commit_loss = self.rvq.last_commit_loss
+
+        self._last_aux = {
+            "bridge_pooled": bridge_pooled,
+            "text_pooled": text_pooled,
+            "commit_loss": commit_loss,
+        }
 
     # ------------------------------------------------------------------
     # Soft-prompt path (Linear / Q-Former)

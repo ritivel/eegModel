@@ -64,6 +64,20 @@ class CellConfig:
     # Stage-1 modality alignment (encoder + LM frozen)
     stage1_steps: int = 2_000
     stage1_lr: float = 1e-4
+    # CLIP-style InfoNCE between sentence-pooled bridge output and
+    # sentence-pooled (frozen) text-token embeddings. Forces the bridge to
+    # encode sentence-discriminating information instead of collapsing onto a
+    # constant prefix that just nudges Gemma's LM prior. Skipped automatically
+    # when ``batch_size * grad_accum < 2`` (need negatives in the batch).
+    # See BELT-2 §2.2 (BPE-CL), CET-MAE (Wang et al. 2024a),
+    # Defossez/King 2025 (CLIP loss for non-invasive M/EEG decoding).
+    stage1_align_weight: float = 1.0
+    stage1_align_temperature: float = 0.07
+    # Commitment loss weight for off-diagonal vocab cells (REVE+vocab,
+    # DIVER-1+vocab) that go through ``RVQHead``. Without it the random
+    # codebook never moves and the model is essentially hashing EEG to
+    # vocabulary slots at random.
+    rvq_commit_weight: float = 1.0
 
     # Stage-2 frozen-LM SFT
     stage2_steps: int = 6_000
