@@ -1,8 +1,19 @@
 # Track B — CTC (ASR-style direct EEG → char decoding)
 
-**Status:** in flight. Lead cell `reve.ctc.eeg.0` launched on Box B at
-**20:58 IST**, Apr-30. Other CTC cells will fan out to Box A GPUs as
-Track-A cells finish.
+**Status:** Lead cell `reve.ctc.eeg.0` finished on Box B at **21:43 IST**;
+8 more CTC cells running on Box A (started 21:11–21:34 IST). Final
+matched-pair §4.3 results expected ~22:15 IST.
+
+**Headline (lead cell only, full matched-pair table after 22:15):**
+The CTC cell's BLEU-1 = **0.2606 [0.237, 0.287]** is **2.06× higher**
+than the V2 noise baseline (0.1263). BLEU-2 is **11× higher** (0.186
+vs 0.017). But the qualitative output is mostly blanks + the most
+common letters (`'  a a a a   a a a  a   a ii  .'`), which suggests
+the CTC head learned the marginal char distribution rather than
+EEG-driven content. **The matched noise-CTC baseline (still training,
+~22:00 IST) will tell us whether this is an EEG signal or just a
+char-prior**. See §3 for the partial result + interpretation.
+
 **Hypothesis:** Bypass the LM-prior trap entirely. If we skip the frozen
 Gemma decoder and train the encoder + a small CTC head directly on
 char-level cross-entropy, *any* signal in the output is unambiguously
@@ -210,6 +221,121 @@ recognisable text.
 
 ---
 
+## 3. First CTC result — `reve.ctc.eeg.0` (Box B, finished 21:43 IST)
+
+### 3.1 Quantitative
+
+
+| metric | mean | 95% CI | vs V2 noise floor (soft-prompt) |
+| ------ | ---- | ------ | ------------------------------- |
+| **BLEU-1** | **0.2606** | [0.2366, 0.2865] | **2.06× higher than 0.1263** |
+| **BLEU-2** | **0.1861** | [0.1628, 0.2095] | **10.7× higher than 0.0174** |
+| BLEU-3 | 0.0441 | [0.0358, 0.0532] | 5.2× higher than 0.0085 |
+| BLEU-4 | 0.0155 | [0.0124, 0.0193] | 3.3× higher than 0.0047 |
+| ROUGE-1-F | 0.0282 | [0.0230, 0.0339] | **0.22× of 0.1277** (lower — CTC hyps are short) |
+| **CER** | **0.8135** | [0.8070, 0.8224] | (soft-prompt CER ≈ 2.4 — saturated) |
+| WER | 1.0219 | [0.9997, 1.0507] | (~ length ratio; almost no exact word match) |
+| BERTScore-F1 | −0.4998 | [−0.5223, −0.4785] | much lower (CTC outputs aren't semantic) |
+
+`n_test = 257`, `n_unique (first 80 chars) = 231 / 257 = 89.9%`
+(vs noise soft-prompt's 18/257 = 7%, and Track-A's best
+`reve.qformer.eeg.0` at 52/257 = 20%).
+
+### 3.2 Qualitative — what the CTC cell actually generates
+
+> **REF:** *"Ultimately feels empty and unsatisfying, like swallowing a Communion wafer without the wine."*
+> **HYP:** *`'  a a a a   a a a  a   a ii        .'`*
+>
+> **REF:** *"This version moves beyond the original's nostalgia for the communal film experiences of yesteryear…"*
+> **HYP:** *`'  a a o a   a a a  a    i ii i       .'`*
+>
+> **REF:** *"The Movie will reach far beyond its core demographic."*
+> **HYP:** *`'            i      .'`*
+>
+> **REF:** *"At times, the movie looks genuinely pretty."*
+> **HYP:** *`' a    ai   a a a a   a a i i     a .'`*
+>
+> **REF:** *"It depends on how well flatulence gags fit into your holiday concept."*
+> **HYP:** *`' a  a  a   a a a     a i      .'`*
+
+The CTC head is producing **space-dominated output with sparse letters
+(mostly `a`, `i`, occasional `o`) and a final `.`**. Hypothesis length
+median is **32 chars vs reference median 108 chars** — CTC is heavily
+emitting BLANK and the most common chars.
+
+This is a classic CTC partial-collapse failure mode: the head learned
+the **marginal character distribution** (`' '` is the most common char
+in English text, then `e`, then `t`, etc., but the head specifically
+learned `' '` and `'a'` and `'i'`). It also learned that English
+sentences end in `.`. It has *not* learned letter-by-letter EEG
+decoding.
+
+### 3.3 Why the BLEU is so high
+
+This output drives high BLEU-1 because:
+
+- BLEU-1 counts unigram overlap between hyp and ref. The hyp is mostly
+  `' '` and `'a'`; both `' '` and `'a'` appear many times in every ref.
+  At the *character* level (sacrebleu's default), `' '`, `'a'`, `'i'`,
+  `'.'` are extremely common in any English sentence.
+- BLEU-2 counts bigram overlap. `' a'`, `'a '`, `' i'`, etc., are also
+  extremely common bigrams.
+- **The hyp is short, which inflates *precision*.** BLEU is precision-
+  oriented; a short hyp gets high precision if every char it emits
+  appears in the ref. The brevity penalty does kick in (hyp length
+  ≈ 30% of ref length, so BP ≈ exp(1 − 1/0.3) ≈ 0.10), but the raw
+  precision is so high it still beats noise soft-prompt by 2×.
+
+In short: **the CTC head is gaming BLEU**. The high BLEU-1/2 is a
+real artefact of CTC's char-level operation, not evidence of EEG-driven
+content.
+
+### 3.4 What the matched noise CTC baseline will tell us
+
+The clean §4.3 test for CTC: **does `reve.ctc.eeg.0` BLEU-1/CER beat
+`reve.ctc.noise_train.0` BLEU-1/CER?**
+
+Three possible outcomes when the noise CTC cell finishes (~22:00 IST):
+
+1. **Noise CTC ≈ 0.26 BLEU-1 too** → the high BLEU is purely the
+   marginal-char-distribution prior, no EEG signal. CTC does *not*
+   escape the prior trap, it just changed which prior dominates. We'd
+   need beam search + char-LM rescore to make CTC meaningful.
+2. **Noise CTC < 0.26 BLEU-1 (e.g. 0.15–0.20)** → there's a real EEG
+   signal in the gap. The strength of the gap quantifies how much
+   useful info the encoder gives the CTC head.
+3. **Noise CTC produces longer / less-collapsed output but with
+   different chars** → comparison is messy; need to look at CER + WER
+   patterns, possibly per-word rank metrics.
+
+The CER of `reve.ctc.eeg.0` is 0.81 — meaning average edit distance
+is 81% of ref length. For an empty hyp, CER would be 1.0; for a hyp
+that's a perfectly correct transcript, CER would be 0. So 0.81 says
+the model is *somewhere between random and empty*, plus a length bias.
+
+**Important caveat for the matched test:** the noise CTC cell sees
+per-row Gaussian noise with the same per-channel mean/std as the EEG.
+After V2 z-score, the noise has std ≈ 1 like the EEG. The CTC head
+will likely still learn the same marginal char distribution from the
+*targets* (which are unchanged English) — so noise CTC probably also
+gets BLEU-1 ≈ 0.26. **If so, the §4.3 verdict on CTC is the same as
+on soft-prompt: the model is decoding from an output prior, not from
+EEG.**
+
+This would tell us that even CTC isn't enough on its own; what's
+needed is either:
+- More training steps (the CTC loss is still around 3.0; could be
+  much lower with 12k steps), OR
+- A different supervision signal (word-level alignment with a real
+  language model rescorer, BELT-2 style), OR
+- A different encoder (REVE / TFM may simply not produce
+  text-discriminative features at the resolution / channel layout
+  ZuCo provides).
+
+The remaining 8 Track-B cells will tell us which.
+
+---
+
 ## 6. Reproducibility / artifacts (will populate as cells finish)
 
 
@@ -218,7 +344,7 @@ recognisable text.
 | per-cell `metrics.json` + `predictions.parquet` | `$EXP01_DATA_ROOT/eval/<cell_id>/`                                                                                                  |
 | per-step training logs (CTC loss, grad_norm)    | `$EXP01_DATA_ROOT/runs/<cell_id>/log.jsonl`                                                                                         |
 | dev-sample CTC decodings during training        | `$EXP01_DATA_ROOT/runs/<cell_id>/sample_gens.jsonl`                                                                                 |
-| W&B project                                     | [https://wandb.ai/ritivel-eeg-ritivel/exp01-eeg-to-text](https://wandb.ai/ritivel-eeg-ritivel/exp01-eeg-to-text) (filter `*_ctc_`*) |
+| W&B project                                     | [https://wandb.ai/ritivel-eeg-ritivel/exp01-eeg-to-text](https://wandb.ai/ritivel-eeg-ritivel/exp01-eeg-to-text) (filter `*_ctc`_*) |
 
 
 Cell-id format for Track B: `<encoder>_ctc_<input>_fold<n>_pp-v2_dec-gemma4-e2b`.
