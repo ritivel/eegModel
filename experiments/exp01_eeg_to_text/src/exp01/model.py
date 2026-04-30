@@ -188,6 +188,12 @@ class EEG2Text(nn.Module):
         eeg_cast = eeg_embeds.to(embed_layer.weight.dtype)
 
         def _hook(_module, _inputs, output):
+            # During incremental decoding the model only re-embeds the latest
+            # token (output.shape[1] == 1) and uses the KV cache for the
+            # prefix — the EEG embeds are already baked into the cache, so
+            # we only inject on the FIRST forward call (the full prefix).
+            if output.shape[1] < K:
+                return output
             output = output.clone()
             output[:, :K, :] = eeg_cast
             return output
