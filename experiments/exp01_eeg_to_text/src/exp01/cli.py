@@ -86,6 +86,16 @@ def _cmd_inspect_channels(args):
 # ============================================================================
 
 
+def _finish_wandb():
+    """Close any active W&B run (no-op if none)."""
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.run.finish()
+    except Exception:
+        pass
+
+
 def _parse_cfg_key(key: str):
     """``encoder.bridge.input.fold`` -> CellConfig kwargs.
     Example: ``reve.linear.eeg.0`` -> CellConfig(encoder='reve',...)."""
@@ -145,7 +155,9 @@ def _cmd_smoke(args):
             fails.append((cfg.cell_id, repr(e)))
             print(f"FAILED: {e}", flush=True)
             _tb.print_exc()
+            _finish_wandb()
             continue
+        _finish_wandb()
 
         run_dir = storage.cell_run_dir(cfg.cell_id)
         eval_dir = storage.cell_eval_dir(cfg.cell_id)
@@ -208,6 +220,7 @@ def _cmd_pilot(args):
             print(f"  FAIL: {type(e).__name__}: {e}", flush=True)
             _tb.print_exc()
             results.append((cfg.cell_id, None, None))
+        _finish_wandb()
 
     print("\n=== Pilot ranking (BLEU-1) ===")
     results.sort(key=lambda r: -(r[1] if r[1] is not None else -1))

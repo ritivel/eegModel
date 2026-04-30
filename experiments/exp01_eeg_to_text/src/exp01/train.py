@@ -184,10 +184,9 @@ def train(cfg: CellConfig) -> Path | None:
     log.write(json.dumps({"event": "done", "ckpt": str(final_ckpt)}) + "\n")
     for f in (log, samples_log, stats_log):
         f.close()
-
-    if wb is not None:
-        wb.finish()
-
+    # Note: don't call wb.finish() here. evaluate_cell() reuses the active
+    # run to log eval metrics + the predictions table; cli/pilot orchestrates
+    # finishing per cell via wandb.finish() between cells.
     return final_ckpt
 
 

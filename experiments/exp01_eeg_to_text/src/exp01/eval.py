@@ -188,15 +188,24 @@ def _wandb_log_eval(cfg: CellConfig, summary: dict, preds: list[dict]):
     if "WANDB_API_KEY" not in os.environ:
         return
     import wandb
-    run = wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "exp01-eeg-to-text"),
-        name=cfg.cell_id,
-        group=f"{cfg.encoder}_{cfg.bridge}",
-        tags=[cfg.encoder, cfg.bridge, cfg.input, f"fold{cfg.fold}", "eval"],
-        config=asdict(cfg),
-        dir=str(storage.WANDB_DIR),
-        resume="allow",
-    )
+
+    # Reuse the active run if training created one for this cell; otherwise
+    # spin up a fresh eval-only run (e.g. when ``exp01 eval`` is called
+    # standalone on a checkpoint).
+    own_run = False
+    run = wandb.run
+    if run is None:
+        run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "exp01-eeg-to-text"),
+            name=cfg.cell_id,
+            group=f"{cfg.encoder}_{cfg.bridge}",
+            tags=[cfg.encoder, cfg.bridge, cfg.input, f"fold{cfg.fold}", "eval"],
+            config=asdict(cfg),
+            dir=str(storage.WANDB_DIR),
+            resume="allow",
+        )
+        own_run = True
+
     run.summary["n_examples"] = len(preds)
     for k, v in summary["scores"].items():
         run.summary[f"eval/{k}"] = v["mean"]
@@ -210,7 +219,8 @@ def _wandb_log_eval(cfg: CellConfig, summary: dict, preds: list[dict]):
         rows = [[p.get(c, None) for c in cols] for p in cap]
         run.log({"predictions": wandb.Table(columns=cols, data=rows)})
 
-    run.finish()
+    if own_run:
+        run.finish()
 
 
 # ============================================================================

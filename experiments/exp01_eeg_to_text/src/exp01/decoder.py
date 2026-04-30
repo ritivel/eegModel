@@ -21,7 +21,11 @@ class LoadedDecoder(nn.Module):
         super().__init__()
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=str(storage.HF_CACHE))
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id, cache_dir=str(storage.HF_CACHE), padding_side="left",
+        )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             cache_dir=str(storage.HF_CACHE),
@@ -45,7 +49,13 @@ def freeze(model: nn.Module) -> nn.Module:
 
 
 def attach_lora(model: nn.Module, *, r: int = 16, alpha: int = 32, dropout: float = 0.05) -> nn.Module:
-    """Wrap with PEFT LoRA on the standard Gemma attention projections."""
+    """Wrap with PEFT LoRA on the standard attention projections.
+
+    Gemma 4 wraps q/k/v/o ``nn.Linear`` layers in ``Gemma4ClippableLinear``,
+    so PEFT's name match doesn't see a raw ``nn.Linear`` named ``q_proj``.
+    The regex below targets the inner ``.linear`` module of those four
+    projections specifically (not every nn.Linear in the model).
+    """
     from peft import LoraConfig, get_peft_model
 
     cfg = LoraConfig(
@@ -54,7 +64,7 @@ def attach_lora(model: nn.Module, *, r: int = 16, alpha: int = 32, dropout: floa
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=r".*self_attn\.(q_proj|k_proj|v_proj|o_proj)(\.linear)?$",
     )
     return get_peft_model(model, cfg)
 
