@@ -10,25 +10,26 @@ to finish. All times in **IST**.
 > | [`README.md`](./README.md) | quick start + run matrix + artifact map |
 > | [`design.md`](./design.md) | design rationale, citations for every knob, full §4.3 verdict rules |
 > | [`wave2_plan.md`](./wave2_plan.md) | augmentation matrix + launch commands for wave-2 |
+> | [`findings.md`](./findings.md) | **wave-1 audit + wave-3 plan (May 1, 08:00 IST)** |
 > | this file | live timeline + per-cell loss snapshots + decisions |
 
 ---
 
-## TL;DR — where we are at 06:41 IST May 1
+## TL;DR — where we are at 09:00 IST May 1
 
-- **Wave-1 pilot**: 14-cell Track-C scope launched on Box A 8× H100 at 23:55 IST Apr 30 via `exp02 pilot --group all --parallel`. Currently ~6h 33min in; first 8 cells at step ≈ 10 200–10 750 / 12 000 (~85% done). Second wave (6 queued cells: intctc + ctcaed + frozen ablations) will auto-start as GPUs free up.
-- **Wave-2 aug-signal**: `reve.bpe1k.crctc.eeg.0` + 6 GPU-side signal augmentations launched on Box B 1× H100 at 00:35 IST May 1. Currently ~6h in; step 8140 / 12 000 (~67% done).
-- **Headline §4.3 signal is real, large, and growing**: at step 10 380 the EEG cell has ctc_loss = **2.68** vs noise twin = **3.15** → **gap −0.47 in CTC loss** (on top of an already-growing trend; was −1.18 at step 10 220 last sample). REVE+CR-CTC is decoding from EEG content, not from priors.
-- **No errors anywhere**. Both orchestrators alive, all 9 cells healthy.
+- **Wave-1 pilot completed at step 12000** on Box A. Final losses are exactly what the audit predicted: REVE+CR-CTC headline ctc=2.91 (eeg) vs 3.68 (noise) → **gap −0.77 in CTC loss**, but the qualitative dev outputs are **30-character non-content gibberish** for both EEG and noise (`'lious about t war ged g im hull hle.'` vs `'the moved sc ling stiousovle.'`). CER ≈ 1 expected for both, §4.3 verdict will be TIE.
+- **Wave-1 root causes** identified (see [`findings.md`](./findings.md) for the full audit): TFM encoder was permanently frozen (bug), no English priors in the head (CTC over a randomly-init transformer), only **1 237 unique training sentences** (sequence-CTC over a 1.2K-sentence vocabulary), substantial data quality issues (DERCo 95% truncated, EMMT 96% zero-padded across channels, NaN rows, multi-paragraph monsters).
+- **Wave-3 launched at 08:30 IST May 1** with all 4 root causes addressed: cleaned data (drop EMMT/DERCo, drop garbage labels, drop > 12 s rows, drop NaN/zero), GPT-4o-mini paraphrase substitution at p=0.5 over the 1 547 ZuCo sentences (× 5 paraphrases each), 6 GPU-side signal augmentations (time shift / channel dropout / freq mask / time warp / fourier surrogate / mixup), and **DistilBERT bridge head** (`LMBridgeHead`) replacing the random-init 4-layer transformer with the 6-layer pretrained DistilBERT encoder.
+- **All 9 GPUs running wave-3**: Box A has 8 cells (4 transformer-only controls + 4 lm-bridge cells across {clean, lm-clean, lm-aug, aug-clean}), Box B running 2 cells sequentially (`char-lm-aug` pair). ETA ~5h on Box A, ~10h on Box B.
 
 ---
 
 ## Compute
 
-| Box | Host | GPUs | Role |
-| --- | --- | --- | --- |
-| **A** | `ubuntu@192.222.53.60` | 8× H100 80GB | Wave-1 Track-C pilot (14 cells via `exp02 pilot --group all --parallel`) |
-| **B** | `ubuntu@192.222.53.81` | 1× H100 80GB | Wave-2 aug-signal headline + matched noise twin (sequential) |
+| Box | Host | GPUs | Role (current) | Role (wave-1) |
+| --- | --- | --- | --- | --- |
+| **A** | `ubuntu@192.222.53.60` | 8× H100 80GB | Wave-3 cells 0–7 (`pilot --group wave3 --parallel --cells :8`) | Wave-1 14-cell Track-C pilot (completed) |
+| **B** | `ubuntu@192.222.53.81` | 1× H100 80GB | Wave-3 cells 8–9 sequential (`pilot --group wave3 --parallel --cells 8:`) | Wave-2 aug-signal headline (killed at step 9 970, wave-3 supersedes) |
 
 SSH: `ssh -i ~/Downloads/modal_biosigtotext ubuntu@<host>`
 W&B: <https://wandb.ai/ritivel-eeg-ritivel/exp02-eeg-ctc>
@@ -63,6 +64,60 @@ share the dataset cache + fold JSONs).
 | May 1 03:30 | Inspected qualitative outputs at step 3600. EEG cell producing `"the c c spe."` etc — short outputs (partial blank-collapse) but EEG-vs-noise tokens differ in semantically-relevant ways (movie-related for movie reviews, gibberish for noise). |
 | May 1 06:30 | Headline gap explodes to **−1.18 in CTC loss** at step 10 220. EEG model is well below chance (2.66 vs `log(1026) ≈ 6.93`); noise twin lags significantly (3.85). |
 | May 1 06:41 | This document written. |
+| May 1 07:30 | **Audit triggered** by suspicion that wave-1 results don't match the qualitative outputs. Discovers (1) TFM encoder permanently frozen due to `@torch.no_grad()` + `.eval()` in `_tokenize_no_grad`; (2) only 1 237 unique training sentences for a 1024-vocab BPE-CTC task; (3) DERCo 95% truncated, EMMT 96% zero-padded, 8 garbage-text rows; (4) the random-init transformer head has no English priors. Full audit landed in [`findings.md`](./findings.md). |
+| May 1 08:00 | **Wave-3 plan committed** (`94475dd`): TFMEncoder fix, `EEGSentenceDataset` quality filters (`drop_sources / min_text_chars / max_text_chars / max_seconds / drop_nan_rows / drop_zero_rows`), `LMBridgeHead` (DistilBERT 6-layer, 42.5 M params bridge), `wave3_cells()` matrix in `config.py`, `--group wave3` in CLI. TFM removed from `all_track_c_cells()`. |
+| May 1 08:15 | **Wave-1 + wave-2 killed** on both boxes. ~30 min of training lost on each cell, but step-12000 logs / sample_gens / stats preserved for analysis; checkpoints at step 6000 (50% mark) survive. |
+| May 1 08:20 | DistilBERT pre-downloaded into HF cache on both boxes; `paraphrases.parquet` (1 547 sentences × 5 paraphrases, 827 KB) scp'd from Box A → Box B. |
+| May 1 08:30 | **Wave-3 launched** (`pilot --group wave3 --parallel`): 8 cells on Box A (`--cells :8`), 2 sequential cells on Box B (`--cells 8:`). All 4 lm-bridge cells crashed in the first 4 minutes due to a transformers-API mismatch (`Transformer.forward(x=...)` was renamed to `(hidden_states, ...)` in DistilBERT 4.40+). |
+| May 1 08:45 | Patched (`edd62b9`): `LMBridgeHead._bridge_forward` now iterates over `self.transformer.layer` directly instead of calling the wrapper's `forward`, sidestepping the API churn. Verified with a (B=2, T=100, V=1026) smoke test on Box A GPU 2. |
+| May 1 08:55 | Re-launched the 4 lm-bridge cells (Box A GPUs 2–5) and the 2 char-lm-aug cells (Box B). All 9 GPUs now active; 8 wave-3 cells running on Box A, 1 on Box B (1 queued). |
+| May 1 09:00 | First reasonable losses observed: transformer-only `clean` cells at step 430, ctc≈5.94 (still warming up); lm-bridge cells at step 150, ctc≈6.21 (starting from random head + pretrained DistilBERT priors); char-lm-aug at step 140, ctc=3.53 (char vocab `log(50)≈3.91` baseline). All cells healthy, encoder still frozen (warmup-freeze active until step 1200). |
+
+---
+
+## Wave-3 — post-audit launch (May 1 08:30 IST, 10 cells across 9 GPUs)
+
+| Box | GPU | cell | features | hypothesis |
+| --- | --- | --- | --- | --- |
+| A | 0 | `reve.bpe1k.crctc.eeg.0_clean` | clean data only | "Does cleaning the data alone move CER?" |
+| A | 1 | `reve.bpe1k.crctc.noise_train.0_clean` | matched twin | — |
+| A | 2 | `reve.bpe1k.crctc.eeg.0_h-lm-bridge_lm-clean` | clean data + DistilBERT bridge | "Does the LM bridge alone move CER (no aug)?" |
+| A | 3 | `reve.bpe1k.crctc.noise_train.0_h-lm-bridge_lm-clean` | matched twin | — |
+| A | 4 | `reve.bpe1k.crctc.eeg.0_h-lm-bridge_lm-aug` | **HEADLINE**: clean + bridge + paraphrase + signal aug | "Full stack — does it pass strict §4.3?" |
+| A | 5 | `reve.bpe1k.crctc.noise_train.0_h-lm-bridge_lm-aug` | matched twin | — |
+| A | 6 | `reve.bpe1k.crctc.eeg.0_aug-clean` | clean + paraphrase + signal aug, **no LM bridge** | "Does aug alone move CER? (controls for the LM-bridge contribution)" |
+| A | 7 | `reve.bpe1k.crctc.noise_train.0_aug-clean` | matched twin | — |
+| B | 0 | `reve.char.crctc.eeg.0_h-lm-bridge_char-lm-aug` | char vocab + bridge + paraphrase + signal aug | "Does char vocab beat BPE-1k under the bridge? Per-character CTC may avoid the BPE length-precision artefact." |
+| B | 0 (queued) | `reve.char.crctc.noise_train.0_h-lm-bridge_char-lm-aug` | matched twin (sequential after the eeg cell finishes) | — |
+
+Each EEG cell has a matched §4.3 noise twin per Jo et al. 2024. Eval runs
+greedy + beam (50) + (when KenLM is available) beam + KenLM 4-gram rescore.
+After all cells finish, `exp02 gap <eeg_key>` reports the matched-pair
+gap on CER / WER / BLEU 1-4 / ROUGE-1-F / BERTScore-F1.
+
+**ETA**: Box A ~5 h (parallel, ~13:30 IST), Box B ~10 h (~18:30 IST for cell B-1).
+
+---
+
+## Wave-1 — Track-C pilot (Box A, 14 cells) — COMPLETED, results pessimistic
+
+**Final state at step 12 000** (May 1 08:15 IST, just before kill-and-relaunch):
+
+| cell | ctc_loss | gap vs noise | qualitative (sample step 10 800) |
+| --- | --- | --- | --- |
+| `reve.bpe1k.crctc.eeg.0` (HEADLINE) | 2.91 | **−0.77** | `'lious about t war ged g im hull hle.'` (38 chars vs ref 118) |
+| `reve.bpe1k.crctc.noise_train.0` | 3.68 | — | `'the moved sc ling stiousovle.'` (29 chars) |
+| `reve.bpe1k.ctc.eeg.0` | 3.16 | **−0.68** | empty string everywhere |
+| `reve.bpe1k.ctc.noise_train.0` | 3.84 | — | empty string |
+| `reve.char.crctc.eeg.0` | 2.27 | −0.10 | `'e a o o a i te ae a i ei a ee a i...'` (vowel soup) |
+| `reve.char.crctc.noise_train.0` | 2.37 | — | similar vowel soup |
+| `tfm.bpe1k.crctc.eeg.0` | 5.57 | −0.10 | empty / `.` (TFM-frozen bug; wave-1 cells invalidated) |
+| `tfm.bpe1k.crctc.noise_train.0` | 5.67 | — | empty / `.` |
+
+The CTC-loss gap is real and growing through training, but the qualitative
+output makes clear that the §4.3 verdict will be **TIE on CER**: both EEG
+and noise produce ~30-character non-content fragments. Wave-3 is the
+intervention.
 
 ---
 
@@ -272,3 +327,7 @@ ssh -i ~/Downloads/modal_biosigtotext ubuntu@192.222.53.60 \
 | `fcdd2ec` | exp02 build-bpe: read text via parquet (not EEGSentenceDataset) |
 | `0f5fd80` | exp02: signal + text data augmentation suite (off by default; wave-2 ready) |
 | `f50cb26` | exp02: cell_id `--tag` suffix + wave-2 augmentation plan doc |
+| `4d0b420` | exp02 progress.md: live timeline of the May 1 pilot |
+| `94475dd` | **Wave-3**: TFM-frozen fix + data filters (drop_sources/min_text/max_text/max_seconds/drop_nan/drop_zero) + DistilBERT `LMBridgeHead` + `wave3_cells()` matrix |
+| `c69739a` | exp02 cli: `--cells` slice flag for multi-box pilot orchestration |
+| `edd62b9` | exp02 lm_bridge_head: iterate per-layer to be robust to transformers API churn |
