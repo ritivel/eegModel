@@ -117,6 +117,13 @@ class EEGSentenceDataset:
         eval_only: bool = False,
         preprocess: "preprocessing.PreprocessSpec | None" = None,
         specaugment: dict | None = None,
+        # ----- Quality filters added after the May-1 audit (see findings.md §2.3) -----
+        drop_sources: Iterable[str] = (),
+        min_text_chars: int = 0,
+        max_text_chars: int | None = None,
+        max_seconds: float | None = None,
+        drop_nan_rows: bool = False,
+        drop_zero_rows: bool = False,
     ):
         import pyarrow.parquet as pq
 
@@ -127,9 +134,17 @@ class EEGSentenceDataset:
         self.noise = noise
         self.eval_only = eval_only
         self.preprocess = preprocess
+        self.drop_sources = set(drop_sources)
+        self.min_text_chars = max(0, int(min_text_chars))
+        self.max_text_chars = int(max_text_chars) if max_text_chars else None
+        self.max_seconds = float(max_seconds) if max_seconds else None
+        self.drop_nan_rows = bool(drop_nan_rows)
+        self.drop_zero_rows = bool(drop_zero_rows)
 
         files: list[tuple[Path, str]] = []
         for src in sources:
+            if src in self.drop_sources:
+                continue
             for p in shard_paths(storage, src):
                 files.append((p, src))
         self.files = files
@@ -140,7 +155,9 @@ class EEGSentenceDataset:
         self._index: list[tuple[int, int, int]] = []
         per_source_kept: dict[str, int] = {}
         per_source_total: dict[str, int] = {}
-        per_file_degenerate = 0
+        n_drop_text = 0
+        n_drop_seconds = 0
+        n_drop_degenerate = 0
         for fi, (f, src) in enumerate(files):
             try:
                 pf = pq.ParquetFile(f)
@@ -149,13 +166,21 @@ class EEGSentenceDataset:
                 continue
             word_level_source = src in self._WORD_LEVEL_ONLY_SOURCES
             apply_sentence_filter_here = src in ZUCO_SOURCES
+            cols_meta = ["sentence_text", "participant_id", "num_channels",
+                         "num_words", "sampling_rate_hz"]
+            if self.max_seconds is not None:
+                # Need a per-row T estimate. ``num_samples`` lives in some shards;
+                # otherwise fall back to peeking at the EEG arr length below.
+                try:
+                    if "num_samples" in pf.schema_arrow.names:
+                        cols_meta.append("num_samples")
+                except Exception:
+                    pass
             kept = 0
             total = 0
             for rg_idx in range(pf.num_row_groups):
                 try:
-                    t = pf.read_row_group(
-                        rg_idx, columns=["sentence_text", "participant_id",
-                                         "num_channels", "num_words"])
+                    t = pf.read_row_group(rg_idx, columns=cols_meta)
                 except Exception as e:
                     print(f"[data] WARN: failed to read rg{rg_idx} of {f.name}: {e}",
                           flush=True)
@@ -164,19 +189,33 @@ class EEGSentenceDataset:
                 pids = t["participant_id"].to_pylist()
                 ncs = t["num_channels"].to_pylist()
                 nws = t["num_words"].to_pylist()
+                srs = t["sampling_rate_hz"].to_pylist()
+                nsamples = (t["num_samples"].to_pylist()
+                            if "num_samples" in t.column_names else [None] * len(texts))
                 total += len(texts)
-                for ri_in_rg, (text, pid, nc, nw) in enumerate(
-                        zip(texts, pids, ncs, nws)):
+                for ri_in_rg, (text, pid, nc, nw, sr, nsamp) in enumerate(
+                        zip(texts, pids, ncs, nws, srs, nsamples)):
                     if self.subject_filter and str(pid) not in self.subject_filter:
                         continue
                     if (apply_sentence_filter_here and self.sentence_filter
                             and sent_hash(text or "") not in self.sentence_filter):
                         continue
                     if (nc or 0) < 2:
-                        per_file_degenerate += 1
+                        n_drop_degenerate += 1
                         continue
                     if not word_level_source and (nw or 0) < 1:
-                        per_file_degenerate += 1
+                        n_drop_degenerate += 1
+                        continue
+                    txt = text or ""
+                    if self.min_text_chars and len(txt.strip()) < self.min_text_chars:
+                        n_drop_text += 1
+                        continue
+                    if self.max_text_chars is not None and len(txt) > self.max_text_chars:
+                        n_drop_text += 1
+                        continue
+                    if (self.max_seconds is not None and nsamp is not None and sr
+                            and (nsamp / float(sr)) > self.max_seconds):
+                        n_drop_seconds += 1
                         continue
                     self._index.append((fi, rg_idx, ri_in_rg))
                     kept += 1
@@ -185,15 +224,20 @@ class EEGSentenceDataset:
 
         per_source_str = ", ".join(
             f"{s}={per_source_kept.get(s, 0)}/{per_source_total.get(s, 0)}"
-            for s in sources
+            for s in sources if s not in self.drop_sources
         )
+        filt_str = (f"min_text={self.min_text_chars} max_text={self.max_text_chars} "
+                    f"max_sec={self.max_seconds} drop_sources={sorted(self.drop_sources) or '-'} "
+                    f"drop_nan={self.drop_nan_rows} drop_zero={self.drop_zero_rows}")
         print(
             f"[data] EEGSentenceDataset: {len(self._index)} rows kept "
-            f"(degenerate dropped={per_file_degenerate}); "
+            f"(degenerate dropped={n_drop_degenerate}, text dropped={n_drop_text}, "
+            f"too-long dropped={n_drop_seconds}); "
             f"per-source kept/total: {per_source_str}; "
             f"subject_filter={'set('+str(len(self.subject_filter))+')' if self.subject_filter else 'None'}, "
             f"sentence_filter={'set('+str(len(self.sentence_filter))+')' if self.sentence_filter else 'None'}, "
-            f"noise={self.noise}, preprocess={self.preprocess.name if self.preprocess else 'None'}",
+            f"noise={self.noise}, preprocess={self.preprocess.name if self.preprocess else 'None'}, "
+            f"filters=[{filt_str}]",
             flush=True,
         )
         if not self._index:
@@ -237,6 +281,20 @@ class EEGSentenceDataset:
         eeg = _row_to_array(row)
         sr = float(row["sampling_rate_hz"])
 
+        # Runtime-only quality fallback: if a row is all NaN or all zeros,
+        # quietly substitute the next surviving row in the index. The startup
+        # filter step doesn't peek at the actual EEG arrays for speed, so a
+        # small fraction of degenerate rows can slip through.
+        if self.drop_nan_rows or self.drop_zero_rows:
+            bad = False
+            if self.drop_nan_rows and np.isnan(eeg).any():
+                bad = True
+            if self.drop_zero_rows and (eeg.size <= 1 or float(np.abs(eeg).max()) < 1e-12):
+                bad = True
+            if bad:
+                # Walk forward; bounded by len(self._index) to avoid infinite recursion.
+                return self.__getitem__((i + 1) % len(self._index))
+
         if self.preprocess is not None:
             eeg, sr = self.preprocess.apply(eeg, sr)
 
@@ -246,6 +304,9 @@ class EEGSentenceDataset:
             seed = hash((row["participant_id"], row["sentence_text"])) & 0xFFFFFFFF
             rng = np.random.default_rng(seed=seed)
             eeg = (rng.standard_normal(size=eeg.shape).astype("float32") * sd + mu).astype("float32")
+            # If the source row was NaN-rich, the noise is too. Replace with N(0,1).
+            if not np.isfinite(eeg).all():
+                eeg = rng.standard_normal(size=eeg.shape).astype("float32")
 
         if self.specaugment_kwargs is not None and not self.eval_only:
             sa_seed = hash(("specaug", row["participant_id"],

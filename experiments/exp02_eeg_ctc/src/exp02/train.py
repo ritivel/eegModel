@@ -220,6 +220,16 @@ def train(cfg: CTCConfig) -> Path:
              chan_mask_max=cfg.specaug_chan_mask_max)
         if cfg.specaugment else None
     )
+    drop_sources = tuple(s.strip() for s in (cfg.drop_sources or "").split(",") if s.strip())
+    quality_kwargs = dict(
+        drop_sources=drop_sources,
+        min_text_chars=cfg.min_text_chars,
+        max_text_chars=(cfg.max_text_chars or None),
+        max_seconds=(cfg.max_seconds or None),
+        drop_nan_rows=cfg.drop_nan_rows,
+        drop_zero_rows=cfg.drop_zero_rows,
+    )
+
     train_ds = EEGSentenceDataset(
         storage.STORAGE,
         sources=ALL_SOURCES,
@@ -228,6 +238,7 @@ def train(cfg: CTCConfig) -> Path:
         noise="gauss" if cfg.input == "noise_train" else None,
         preprocess=pp_spec,
         specaugment=sa_kwargs,
+        **quality_kwargs,
     )
     dev_ds = EEGSentenceDataset(
         storage.STORAGE,
@@ -237,6 +248,13 @@ def train(cfg: CTCConfig) -> Path:
         noise="gauss" if cfg.input == "noise_train" else None,
         preprocess=pp_spec,
         eval_only=True,
+        # Dev keeps the same quality knobs so we evaluate apples-to-apples,
+        # but DON'T drop sources at dev time — dev is ZuCo-only already.
+        min_text_chars=cfg.min_text_chars,
+        max_text_chars=(cfg.max_text_chars or None),
+        max_seconds=(cfg.max_seconds or None),
+        drop_nan_rows=cfg.drop_nan_rows,
+        drop_zero_rows=cfg.drop_zero_rows,
     )
 
     # ---- text augmentation (paraphrase lookup; loaded once on main proc) ----

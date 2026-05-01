@@ -187,10 +187,19 @@ class TFMEncoder(EEGEncoder):
             cache_dir=str(storage.hf_cache),
         )
         self.tokenizer.load_state_dict(torch.load(ckpt, map_location="cpu"))
-        self.tokenizer.eval()
+        # NOTE: do NOT call self.tokenizer.eval() here. The eval-mode flag is
+        # automatically toggled by ``model.train()`` / ``model.eval()`` from
+        # the trainer; forcing eval at construction time used to leak into
+        # training and combined with the @torch.no_grad() decorator below
+        # silently froze the entire encoder (see findings.md §2.1).
 
-    @torch.no_grad()
-    def _tokenize_no_grad(self, eeg: torch.Tensor, sr: float):
+    def _tokenize(self, eeg: torch.Tensor, sr: float):
+        """Continuous + discrete forward through the tokenizer.
+
+        Respects ``self.training`` and the autograd context of the caller.
+        Wrap externally with ``torch.no_grad()`` if a non-trainable inference
+        path is desired.
+        """
         from einops import rearrange
         eeg = _resample(eeg, sr, self.spec.native_sr)
         B, C, T = eeg.shape
@@ -203,11 +212,12 @@ class TFMEncoder(EEGEncoder):
         return tokens, embs
 
     def encode(self, eeg: torch.Tensor, sr: float, channels: list[str]) -> torch.Tensor:
-        _, embs = self._tokenize_no_grad(eeg, sr)
+        _, embs = self._tokenize(eeg, sr)
         return embs
 
     def tokenize(self, eeg: torch.Tensor, sr: float, channels: list[str]) -> torch.LongTensor:
-        tokens, _ = self._tokenize_no_grad(eeg, sr)
+        with torch.no_grad():
+            tokens, _ = self._tokenize(eeg, sr)
         return tokens.long()
 
 

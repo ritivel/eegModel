@@ -76,6 +76,20 @@ class CTCConfig:
     precision: Literal["bf16", "fp32"] = "bf16"
 
     # ----------- CTC head -----------
+    # ``transformer`` (default): randomly-initialised TransformerEncoder stack.
+    # ``lm_bridge``: a pretrained text Transformer (DistilBERT by default)
+    # used as the bridge. Brings English priors that a from-scratch head
+    # would need 100M+ training tokens to acquire on its own; see
+    # ``exp02/lm_bridge_head.py`` and ``findings.md`` §2.4.
+    head_type: Literal["transformer", "lm_bridge"] = "transformer"
+    # Used by ``lm_bridge``: HuggingFace model id of the bridge transformer.
+    head_lm_model_id: str = "distilbert-base-uncased"
+    # REVE outputs (B, C * T_p, D) with C=105 channels and T_p depending on
+    # input duration; this can exceed BERT's standard 512 cap. 8192 covers
+    # 12-sec EEG at REVE's per-channel downsampling and is essentially free
+    # (fixed sinusoidal buffer).
+    head_lm_max_seq_len: int = 8192
+
     head_hidden: int = 512
     head_layers: int = 4
     head_heads: int = 8
@@ -143,6 +157,20 @@ class CTCConfig:
     text_aug_paraphrase_path: str = ""
     text_aug_prob: float = 0.0
 
+    # ----------- Data quality filters (May 1 audit, see findings.md §2.3) -----------
+    # ``drop_sources``: comma-joined list, e.g. "derco_preprocessed,emmt".
+    # The audit found DERCo (95% truncated by max_seconds) and EMMT
+    # (4-channel, 96% zero-padded when batched with ZuCo) net-harmful.
+    drop_sources: str = ""
+    # Filter out rows whose label text length is outside the sane range.
+    min_text_chars: int = 0
+    max_text_chars: int = 0  # 0 disables the upper cap
+    # Drop rows whose EEG duration exceeds this cap (rather than silently
+    # truncating in the collator).
+    max_seconds: float = 0.0
+    drop_nan_rows: bool = False
+    drop_zero_rows: bool = False
+
     # ----------- Decoder (eval-time) -----------
     decode_beam_width: int = 50
     decode_kenlm_alpha: float = 0.5
@@ -168,6 +196,8 @@ class CTCConfig:
     def cell_id(self) -> str:
         prep = "" if self.preprocess == "v1" else f"_pp-{self.preprocess.replace('_', '-')}"
         suffix = ""
+        if self.head_type != "transformer":
+            suffix += f"_h-{self.head_type.replace('_', '-')}"
         if self.encoder_finetune == "frozen":
             suffix += "_frozen"
         elif self.encoder_finetune == "lora":
@@ -256,9 +286,112 @@ def all_track_c_cells(include_diver1: bool = False) -> list[CTCConfig]:
 
     GROUP F (5-fold extension) is decided after a survivor is identified, so
     it's not part of the default sweep.
+
+    NOTE (May 1 2026): TFM is excluded from the default sweep until the
+    encoder-frozen bug in ``packages/eeg_common/src/eeg_common/encoders.py``
+    is verified end-to-end (see ``findings.md`` §2.1). Pass
+    ``include_diver1=True`` only when the DIVER-1 weights are present.
     """
     return (headline_cells()
-            + encoder_ablation_cells(include_diver1=include_diver1)
             + vocab_ablation_cells()
             + variant_ablation_cells()
-            + freeze_ablation_cells())
+            + freeze_ablation_cells()
+            + (encoder_ablation_cells(include_diver1=True) if include_diver1 else []))
+
+
+# ============================================================================
+# Wave-3 — May 1 2026, post-audit launch matrix
+# ============================================================================
+#
+# Designed to factor the four wave-1 root causes (see ``findings.md``):
+#   (1) data quality          — drop_sources + length filters + NaN/zero filter
+#   (2) data sufficiency      — paraphrase text augmentation
+#   (3) signal regularisation — GPU-side signal augmentations
+#   (4) no English priors     — DistilBERT bridge as the head transformer
+#
+# 9 cells total, fanned across both boxes via the parallel orchestrator.
+
+_DROP_SOURCES_DEFAULT = "derco_preprocessed,emmt"  # see findings.md §2.3
+_PARAPHRASE_DEFAULT = "/home/ubuntu/data/exp02/text_aug/paraphrases.parquet"
+
+
+def _clean_data_kwargs() -> dict:
+    """Defaults applied to wave-3 'cleaned data' cells."""
+    return dict(
+        drop_sources=_DROP_SOURCES_DEFAULT,
+        min_text_chars=10,
+        max_text_chars=800,
+        max_seconds=12.0,
+        drop_nan_rows=True,
+        drop_zero_rows=True,
+    )
+
+
+def _paraphrase_kwargs(prob: float = 0.5) -> dict:
+    return dict(
+        text_aug_prob=prob,
+        text_aug_paraphrase_path=_PARAPHRASE_DEFAULT,
+    )
+
+
+def _signal_aug_kwargs() -> dict:
+    """The wave-2 ``aug-signal`` recipe — 6 GPU-side augmentations."""
+    return dict(
+        signal_aug_time_shift_max_frac=0.05,
+        signal_aug_channel_dropout_p=0.5,
+        signal_aug_channel_dropout_frac=0.1,
+        signal_aug_freq_mask_p=0.5,
+        signal_aug_freq_mask_max_hz=8.0,
+        signal_aug_time_warp_p=0.3,
+        signal_aug_fourier_surrogate_p=0.2,
+        signal_aug_mixup_alpha=0.4,
+    )
+
+
+def wave3_cells() -> list[CTCConfig]:
+    """Wave-3 launch matrix — 9 cells across 9 GPUs.
+
+    Pairings (4 EEG + 4 noise on Box A, 1 EEG (Box B) → noise sequential):
+
+    | tag         | head        | data    | text-aug | signal-aug | hypothesis |
+    | ----------- | ----------- | ------- | -------- | ---------- | --- |
+    | clean       | transformer | cleaned | off      | off        | data quality alone moves the needle |
+    | lm-clean    | lm_bridge   | cleaned | off      | off        | LM bridge alone moves the needle (no aug confound) |
+    | lm-aug      | lm_bridge   | cleaned | 0.5      | on         | full stack — HEADLINE |
+    | aug-clean   | transformer | cleaned | 0.5      | on         | aug helps WITHOUT lm bridge — controls for cell 3's lm contribution |
+    | char-lm-aug | lm_bridge + char | cleaned | 0.5 | on        | char vocab beats BPE-1k under LM bridge (Box B) |
+
+    Each EEG cell has a matched ``noise_train`` twin per Jo §4.3.
+    """
+    from dataclasses import replace
+    base = CTCConfig(encoder="reve", vocab="bpe1k", variant="crctc")
+    cells: list[CTCConfig] = []
+
+    # 1+2: clean data only (transformer head, no aug)  ←  data-quality control
+    c = replace(base, tag="clean", **_clean_data_kwargs())
+    cells += _eeg_and_noise(c)
+
+    # 3+4: lm-bridge only (no aug)  ←  isolated LM-bridge contribution
+    c = replace(base, tag="lm-clean", head_type="lm_bridge",
+                **_clean_data_kwargs())
+    cells += _eeg_and_noise(c)
+
+    # 5+6: HEADLINE — lm-bridge + paraphrase + signal aug + cleaned data
+    c = replace(base, tag="lm-aug", head_type="lm_bridge",
+                **_clean_data_kwargs(), **_paraphrase_kwargs(0.5),
+                **_signal_aug_kwargs())
+    cells += _eeg_and_noise(c)
+
+    # 7+8: aug WITHOUT lm bridge — controls for lm contribution of cell 5
+    c = replace(base, tag="aug-clean",
+                **_clean_data_kwargs(), **_paraphrase_kwargs(0.5),
+                **_signal_aug_kwargs())
+    cells += _eeg_and_noise(c)
+
+    # 9: lm-bridge + char vocab + everything (Box B's slot; sequential noise)
+    c = replace(base, vocab="char", tag="char-lm-aug", head_type="lm_bridge",
+                **_clean_data_kwargs(), **_paraphrase_kwargs(0.5),
+                **_signal_aug_kwargs())
+    cells += _eeg_and_noise(c)
+
+    return cells

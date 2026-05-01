@@ -40,6 +40,7 @@ from . import storage
 from .chars import Vocab
 from .config import CTCConfig
 from .head import CTCHead, HeadOutput
+from .lm_bridge_head import LMBridgeHead
 
 
 class EEG2CTC(nn.Module):
@@ -57,12 +58,9 @@ class EEG2CTC(nn.Module):
         # requires_grad flags decide which params actually move.
         self._configure_encoder_trainability()
 
-        self.head = CTCHead(
+        head_kwargs = dict(
             d_in=self.encoder.spec.feature_dim,
             vocab_size=vocab.size,
-            hidden=cfg.head_hidden,
-            n_layers=cfg.head_layers,
-            n_heads=cfg.head_heads,
             dropout=cfg.head_dropout,
             intermediate_layers=cfg.intermediate_ctc_layers if cfg.variant == "intctc" else (),
             attach_aed=(cfg.variant == "ctcaed"),
@@ -71,6 +69,20 @@ class EEG2CTC(nn.Module):
             aed_dropout=cfg.aed_dropout,
             aed_max_target_len=cfg.aed_max_target_len,
         )
+        if cfg.head_type == "lm_bridge":
+            self.head = LMBridgeHead(
+                **head_kwargs,
+                model_id=cfg.head_lm_model_id,
+                max_seq_len=cfg.head_lm_max_seq_len,
+                cache_dir=str(storage.HF_CACHE),
+            )
+        else:
+            self.head = CTCHead(
+                **head_kwargs,
+                hidden=cfg.head_hidden,
+                n_layers=cfg.head_layers,
+                n_heads=cfg.head_heads,
+            )
 
         # Trainer toggles this to gate the encoder during the warmup-freeze
         # window. Distinct from the per-parameter requires_grad flags so we

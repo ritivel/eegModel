@@ -150,13 +150,24 @@ _FLOAT_OVERRIDE_FIELDS = (
     "signal_aug_mixup_alpha",
     # Text-aug
     "text_aug_prob",
+    # Data quality
+    "max_seconds",
 )
 _INT_OVERRIDE_FIELDS = (
     "total_steps", "warmup_steps", "batch_size", "grad_accum",
     "encoder_warmup_freeze_steps", "num_workers",
     "signal_aug_freq_mask_n", "signal_aug_time_warp_segments",
+    "head_lm_max_seq_len",
+    "min_text_chars", "max_text_chars",
 )
-_STR_OVERRIDE_FIELDS = ("text_aug_paraphrase_path", "tag")
+_STR_OVERRIDE_FIELDS = (
+    "text_aug_paraphrase_path", "tag",
+    "head_type", "head_lm_model_id",
+    "drop_sources",
+)
+_BOOL_OVERRIDE_FIELDS = (
+    "drop_nan_rows", "drop_zero_rows",
+)
 
 
 def _cli_overrides(args) -> dict:
@@ -173,6 +184,10 @@ def _cli_overrides(args) -> dict:
         v = getattr(args, name, None)
         if v is not None:
             out[name] = str(v)
+    for name in _BOOL_OVERRIDE_FIELDS:
+        v = getattr(args, name, None)
+        if v is True:  # only override on explicit --flag
+            out[name] = True
     if getattr(args, "encoder_finetune", None):
         out["encoder_finetune"] = args.encoder_finetune
     if getattr(args, "preprocess", None):
@@ -325,6 +340,7 @@ def _cmd_pilot(args):
         headline_cells,
         variant_ablation_cells,
         vocab_ablation_cells,
+        wave3_cells,
     )
 
     if args.group == "all":
@@ -339,6 +355,8 @@ def _cmd_pilot(args):
         cells = variant_ablation_cells()
     elif args.group == "freeze":
         cells = freeze_ablation_cells()
+    elif args.group == "wave3":
+        cells = wave3_cells()
     else:
         raise ValueError(f"unknown pilot group: {args.group}")
 
@@ -473,7 +491,8 @@ def _run_parallel(cells, *, header: str) -> None:
 # ``_diff_args`` so we don't silently drop important deltas.
 _DIFF_ABLE_FIELDS = (
     {"preprocess", "encoder_finetune", "specaugment"}
-    | set(_INT_OVERRIDE_FIELDS) | set(_FLOAT_OVERRIDE_FIELDS) | set(_STR_OVERRIDE_FIELDS)
+    | set(_INT_OVERRIDE_FIELDS) | set(_FLOAT_OVERRIDE_FIELDS)
+    | set(_STR_OVERRIDE_FIELDS) | set(_BOOL_OVERRIDE_FIELDS)
 )
 
 
@@ -494,7 +513,10 @@ def _diff_args(cfg) -> list[str]:
         if fname == "specaugment" and cv is False:
             args.append("--no-specaugment")
         elif isinstance(cv, bool):
-            # No CLI flag for True overrides; they should already be the default.
+            # Bool flags are true-only --flags. We skip if cv is False and base is True
+            # (we have no --no-foo for these).
+            if cv is True:
+                args.append("--" + fname.replace("_", "-"))
             continue
         else:
             args += ["--" + fname.replace("_", "-"), str(cv)]
@@ -575,6 +597,28 @@ def _step_flags(p):
                    help="Probability of substituting a paraphrase as the CTC target per row.")
     p.add_argument("--text-aug-paraphrase-path", default=None,
                    help="Path to paraphrases parquet (default: $EXP02_DATA_ROOT/text_aug/paraphrases.parquet).")
+    # Head selection
+    p.add_argument("--head-type", default=None, choices=("transformer", "lm_bridge"),
+                   help="Head architecture: ``transformer`` (default randomly-init stack) "
+                        "or ``lm_bridge`` (pretrained DistilBERT bridge for English priors).")
+    p.add_argument("--head-lm-model-id", default=None,
+                   help="Bridge transformer HF model id (default distilbert-base-uncased).")
+    p.add_argument("--head-lm-max-seq-len", type=int, default=None,
+                   help="Sinusoidal positional encoding capacity for the LM bridge.")
+    # Data-quality filters (May 1 audit)
+    p.add_argument("--drop-sources", default=None,
+                   help='Comma-joined list of dataset sources to exclude entirely '
+                        '(e.g. "derco_preprocessed,emmt").')
+    p.add_argument("--min-text-chars", type=int, default=None,
+                   help="Drop rows whose text length is below this (default 0 = off).")
+    p.add_argument("--max-text-chars", type=int, default=None,
+                   help="Drop rows whose text length is above this (0 = off).")
+    p.add_argument("--max-seconds", type=float, default=None,
+                   help="Drop rows whose EEG duration exceeds this many seconds.")
+    p.add_argument("--drop-nan-rows", action="store_true", default=None,
+                   help="Skip rows with any NaN value in their EEG.")
+    p.add_argument("--drop-zero-rows", action="store_true", default=None,
+                   help="Skip rows whose EEG is all-zero.")
     p.add_argument("--tag", default=None,
                    help="Free-form suffix appended to cell_id (e.g. 'aug', 'big-batch'). "
                         "Lets a re-parametrised cell live alongside its baseline.")
@@ -632,8 +676,11 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("pilot")
     sp.add_argument("--group", default="all",
                     choices=("all", "headline", "encoder", "vocab",
-                             "variant", "freeze"),
-                    help="Which subset of the Track-C scope to run.")
+                             "variant", "freeze", "wave3"),
+                    help="Which subset of the Track-C scope to run. "
+                         "``wave3`` launches the May-1 post-audit 9-cell matrix "
+                         "(LM bridge + paraphrase + signal aug + cleaned data + "
+                         "matched §4.3 noise twins).")
     sp.add_argument("--include-diver1", action="store_true",
                     help="Add DIVER-1 cells (requires checkpoint at "
                          "$EXP02_DATA_ROOT/diver1/pytorch_model.bin)")

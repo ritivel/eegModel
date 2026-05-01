@@ -185,6 +185,13 @@ def evaluate_cell(cfg: CTCConfig, *, ckpt_path: Path | None = None,
         sentence_filter=fold.test_sent_hashes,
         noise="gauss" if cfg.input in ("noise_train", "noise_test") else None,
         preprocess=pp_spec,
+        # Apply the same length / quality filters at eval time so the
+        # cell's eval pool is comparable to its train pool.
+        min_text_chars=cfg.min_text_chars,
+        max_text_chars=(cfg.max_text_chars or None),
+        max_seconds=(cfg.max_seconds or None),
+        drop_nan_rows=cfg.drop_nan_rows,
+        drop_zero_rows=cfg.drop_zero_rows,
     )
 
     model = EEG2CTC(cfg, vocab).to("cuda")
