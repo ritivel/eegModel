@@ -202,19 +202,81 @@ on non-invasive EEG/MEG.
 
 ---
 
-## 5. Per-issue patches landing in this commit
+## 5. Per-issue patches landed (commits 94475dd, c69739a, edd62b9)
 
-| issue | file | change |
-| --- | --- | --- |
-| TFM frozen-encoder bug | `packages/eeg_common/src/eeg_common/encoders.py` | drop `@torch.no_grad()` + `.eval()`, add `forward()` that respects `self.training` |
-| Garbage labels in train | `packages/eeg_common/src/eeg_common/data.py` | `min_text_chars`, `max_text_chars` filters in `EEGSentenceDataset` |
-| Excessive truncation | `packages/eeg_common/src/eeg_common/data.py` | `max_seconds` filter (drop instead of truncate) |
-| NaN / zero rows | `packages/eeg_common/src/eeg_common/data.py` | `drop_nan_rows`, `drop_zero_rows` filters |
-| Useless DERCo / EMMT | `packages/eeg_common/src/eeg_common/data.py` | `drop_sources` filter |
-| No English priors | `experiments/exp02_eeg_ctc/src/exp02/lm_bridge_head.py` (new) | DistilBERT-bridge CTC head |
-| TFM in default pilot | `experiments/exp02_eeg_ctc/src/exp02/config.py` | remove TFM cells from `all_track_c_cells()` |
-| Wave-3 launch | `experiments/exp02_eeg_ctc/wave3_plan.md` (new) | per-GPU launch matrix |
+| # | issue | file | change | commit |
+| --- | --- | --- | --- | --- |
+| 1 | TFM frozen-encoder bug | `packages/eeg_common/src/eeg_common/encoders.py` | drop `@torch.no_grad()` from `_tokenize`, drop `self.tokenizer.eval()` from `__init__`; the discrete `tokenize()` path keeps `with torch.no_grad():` (codebook lookup is non-differentiable anyway) | `94475dd` |
+| 2 | Garbage labels in train | `packages/eeg_common/src/eeg_common/data.py` | `min_text_chars`, `max_text_chars` filters in `EEGSentenceDataset` (default 10 / 800) | `94475dd` |
+| 3 | Excessive truncation of long EEG | `packages/eeg_common/src/eeg_common/data.py` | `max_seconds` filter — drops 12 s+ rows at index time instead of silently truncating in the collator | `94475dd` |
+| 4 | NaN / zero rows | `packages/eeg_common/src/eeg_common/data.py` | `drop_nan_rows`, `drop_zero_rows` filters; runtime fallback walks to next row if a degenerate one slips through | `94475dd` |
+| 5 | Useless DERCo / EMMT | `packages/eeg_common/src/eeg_common/data.py` | `drop_sources` filter (default `"derco_preprocessed,emmt"` in wave-3) | `94475dd` |
+| 6 | NaN-rich noise twin | `packages/eeg_common/src/eeg_common/data.py` | If the source row was NaN, replace the noise twin with `N(0,1)` instead of `NaN * std + mu` | `94475dd` |
+| 7 | No English priors in CTC head | `experiments/exp02_eeg_ctc/src/exp02/lm_bridge_head.py` (new) | `LMBridgeHead`: pretrained `distilbert-base-uncased` (42.5 M params, 6 layers, hidden=768) replacing the random-init 4-layer transformer; word/position embeddings deleted, EEG features projected into BERT's hidden space, sinusoidal positions for unbounded sequence lengths | `94475dd` |
+| 8 | TFM in default pilot | `experiments/exp02_eeg_ctc/src/exp02/config.py` | TFM removed from `all_track_c_cells()`; opt-in via `include_diver1=True` only | `94475dd` |
+| 9 | LM-bridge wired through model + cli | `model.py`, `config.py`, `cli.py` | `head_type` config field with `transformer` / `lm_bridge` choice; full set of `--head-type / --head-lm-model-id / --head-lm-max-seq-len` flags; `_DIFF_ABLE_FIELDS` extended so the parallel orchestrator emits the right `--flag value` for each cell | `94475dd` |
+| 10 | Wave-3 launch matrix | `experiments/exp02_eeg_ctc/src/exp02/config.py` | `wave3_cells()` (10 cells) factoring the four root causes; `--group wave3` in pilot; `_clean_data_kwargs / _paraphrase_kwargs / _signal_aug_kwargs` factory helpers | `94475dd` |
+| 11 | Multi-box pilot orchestration | `experiments/exp02_eeg_ctc/src/exp02/cli.py` | `--cells <slice>` flag on `exp02 pilot` so Box A can run cells 0–7 while Box B runs cells 8–9 without spawning the same cell twice | `c69739a` |
+| 12 | DistilBERT API churn | `experiments/exp02_eeg_ctc/src/exp02/lm_bridge_head.py` | First wave-3 launch crashed: `TypeError: Transformer.forward() missing 1 required positional argument: 'hidden_states'`. DistilBERT 4.40+ renamed the wrapper's `forward(x=...)` to `forward(hidden_states=...)`. `_bridge_forward` now iterates `self.transformer.layer` directly — robust to either signature | `edd62b9` |
 
-Wave-3 launch goes via the same parallel orchestrator
-(`exp02 pilot --group wave3 --parallel`) once the wave-1 cells finish
-their final eval (~30 min from now).
+## 6. Wave-3 launch (May 1 08:30 → 08:55 IST)
+
+| time IST | event |
+| --- | --- |
+| 07:30 | Audit triggered after the user spotted that the loss curve looked too good given the `progress.md` qualitative samples. |
+| 08:00 | `94475dd` committed (TFM-fix + data filters + LM-bridge head + wave-3 matrix). |
+| 08:15 | Wave-1 + wave-2 killed on both boxes (`pkill -KILL -f "exp02.cli (train\|pilot)"`). Step-12 000 logs / sample_gens / stats preserved; `model_step6000.pt` checkpoint survives for evaluation. |
+| 08:20 | DistilBERT pre-downloaded into HF cache on both boxes. `paraphrases.parquet` (827 KB) scp'd from Box A → Box B. |
+| 08:25 | `c69739a` committed: `--cells :8` / `--cells 8:` slice flag on pilot. |
+| 08:30 | Wave-3 launched on both boxes. **Within 4 minutes the 4 lm-bridge cells crashed** with `TypeError: Transformer.forward() missing 1 required positional argument: 'hidden_states'`. The 4 transformer-only cells (clean × 2, aug-clean × 2) kept running. |
+| 08:45 | `edd62b9` committed: bypass the DistilBERT `Transformer.forward` wrapper, iterate `self.transformer.layer` directly. Smoke-tested locally on Box A GPU 2 with a synthetic (B=2, T=100) input: shape correct, gradients flow. |
+| 08:55 | Re-launched the 4 lm-bridge cells (Box A GPUs 2–5) and the 2 char-lm-aug cells (Box B). All 9 GPUs now active. |
+| 09:00 → ~13:30 | Wave-3 main pass running. ETA ~5 h on Box A (parallel), ~10 h on Box B (sequential). |
+
+## 7. Wave-3 cell matrix (10 cells, 9 GPUs)
+
+| GPU | cell | features | hypothesis |
+| --- | --- | --- | --- |
+| A.0 | `clean` (eeg) | data filters only | "Does cleaning the data alone help?" |
+| A.1 | `clean` (noise) | matched twin | — |
+| A.2 | `lm-clean` (eeg) | data filters + LM-bridge | "Does LM bridge alone help (no aug confound)?" |
+| A.3 | `lm-clean` (noise) | matched twin | — |
+| A.4 | `lm-aug` (eeg) | data filters + LM-bridge + paraphrase 0.5 + 6 signal augs | **HEADLINE** — full stack |
+| A.5 | `lm-aug` (noise) | matched twin | — |
+| A.6 | `aug-clean` (eeg) | data filters + paraphrase + signal aug, **no LM bridge** | "Does aug help WITHOUT bridge? Controls A.4." |
+| A.7 | `aug-clean` (noise) | matched twin | — |
+| B.0 | `char-lm-aug` (eeg) | char vocab + LM-bridge + paraphrase + signal aug | "Does char vocab beat BPE-1k under the bridge?" |
+| B.0 (queued) | `char-lm-aug` (noise) | matched twin (sequential after eeg cell) | — |
+
+After all cells finish, `exp02 gap <eeg_key>` reports the matched-pair
+gap on CER / WER / BLEU 1-4 / ROUGE-1-F / BERTScore-F1 across
+greedy / beam / beam + KenLM decode modes.
+
+## 8. Decision rule for the wave-3 verdict
+
+Per Jo et al. 2024 §4.3 (and the `design.md` decision rule):
+
+- **Strict PASS**: CER 95% bootstrap CIs disjoint AND sign-flip
+  permutation `p < 0.01`, with EEG below noise — declare success on
+  this fold, run 5-fold extension on the survivor.
+- **Weak PASS**: CER mean below noise, CIs overlap — strong evidence
+  but not strict; report and consider running aug variants.
+- **TIE/FAIL** (where wave-1 ended): CER ≈ 1 for both — the
+  architectural changes weren't enough; pivot to **D-SigLIP word-level
+  contrastive alignment** ([d'Ascoli & King 2025
+  *Nat. Commun.* 16, 10521](https://doi.org/10.1038/s41467-025-65499-0)),
+  which is the only published recipe that has rigorously cleared
+  the §4.3 bar on non-invasive EEG/MEG.
+
+The four interventions in wave-3 are designed so that the controls
+isolate the contribution of each. Reading the matrix:
+
+- `clean` vs wave-1 baseline → contribution of data cleaning alone.
+- `lm-clean` vs `clean` → contribution of LM bridge alone.
+- `aug-clean` vs `clean` → contribution of paraphrase + signal aug alone.
+- `lm-aug` vs `lm-clean` → marginal contribution of aug *given* LM bridge.
+- `lm-aug` vs `aug-clean` → marginal contribution of LM bridge *given* aug.
+- `char-lm-aug` vs `lm-aug` → contribution of char vocab over BPE-1k under bridge.
+
+Whichever combination wins, we know which of the four root causes was
+load-bearing.
