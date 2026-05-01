@@ -153,47 +153,38 @@ class LMBridgeHead(nn.Module):
 
         Returns ``(final_hidden, intermediates_list)``.
         """
+        # We iterate over the bridge's layer list directly rather than calling
+        # the wrapper ``Transformer`` / ``BertEncoder`` ``forward`` — those
+        # wrappers' kwargs vary across transformers versions (DistilBERT
+        # 4.40+ renames ``x`` to ``hidden_states`` and drops most of the
+        # output_* knobs into ``**kwargs``). The per-layer call is stable.
+        h = x
+        layers = self.transformer.layer  # nn.ModuleList of TransformerBlock
+        intermediate_set = set(self.intermediate_layers)
+        inters: list[torch.Tensor] = []
+
         if self._bridge_kind == "distilbert":
-            # DistilBERT's transformer expects ``hidden_states`` and (optional)
-            # ``attn_mask``. With output_hidden_states=True it returns a tuple
-            # of (last_hidden,) + all_hidden_states + (attentions,).
-            out = self.transformer(
-                x=x,
-                attn_mask=None,
-                head_mask=None,
-                output_attentions=False,
-                output_hidden_states=bool(self.intermediate_layers),
-                return_dict=True,
-            )
-            final = out.last_hidden_state
-            inters: list[torch.Tensor] = []
-            if self.intermediate_layers and out.hidden_states is not None:
-                # hidden_states is a tuple of (N+1) entries: input + each layer's output.
-                # Map the ``intermediate_layers`` indices (0-based among layers).
-                for li in self.intermediate_layers:
-                    if 0 <= li < len(out.hidden_states) - 1:
-                        inters.append(out.hidden_states[li + 1])
-            return final, inters
+            # TransformerBlock.forward(hidden_states, attention_mask=None, **kwargs).
+            # We don't pad-mask at this level (input is dense EEG features).
+            for li, block in enumerate(layers):
+                out = block(h)
+                # block returns a tuple: (hidden_states,) or (hidden_states, attn).
+                h = out[0] if isinstance(out, tuple) else out
+                if li in intermediate_set:
+                    inters.append(h)
         else:  # bert layout
-            # BertEncoder accepts ``hidden_states`` and a mask. Feed all-ones
-            # extended mask (we don't pad-mask at this level).
+            # BertLayer.forward(hidden_states, attention_mask=None, head_mask=None,
+            # encoder_hidden_states=None, encoder_attention_mask=None,
+            # past_key_value=None, output_attentions=False).
             B, T, _ = x.shape
-            extended_attn_mask = torch.zeros(B, 1, 1, T, device=x.device, dtype=x.dtype)
-            out = self.transformer(
-                x,
-                attention_mask=extended_attn_mask,
-                head_mask=None,
-                output_attentions=False,
-                output_hidden_states=bool(self.intermediate_layers),
-                return_dict=True,
-            )
-            final = out.last_hidden_state
-            inters = []
-            if self.intermediate_layers and out.hidden_states is not None:
-                for li in self.intermediate_layers:
-                    if 0 <= li < len(out.hidden_states) - 1:
-                        inters.append(out.hidden_states[li + 1])
-            return final, inters
+            extended_attn_mask = torch.zeros(
+                B, 1, 1, T, device=x.device, dtype=x.dtype)
+            for li, block in enumerate(layers):
+                out = block(h, attention_mask=extended_attn_mask)
+                h = out[0] if isinstance(out, tuple) else out
+                if li in intermediate_set:
+                    inters.append(h)
+        return h, inters
 
     def forward(
         self,
