@@ -10,7 +10,8 @@ to finish. All times in **IST**.
 > | [`README.md`](./README.md) | quick start + run matrix + artifact map |
 > | [`design.md`](./design.md) | design rationale, citations for every knob, full §4.3 verdict rules |
 > | [`wave2_plan.md`](./wave2_plan.md) | augmentation matrix + launch commands for wave-2 |
-> | [`findings.md`](./findings.md) | **wave-1 audit + wave-3 plan (May 1, 08:00 IST)** |
+> | [`findings.md`](./findings.md) | wave-1 audit + the 4 root causes + wave-3 plan |
+> | [`results.md`](./results.md) | **final wave-1 + wave-3 results + §4.3 verdicts + recommendations (May 1, 18:00 IST)** |
 > | this file | live timeline + per-cell loss snapshots + decisions |
 
 ---
@@ -76,6 +77,9 @@ share the dataset cache + fold JSONs).
 | May 1 12:30 | Patched (`4562b8f`): added `cfg.bridge_lr = 1e-5` and split the head optimizer into two param groups — `proj` (input projection + output head + AED, ~1.2 M params @ `head_lr = 1e-3`) and `bridge` (the pretrained DistilBERT layers, ~42.5 M params @ `bridge_lr = 1e-5`). LR scheduler now scales each group by its own `_base_lr` so warmup/cosine-decay applies correctly across all three rates (encoder, projection, bridge). |
 | May 1 12:35 | Killed the 5 broken lm-bridge cells; transformer-only cells (`clean`, `aug-clean`) left running. Re-launched the 4 lm-bridge cells on Box A GPUs 2–5 and the 2 char-lm-aug cells on Box B with the bridge_lr fix. Confirmed via run.log: `head_opt: proj=1.18M @ lr=0.001; bridge=42.53M @ lr=1e-05`. |
 | May 1 12:50 | First step-100 lm-bridge losses were ctc≈50–65 with gradient-norm ≈480 (clipped to 1.0). After 5 minutes (step 320): noise twins back to ctc≈6.1, EEG cells at ctc≈12 and falling. After 10 min (step 580): all 4 lm-bridge cells stable at ctc≈6.0–6.3 (log(1024)=6.93 chance). Char-lm-aug already at ctc=3.19 (below char chance of log(50)=3.91). Encoder still frozen until step 1200. |
+| May 1 14:30 | Box A 4 transformer-only cells finished + auto-evaluated. **First §4.3 verdicts in**: `clean.eeg` CER=0.802 vs noise=0.816 → gap +1.5 pp, p=0.0044 → **STRICT PASS**. `aug-clean.eeg` CER=0.946 vs noise=0.961 → gap +1.5 pp, p<0.0001 → **STRICT PASS** (but both totally collapsed to single tokens, gap is `'the.'` vs `'he (.'` everywhere). |
+| May 1 17:00 | Box A 4 lm-bridge cells finished + auto-evaluated. `lm-clean` ❌ FAILS strict §4.3 on CER (noise is 0.6 pp better, p=0.999) — EEG collapsed harder than noise. `lm-aug` ✅ STRICT PASS on CER + BLEU-1 + BLEU-2 + BERTscore but only 4 unique EEG outputs across 257 examples (`'he.'`×204 / `'the.'`×51). |
+| May 1 17:38 | **All experiments stopped** on user request. Box B `char-lm-aug.eeg` killed at step 11 860 / 12 000 (98.8 % complete) without auto-eval. Final results compiled in [`results.md`](./results.md). |
 
 ---
 
