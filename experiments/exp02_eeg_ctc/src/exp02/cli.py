@@ -364,6 +364,23 @@ def _cmd_pilot(args):
     if overrides:
         cells = [replace(c, **overrides) for c in cells]
 
+    if getattr(args, "cells", None):
+        # Parse Python-style slice ":8" / "8:" / "2:6" to subset the cell list.
+        # Lets the multi-box launcher run different slices of one group on
+        # each box without conflicting on cell_ids.
+        try:
+            parts = [int(x) if x else None for x in args.cells.split(":")]
+        except Exception:
+            raise SystemExit(f"--cells must be a Python slice like ':8', '8:', '2:6'; got {args.cells!r}")
+        if len(parts) == 1:
+            parts = [parts[0], parts[0] + 1 if parts[0] is not None else None]
+        if len(parts) > 2:
+            raise SystemExit(f"--cells: only start:stop slices supported; got {args.cells!r}")
+        before = len(cells)
+        cells = cells[slice(parts[0], parts[1])]
+        print(f"[pilot] sliced {before} cells with {args.cells!r} -> {len(cells)} cells",
+              flush=True)
+
     if args.parallel:
         _run_parallel(cells, header=f"Pilot[{args.group}]")
         return
@@ -686,6 +703,11 @@ def main(argv: list[str] | None = None) -> None:
                          "$EXP02_DATA_ROOT/diver1/pytorch_model.bin)")
     sp.add_argument("--parallel", action="store_true",
                     help="Round-robin one cell per visible GPU as subprocesses.")
+    sp.add_argument("--cells", default=None,
+                    help="Python-style slice over the chosen group, e.g. "
+                         "':8' to run the first 8 cells, '8:' to run from "
+                         "cell 8 onwards. Useful for splitting a wave across "
+                         "multiple boxes without spawning the same cell twice.")
     _step_flags(sp)
     sp.set_defaults(func=_cmd_pilot)
 
