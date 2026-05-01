@@ -325,14 +325,49 @@ def train(cfg: CTCConfig) -> Path:
     head_params = model.head_trainable_parameters()
     enc_params = model.encoder_trainable_parameters()
 
-    head_opt = torch.optim.AdamW(
-        [p for p in head_params if p.requires_grad],
-        lr=cfg.head_lr, weight_decay=cfg.weight_decay,
-    )
+    # When the head is the LM-bridge, split its parameters into a
+    # ``bridge_params`` group (the pretrained DistilBERT layers, low LR)
+    # and a ``proj_params`` group (input projection / output head / AED,
+    # full head_lr). 1e-3 destroys pretrained DistilBERT weights in the
+    # first ~100 steps; standard fine-tune LR is 1e-5..5e-5 (see
+    # ``findings.md`` §6).
+    bridge_module = (getattr(model.head, "transformer", None)
+                     if cfg.head_type == "lm_bridge" else None)
+    if bridge_module is not None:
+        bridge_param_ids = {id(p) for p in bridge_module.parameters()}
+        bridge_params = [p for p in head_params
+                         if id(p) in bridge_param_ids and p.requires_grad]
+        proj_params = [p for p in head_params
+                       if id(p) not in bridge_param_ids and p.requires_grad]
+        head_opt = torch.optim.AdamW(
+            [
+                {"params": proj_params, "lr": cfg.head_lr,
+                 "_base_lr": cfg.head_lr, "_group": "proj"},
+                {"params": bridge_params, "lr": cfg.bridge_lr,
+                 "_base_lr": cfg.bridge_lr, "_group": "bridge"},
+            ],
+            weight_decay=cfg.weight_decay,
+        )
+        print(f"[train] head_opt: proj={sum(p.numel() for p in proj_params)/1e6:.2f}M "
+              f"@ lr={cfg.head_lr}; bridge={sum(p.numel() for p in bridge_params)/1e6:.2f}M "
+              f"@ lr={cfg.bridge_lr}", flush=True)
+    else:
+        head_opt = torch.optim.AdamW(
+            [p for p in head_params if p.requires_grad],
+            lr=cfg.head_lr, weight_decay=cfg.weight_decay,
+        )
+        for pg in head_opt.param_groups:
+            pg["_base_lr"] = cfg.head_lr
+            pg["_group"] = "head"
+
     enc_opt = torch.optim.AdamW(
         [p for p in enc_params if p.requires_grad],
         lr=cfg.encoder_lr, weight_decay=cfg.weight_decay,
     ) if enc_params else None
+    if enc_opt is not None:
+        for pg in enc_opt.param_groups:
+            pg["_base_lr"] = cfg.encoder_lr
+            pg["_group"] = "encoder"
 
     # ---- W&B ----
     wb = _wandb_init(cfg, n_train=len(train_ds), n_dev=len(dev_ds))
@@ -387,14 +422,18 @@ def train(cfg: CTCConfig) -> Path:
                 "n_encoder_params": sum(p.numel() for p in enc_params),
             }) + "\n"); log.flush()
 
-        # LR schedule (manual; both opts share warmup + total).
+        # LR schedule (manual; all opts share warmup + total). Each param
+        # group carries its own ``_base_lr`` so the schedule scales every
+        # group correctly even when ``head_opt`` has multiple groups (e.g.
+        # the LM-bridge cell uses head_lr for its projection layers and
+        # bridge_lr for its pretrained DistilBERT layers).
         lr_mult = _linear_warmup_cosine_decay(
             step, warmup=cfg.warmup_steps, total=cfg.total_steps)
         for pg in head_opt.param_groups:
-            pg["lr"] = cfg.head_lr * lr_mult
+            pg["lr"] = pg["_base_lr"] * lr_mult
         if enc_opt is not None:
             for pg in enc_opt.param_groups:
-                pg["lr"] = cfg.encoder_lr * lr_mult
+                pg["lr"] = pg["_base_lr"] * lr_mult
 
         head_opt.zero_grad(set_to_none=True)
         if enc_opt is not None:

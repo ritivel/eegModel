@@ -136,7 +136,7 @@ def _parse_cfg_key(key: str) -> dict:
 
 
 _FLOAT_OVERRIDE_FIELDS = (
-    "head_lr", "encoder_lr",
+    "head_lr", "encoder_lr", "bridge_lr",
     "label_prior_weight", "cr_ctc_kl_weight",
     "intermediate_ctc_weight", "aed_weight",
     # Signal-aug knobs
@@ -584,6 +584,10 @@ def _step_flags(p):
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--head-lr", type=float, default=None)
     p.add_argument("--encoder-lr", type=float, default=None)
+    p.add_argument("--bridge-lr", type=float, default=None,
+                   help="LR for pretrained bridge (e.g. DistilBERT) layers when "
+                        "head_type=lm_bridge. Default 1e-5; matches encoder_lr. "
+                        "Using head_lr (1e-3) here destroys the pretrained weights.")
     p.add_argument("--encoder-finetune", default=None,
                    choices=("full", "lora", "frozen"))
     p.add_argument("--preprocess", default=None,

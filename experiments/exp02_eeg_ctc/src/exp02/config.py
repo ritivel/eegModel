@@ -68,6 +68,13 @@ class CTCConfig:
     warmup_steps: int = 1_000
     head_lr: float = 1e-3
     encoder_lr: float = 1e-5
+    # Used when ``head_type == "lm_bridge"``. The pretrained DistilBERT layers
+    # need a much smaller LR than the from-scratch input projection / output
+    # head — 1e-3 destroys the pretrained weights in the first ~100 steps
+    # (see findings.md §6 and the 09:00 → 12:00 IST May 1 wave-3 post-mortem).
+    # Standard BERT/DistilBERT fine-tune is 1e-5 to 5e-5; we default to the
+    # same 1e-5 we use for REVE.
+    bridge_lr: float = 1e-5
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     grad_accum: int = 2
