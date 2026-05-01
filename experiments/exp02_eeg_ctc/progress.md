@@ -72,6 +72,10 @@ share the dataset cache + fold JSONs).
 | May 1 08:45 | Patched (`edd62b9`): `LMBridgeHead._bridge_forward` now iterates over `self.transformer.layer` directly instead of calling the wrapper's `forward`, sidestepping the API churn. Verified with a (B=2, T=100, V=1026) smoke test on Box A GPU 2. |
 | May 1 08:55 | Re-launched the 4 lm-bridge cells (Box A GPUs 2–5) and the 2 char-lm-aug cells (Box B). All 9 GPUs now active; 8 wave-3 cells running on Box A, 1 on Box B (1 queued). |
 | May 1 09:00 | First reasonable losses observed: transformer-only `clean` cells at step 430, ctc≈5.94 (still warming up); lm-bridge cells at step 150, ctc≈6.21 (starting from random head + pretrained DistilBERT priors); char-lm-aug at step 140, ctc=3.53 (char vocab `log(50)≈3.91` baseline). All cells healthy, encoder still frozen (warmup-freeze active until step 1200). |
+| May 1 12:10 | **Wave-3 mid-run audit (3 h 40 min in)**. Transformer-only cells healthy and converging: `clean.eeg` ctc=2.67 vs noise=3.43 (gap −0.76 at step 9.4k), matching the wave-1 baseline gap. **All 5 lm-bridge cells in complete blank-collapse**: dev outputs are empty strings, ctc stuck at 6.0+ (≈ `log(vocab) = 6.93`), gradient norms anomalously low (0.3–1.5). Diagnosis: `head_lr = 1e-3` was applied to **every** head parameter, including the 42.5 M pretrained DistilBERT layers. Standard BERT/DistilBERT fine-tune is 1e-5 to 5e-5; 1e-3 destroys the pretrained weights in the first ~100 steps. |
+| May 1 12:30 | Patched (`4562b8f`): added `cfg.bridge_lr = 1e-5` and split the head optimizer into two param groups — `proj` (input projection + output head + AED, ~1.2 M params @ `head_lr = 1e-3`) and `bridge` (the pretrained DistilBERT layers, ~42.5 M params @ `bridge_lr = 1e-5`). LR scheduler now scales each group by its own `_base_lr` so warmup/cosine-decay applies correctly across all three rates (encoder, projection, bridge). |
+| May 1 12:35 | Killed the 5 broken lm-bridge cells; transformer-only cells (`clean`, `aug-clean`) left running. Re-launched the 4 lm-bridge cells on Box A GPUs 2–5 and the 2 char-lm-aug cells on Box B with the bridge_lr fix. Confirmed via run.log: `head_opt: proj=1.18M @ lr=0.001; bridge=42.53M @ lr=1e-05`. |
+| May 1 12:50 | First step-100 lm-bridge losses were ctc≈50–65 with gradient-norm ≈480 (clipped to 1.0). After 5 minutes (step 320): noise twins back to ctc≈6.1, EEG cells at ctc≈12 and falling. After 10 min (step 580): all 4 lm-bridge cells stable at ctc≈6.0–6.3 (log(1024)=6.93 chance). Char-lm-aug already at ctc=3.19 (below char chance of log(50)=3.91). Encoder still frozen until step 1200. |
 
 ---
 
@@ -331,3 +335,6 @@ ssh -i ~/Downloads/modal_biosigtotext ubuntu@192.222.53.60 \
 | `94475dd` | **Wave-3**: TFM-frozen fix + data filters (drop_sources/min_text/max_text/max_seconds/drop_nan/drop_zero) + DistilBERT `LMBridgeHead` + `wave3_cells()` matrix |
 | `c69739a` | exp02 cli: `--cells` slice flag for multi-box pilot orchestration |
 | `edd62b9` | exp02 lm_bridge_head: iterate per-layer to be robust to transformers API churn |
+| `c0c0564` | exp02 progress.md: wave-3 launch + post-audit timeline |
+| `2b42182` | exp02 findings.md: full patch table + wave-3 launch timeline + decision rule |
+| `4562b8f` | **Wave-3 mid-run fix**: split LM-bridge optimizer into bridge_lr (1e-5) + head_lr (1e-3) groups; the unified head_lr=1e-3 destroyed the pretrained DistilBERT weights and trapped the 5 lm-bridge cells in complete blank-collapse |
