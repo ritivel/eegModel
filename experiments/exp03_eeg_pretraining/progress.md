@@ -38,6 +38,29 @@ R6/R7), then the third wave (R8/R9). All-done estimated `~15:00–17:00 UTC`
 (`~20:30–22:30 IST`). Final S3 footprint expected ~1 TB across ~2,639
 subject directories.
 
+**REVISED ETA at 16:38 UTC checkpoint** (entry below): the actual rate was
+~57 sec/subject including download+preprocess+sync (vs my eyeballed 38
+sec). NC at 447 subjects is the long pole. **Revised completion estimate
+~23:30 UTC = ~05:00 IST tomorrow morning.** Per-release projection at
+that checkpoint:
+
+| Release | Subj | At 16:38 UTC | Done by (UTC / IST) |
+|---|---:|---|---|
+| R1, R2, R3, R6 | 605 total | ✅ done in S3 (1,071 subj cumulative incl. earlier) | — |
+| NC | 447 | preprocess 138/447 | ~18:45 / 00:15 |
+| R4 | 324 | preprocess just started | ~19:00 / 00:30 |
+| R5 | 330 | preprocess just started | ~19:30 / 01:00 |
+| R7 | 381 | download just started | ~21:50 / 03:20 |
+| R8 | 257 | not started (awaits slot) | ~22:30 / 04:00 |
+| R9 | 295 | not started (awaits slot) | ~23:20 / 04:50 |
+
+(Slowness vs original estimate explained by NC's 447 subjects being 3.3×
+the largest Tier-1-sample release I'd timed against, plus 3 concurrent
+preprocess workers each getting ~1/3 the CPU cores.)
+
+User decision at 22:17 IST: **let it run overnight**. No action required
+until morning.
+
 **To check progress** from your laptop:
 
 ```bash
