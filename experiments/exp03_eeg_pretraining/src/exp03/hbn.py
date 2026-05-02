@@ -3,30 +3,46 @@ read EEGLAB ``.set/.fdt`` via MNE, parse BIDS-iEEG sidecar metadata, and
 derive the labels we need for the §4.3 eval suite (HBN ADHD-binary AUROC,
 HBN 6-task classification BAC + WF1).
 
-Source: ``s3://fcp-indi/data/Projects/HBN/EEG/`` — NIH-funded public mirror,
-no credentials needed for read; we use anonymous boto3 (UNSIGNED) to avoid
-charging the user's AWS account for the requester-pays-style listing.
+Source: ``s3://fcp-indi/data/Projects/HBN/BIDS_EEG/cmi_bids_<release>/`` —
+NIH-funded public mirror, no credentials needed for read; we use anonymous
+boto3 (UNSIGNED) to avoid charging the user's AWS account for the
+requester-pays-style listing.
 
-Per-subject layout (BIDS-iEEG):
+Per-release layout (verified against the 2026-05 bucket state):
 
-    sub-NDARABCD/
-        eeg/
-            sub-NDARABCD_task-RestingState_eeg.set
-            sub-NDARABCD_task-RestingState_eeg.fdt
-            sub-NDARABCD_task-RestingState_channels.tsv
-            sub-NDARABCD_task-RestingState_eeg.json
-            sub-NDARABCD_task-SequenceLearning_eeg.set
-            ...
+    s3://fcp-indi/data/Projects/HBN/BIDS_EEG/cmi_bids_<release>/
+        participants.tsv                                ← per-release
+        dataset_description.json
+        code/
+        sub-NDARABCD/
+            eeg/
+                sub-NDARABCD_task-RestingState_channels.tsv
+                sub-NDARABCD_task-RestingState_coordsystem.json
+                sub-NDARABCD_task-RestingState_eeg.set     ← raw EEG (EEGLAB header)
+                sub-NDARABCD_task-RestingState_eeg.fdt     ← raw EEG (EEGLAB binary)
+                sub-NDARABCD_task-RestingState_eeg.json    ← BIDS sidecar
+                sub-NDARABCD_task-RestingState_electrodes.tsv
+                sub-NDARABCD_task-RestingState_events.tsv
+                sub-NDARABCD_task-seqLearning8target_eeg.set
+                sub-NDARABCD_task-symbolSearch_eeg.set
+                sub-NDARABCD_task-surroundSupp_run-1_eeg.set
+                sub-NDARABCD_task-surroundSupp_run-2_eeg.set
+                sub-NDARABCD_task-contrastChangeDetection_run-1_eeg.set
+                sub-NDARABCD_task-contrastChangeDetection_run-2_eeg.set
+                sub-NDARABCD_task-contrastChangeDetection_run-3_eeg.set
+                sub-NDARABCD_task-DespicableMe_eeg.set        ← Video category
+                sub-NDARABCD_task-DiaryOfAWimpyKid_eeg.set    ← Video category
+                sub-NDARABCD_task-FunwithFractals_eeg.set     ← Video category
+                sub-NDARABCD_task-ThePresent_eeg.set          ← Video category
 
-Per-release layout: each release folder (NC, RC, etc.) has its own
-``participants.tsv`` (subject demographics + DSM-V Dx columns) plus a
-``dataset_description.json``. We treat releases as independent shards;
-``list_subjects(release=...)`` filters to one release at a time.
+10 releases known: NC, R1..R9. Total ~2,639 subjects across all releases
+(NC=447, R1=136, R2=150, R3=184, R4=324, R5=330, R6=135, R7=381,
+R8=257, R9=295) per a 2026-05-02 listing.
 
 References:
     HBN-EEG dataset:  Shirazi et al. 2024 bioRxiv,
         https://www.biorxiv.org/content/10.1101/2024.10.03.615261v2
-    AWS public mirror layout (``s3://fcp-indi/.../HBN/EEG/...``):
+    AWS public mirror layout (``s3://fcp-indi/.../HBN/BIDS_EEG/...``):
         https://fcp-indi.s3.amazonaws.com/index.html
     NeurIPS 2025 EEG Foundation Challenge (uses HBN):
         https://eeg2025.github.io/
@@ -43,41 +59,89 @@ from typing import Iterable
 # Constants
 # ---------------------------------------------------------------------------
 
-# HBN's six cognitive tasks. Task names as they appear in BIDS filenames;
-# label index per `mini_experiments.md` §4.3 Protocol A.2 (HBN 6-task classification).
+# HBN's six cognitive tasks → label index per `mini_experiments.md` §4.3
+# Protocol A.2 (HBN 6-task classification). Task names as they appear in BIDS
+# filenames are case-sensitive and have HBN-specific quirks: seqLearning8target
+# has a digit inside the name; surroundSupp + contrastChangeDetection ship
+# with multiple `_run-<N>` runs we collapse to one label; the "Video" category
+# splits across four distinct movie-clip task names.
 TASK_LABEL: dict[str, int] = {
     "RestingState":             0,
-    "SequenceLearning":         1,
-    "SymbolSearch":             2,
-    "SurroundSuppression":      3,
-    "ContrastChangeDetection":  4,
-    "Video":                    5,   # Video1 / Video2 / Video3 / Video4 / Video_short all collapse to label 5
+    "seqLearning8target":       1,
+    "symbolSearch":             2,
+    "surroundSupp":             3,
+    "contrastChangeDetection":  4,
+    # Video category — collapse the four movie-clip task names → label 5
+    "DespicableMe":             5,
+    "DiaryOfAWimpyKid":         5,
+    "FunwithFractals":          5,
+    "ThePresent":               5,
 }
 
-# Permissive task-name parser: HBN releases vary in the suffix (e.g.
-# ``SequenceLearning_R6``, ``SurroundSuppression_run-1``, ``Video1`` etc.).
-# Extract the canonical task root and look up the label.
-_TASK_FILENAME_RE = re.compile(r"task-([A-Za-z]+)(?:[_\d].*)?")
+# Reverse map: label → canonical task name (we pick a representative for
+# label 5 for display purposes).
+TASK_NAME_BY_LABEL: dict[int, str] = {
+    0: "RestingState",
+    1: "seqLearning8target",
+    2: "symbolSearch",
+    3: "surroundSupp",
+    4: "contrastChangeDetection",
+    5: "Video",
+}
 
-# HBN site prefix in subject IDs is *not* a thing — site is per-release in
-# ``dataset_description.json`` or per-subject in ``participants.tsv``. We
-# resolve site lazily from the participants.tsv frame.
+# Filename-parse regex. BIDS filenames look like:
+#     sub-NDARxxx_task-<task>[_run-<N>]_<datatype>.<ext>
+# datatype ∈ {eeg, channels, electrodes, coordsystem, events}.
+# We capture the task name (alphanumeric, may contain digits) up to the
+# optional ``_run-<N>`` and the trailing ``_<datatype>``.
+_TASK_FILENAME_RE = re.compile(
+    r"task-([A-Za-z][A-Za-z0-9]*?)(?:_run-\d+)?_(?:eeg|channels|electrodes|coordsystem|events)"
+)
+
+# HBN site code: provided in participants.tsv via the "ehq_total_completed"-
+# adjacent "release_number" / "site" columns (release-dependent). We resolve
+# site lazily from the participants.tsv frame at preprocess time.
 HBN_SITES: tuple[str, ...] = ("RU", "CBIC", "CUNY", "SI")
 
-# 128-channel EGI HydroCel naming convention; HBN uses these literal names
-# in channels.tsv. Order matters — channel_idx in our parquet schema is
-# the position in this list.
+# 128-channel EGI HydroCel naming convention; HBN's channels.tsv uses these
+# literal names. Order matters — channel_idx in our parquet schema is the
+# position in this list.
 HYDROCEL_128_NAMES: tuple[str, ...] = tuple(f"E{i}" for i in range(1, 129))
 
-# FCP-INDI HBN-EEG bucket + prefix.
+# FCP-INDI HBN-EEG bucket + prefix (BIDS-formatted release tree).
 HBN_S3_BUCKET = "fcp-indi"
-HBN_S3_PREFIX = "data/Projects/HBN/EEG"
+HBN_S3_PREFIX = "data/Projects/HBN/BIDS_EEG"
 
-# HBN releases as of 2026-05; new releases get appended over time. We list the
-# bucket prefix at runtime; this constant is just a sanity-check seed.
+# HBN release codes (the prefix we type when calling the CLI). The actual S3
+# directory name is ``cmi_bids_<release>`` — see ``release_s3_prefix``.
 KNOWN_RELEASES: tuple[str, ...] = (
-    "NC", "RC", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9",
+    "NC", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9",
 )
+
+
+def release_s3_prefix(release: str) -> str:
+    """Map user-facing release code (e.g. 'R1') → S3 prefix segment ('cmi_bids_R1')."""
+    return f"cmi_bids_{release}"
+
+
+def parse_task_from_filename(filename: str) -> tuple[str, int] | None:
+    """Parse a BIDS-iEEG filename → (canonical_task_name, task_label) or None.
+
+    Examples:
+        ``sub-NDARxxx_task-RestingState_eeg.set``         → ("RestingState", 0)
+        ``sub-NDARxxx_task-seqLearning8target_eeg.set``   → ("seqLearning8target", 1)
+        ``sub-NDARxxx_task-surroundSupp_run-1_eeg.set``   → ("surroundSupp", 3)
+        ``sub-NDARxxx_task-DespicableMe_eeg.set``         → ("DespicableMe", 5)
+        ``sub-NDARxxx_task-Unknown_eeg.set``              → None  (not in TASK_LABEL)
+    """
+    m = _TASK_FILENAME_RE.search(filename)
+    if not m:
+        return None
+    task = m.group(1)
+    label = TASK_LABEL.get(task)
+    if label is None:
+        return None
+    return task, label
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +153,13 @@ KNOWN_RELEASES: tuple[str, ...] = (
 class Recording:
     """One ``.set/.fdt`` recording for one subject.
 
-    Identifiers in S3 + on local disk:
-        s3_set:  s3://fcp-indi/data/Projects/HBN/EEG/<release>/sub-<id>/eeg/<basename>.set
+    Identifiers in S3 + on local disk (note: the local layout mirrors the
+    BIDS S3 layout including the ``cmi_bids_<release>/`` prefix, so a flat
+    ``rclone`` between local and S3 is a no-op rename):
+
+        s3_set:  s3://fcp-indi/data/Projects/HBN/BIDS_EEG/cmi_bids_<release>/sub-<id>/eeg/<basename>.set
         s3_fdt:  ...<basename>.fdt
-        local:   <storage.raw_hbn>/<release>/sub-<id>/eeg/<basename>.set
+        local:   <storage.raw_hbn>/cmi_bids_<release>/sub-<id>/eeg/<basename>.set
     """
 
     subject_id: str           # "NDARABCD1234"
@@ -111,11 +178,14 @@ class Recording:
     def s3_fdt_uri(self) -> str:
         return f"s3://{HBN_S3_BUCKET}/{self.s3_fdt_key}"
 
+    def _local_eeg_dir(self, raw_root: Path) -> Path:
+        return raw_root / release_s3_prefix(self.release) / f"sub-{self.subject_id}" / "eeg"
+
     def local_set_path(self, raw_root: Path) -> Path:
-        return raw_root / self.release / f"sub-{self.subject_id}" / "eeg" / f"{self.basename}.set"
+        return self._local_eeg_dir(raw_root) / f"{self.basename}.set"
 
     def local_fdt_path(self, raw_root: Path) -> Path:
-        return raw_root / self.release / f"sub-{self.subject_id}" / "eeg" / f"{self.basename}.fdt"
+        return self._local_eeg_dir(raw_root) / f"{self.basename}.fdt"
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +203,10 @@ def _anonymous_s3_client():
 
 
 def list_releases() -> list[str]:
-    """List all HBN-EEG release folders under the FCP-INDI prefix.
+    """List all HBN-EEG release codes available under ``BIDS_EEG/cmi_bids_*``.
 
-    Returns release names like ``["NC", "R1", ...]``. The bucket layout is
-    ``data/Projects/HBN/EEG/<release>/sub-<id>/...``.
+    Returns user-facing release codes (e.g. ``["NC", "R1", "R2", ...]``),
+    stripping the ``cmi_bids_`` prefix the bucket uses for the directory name.
     """
     s3 = _anonymous_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
@@ -144,8 +214,8 @@ def list_releases() -> list[str]:
     for page in paginator.paginate(Bucket=HBN_S3_BUCKET, Prefix=f"{HBN_S3_PREFIX}/", Delimiter="/"):
         for cp in page.get("CommonPrefixes", []) or []:
             tail = cp["Prefix"].rstrip("/").split("/")[-1]
-            if tail and tail != "EEG":
-                releases.add(tail)
+            if tail.startswith("cmi_bids_"):
+                releases.add(tail[len("cmi_bids_"):])
     return sorted(releases)
 
 
@@ -153,7 +223,7 @@ def list_subjects(release: str, *, max_subjects: int | None = None) -> list[str]
     """List subject IDs (without ``sub-`` prefix) under one release."""
     s3 = _anonymous_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
-    prefix = f"{HBN_S3_PREFIX}/{release}/"
+    prefix = f"{HBN_S3_PREFIX}/{release_s3_prefix(release)}/"
     subjects: list[str] = []
     for page in paginator.paginate(Bucket=HBN_S3_BUCKET, Prefix=prefix, Delimiter="/"):
         for cp in page.get("CommonPrefixes", []) or []:
@@ -169,7 +239,7 @@ def list_subject_recordings(subject_id: str, release: str) -> list[Recording]:
     """List all recordings for one subject in one release."""
     s3 = _anonymous_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
-    prefix = f"{HBN_S3_PREFIX}/{release}/sub-{subject_id}/eeg/"
+    prefix = f"{HBN_S3_PREFIX}/{release_s3_prefix(release)}/sub-{subject_id}/eeg/"
 
     recordings: list[Recording] = []
     seen_basenames: set[str] = set()
@@ -183,21 +253,17 @@ def list_subject_recordings(subject_id: str, release: str) -> list[Recording]:
                 continue
             seen_basenames.add(basename)
 
-            m = _TASK_FILENAME_RE.search(basename)
-            if not m:
+            parsed = parse_task_from_filename(basename)
+            if parsed is None:
                 continue
-            task_root = m.group(1)
-            # Collapse "Video1" / "Video_short" / etc. → "Video"
-            task = "Video" if task_root.startswith("Video") else task_root
-            if task not in TASK_LABEL:
-                continue
+            task, task_label = parsed
 
             fdt_key = key[:-4] + ".fdt"  # parallel filename; .set / .fdt come as a pair
             recordings.append(Recording(
                 subject_id=subject_id,
                 release=release,
                 task=task,
-                task_label=TASK_LABEL[task],
+                task_label=task_label,
                 basename=basename,
                 s3_set_key=key,
                 s3_fdt_key=fdt_key,
@@ -237,7 +303,8 @@ def download_recording(rec: Recording, raw_root: Path,
 
 def download_subject_sidecars(subject_id: str, release: str, raw_root: Path,
                               *, overwrite: bool = False) -> list[Path]:
-    """Pull the BIDS sidecar files (channels.tsv, eeg.json, electrodes.tsv).
+    """Pull the BIDS sidecar files (channels.tsv, eeg.json, electrodes.tsv,
+    coordsystem.json, events.tsv).
 
     These are small (~kB each) and needed for channel-name parsing + sample
     rate verification. We pull them all per-subject in one shot; the .set/.fdt
@@ -245,14 +312,14 @@ def download_subject_sidecars(subject_id: str, release: str, raw_root: Path,
     """
     s3 = _anonymous_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
-    prefix = f"{HBN_S3_PREFIX}/{release}/sub-{subject_id}/eeg/"
+    prefix = f"{HBN_S3_PREFIX}/{release_s3_prefix(release)}/sub-{subject_id}/eeg/"
     out: list[Path] = []
     for page in paginator.paginate(Bucket=HBN_S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []) or []:
             key = obj["Key"]
             if key.endswith((".set", ".fdt")):
                 continue
-            local = raw_root / release / f"sub-{subject_id}" / "eeg" / Path(key).name
+            local = raw_root / release_s3_prefix(release) / f"sub-{subject_id}" / "eeg" / Path(key).name
             local.parent.mkdir(parents=True, exist_ok=True)
             if local.exists() and not overwrite:
                 out.append(local)
@@ -268,8 +335,8 @@ def download_release_metadata(release: str, raw_root: Path,
     s3 = _anonymous_s3_client()
     out: dict[str, Path] = {}
     for fname in ("participants.tsv", "dataset_description.json"):
-        key = f"{HBN_S3_PREFIX}/{release}/{fname}"
-        local = raw_root / release / fname
+        key = f"{HBN_S3_PREFIX}/{release_s3_prefix(release)}/{fname}"
+        local = raw_root / release_s3_prefix(release) / fname
         local.parent.mkdir(parents=True, exist_ok=True)
         if local.exists() and not overwrite:
             out[fname] = local

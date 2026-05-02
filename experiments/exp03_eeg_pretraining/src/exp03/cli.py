@@ -176,7 +176,7 @@ def audit_cmd(
     import pandas as pd
 
     s = storage.from_env()
-    rel_dir = s.raw_hbn / release
+    rel_dir = s.raw_hbn / hbn.release_s3_prefix(release)
     if not rel_dir.exists():
         console.print(f"[red]error:[/red] {rel_dir} not found — run "
                       f"`exp03 download {release}` first")
@@ -313,7 +313,7 @@ def preprocess_cmd(
     s = storage.from_env()
     s.ensure_dirs()
 
-    rel_dir = s.raw_hbn / release
+    rel_dir = s.raw_hbn / hbn.release_s3_prefix(release)
     if not rel_dir.exists():
         console.print(f"[red]error:[/red] no local data for release {release} at {rel_dir} — "
                       f"run `exp03 download {release}` first")
@@ -354,17 +354,10 @@ def preprocess_cmd(
             if not fdt_path.exists():
                 continue
 
-            # Parse task from filename
-            import re
-
-            m = re.search(r"task-([A-Za-z]+)(?:[_\d].*)?", set_path.stem)
-            if not m:
+            parsed = hbn.parse_task_from_filename(set_path.stem)
+            if parsed is None:
                 continue
-            task_root = m.group(1)
-            task = "Video" if task_root.startswith("Video") else task_root
-            if task not in hbn.TASK_LABEL:
-                continue
-            task_label = hbn.TASK_LABEL[task]
+            _task, task_label = parsed
             recording_id = set_path.stem.replace(f"sub-{sub_id}_", "").replace("_eeg", "")
 
             # Compute provenance hash once per recording
