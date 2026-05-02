@@ -3,7 +3,63 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-02 (~16:45 IST / 11:15 UTC)
+> **Last refreshed:** 2026-05-02 ~17:00 IST / 11:30 UTC
+
+---
+
+## 2026-05-02T11:22 UTC (16:52 IST) — full HBN pipeline confirmed running
+
+The first kickoff at `~11:18 UTC` was a no-op that took 8 seconds. Two bugs
+in `scripts/full_hbn_pipeline.sh` (commit `d222f0c` is the fix):
+
+1. `$SCRATCH` was used inside `process_release()` but never `export`ed,
+   so when xargs fork'd subshells they got an empty value and tried to
+   write the per-release log to `/full_hbn_pipeline.NC.log` (root) →
+   `tee: Permission denied` → step 1 returned non-zero → the function
+   propagated nothing useful → all 10 releases "completed" instantly.
+2. `log()` did `echo "..." | tee -a $TOP_LOG` AND the script was
+   nohup'd with `stdout → $TOP_LOG`, so each line was written twice.
+
+After both fixes were pushed (commit `d222f0c`), pulled, and the box was
+clean of stale processes, the pipeline restarted at `2026-05-02T11:21:42Z`
+(`16:51:42 IST`):
+
+- **PID `18069`** (parent bash). Pidfile at
+  `/opt/dlami/nvme/eeg/scratch/full_hbn_pipeline.pid`.
+- 4 children running `exp03 download` concurrently for releases
+  **NC, R1, R2, R3** (verified via `ps -ef` after 30 s).
+- Top log clean (no duplication this time).
+- Per-release logs (~500 B each so far) accumulating download progress.
+- Old failed log preserved as `full_hbn_pipeline.bad-1.log` for diagnostic.
+
+**Expected timeline.** First wave (NC/R1/R2/R3) should complete around
+`2026-05-02T13:00–14:00 UTC`, freeing slots for the second wave (R4/R5/
+R6/R7), then the third wave (R8/R9). All-done estimated `~15:00–17:00 UTC`
+(`~20:30–22:30 IST`). Final S3 footprint expected ~1 TB across ~2,639
+subject directories.
+
+**To check progress** from your laptop:
+
+```bash
+ssh -i ~/.ssh/eeg-gpu-key-west.pem ubuntu@34.209.244.101 \
+  'tail -50 /opt/dlami/nvme/eeg/scratch/full_hbn_pipeline.log'
+
+# Live S3 tally:
+aws --profile eegmodel-instance s3 ls --recursive --summarize \
+  s3://eegmodel-warehouse/derived/hbn_minimal_500hz/ | tail -3
+```
+
+When it's done you'll see:
+
+```
+[<ts>] ALL RELEASES PROCESSED. The instance can be safely stopped now.
+```
+
+after which: AWS console → EC2 → `i-0b8ee8096fd9176c0` → **Stop instance**
+(NOT terminate). EBS root volume + venv + repo + IAM creds preserved
+for next time.
+
+---
 
 ---
 
