@@ -569,7 +569,7 @@ network has a head start from classical signal-processing theory).
 
 *How we pick a winner.* On the standard evaluation suite (described
 in §7), strict win means the variant beats F0 by at least two
-percentage points on the TUEV multi-class clinical event benchmark
+percentage points on the HBN 6-task multi-class classification benchmark
 with non-overlapping confidence intervals, *and* the matched-noise
 twin shows no equivalent improvement. We additionally require that
 the variant does not lose on a phase-locking-value reconstruction
@@ -646,9 +646,10 @@ architecturally, and whether phase is preserved by design.
 
 *How we pick a winner.* The standard rule from §7, with frozen-probing
 as the primary metric. One extra constraint: a "predict the source
-dataset" probe on the encoder's pooled output must trend *down* over
-training. A recipe that improves TUEV accuracy but increases
-source-dataset probe accuracy is learning recording-rig identity, not
+dataset" probe (now the HBN site probe + subject-ID k-NN, see §7) on
+the encoder's pooled output must trend *down* over training. A recipe
+that improves HBN 6-task accuracy but increases site / subject probe
+accuracy is learning recording-rig or subject identity, not
 neural content, and is disqualified. The dedicated NSP-only ablation
 (weight sweep, head architecture, optional phase-locking pseudo-target)
 lives in §6.16.
@@ -830,10 +831,14 @@ The injection probability ranges from 0 (baseline) to 0.5 (the WavLM
 default).
 
 *How we pick a winner.* The standard rule. We additionally evaluate
-on the TUH artifact dataset (TUAR), which has high artifact prevalence.
-A multi-condition-pretrained encoder should improve on TUAR more than
-on TUEV; otherwise the noise injection is generic regularisation
-rather than artifact-specific robustness.
+on HBN-Artifact-Synth — a held-out subset of HBN windows into which we
+inject realistic recorded EOG/EMG segments at SNR ∈ [0,5] dB to
+construct an artifact-rich eval. A multi-condition-pretrained encoder
+should improve on HBN-Artifact-Synth more than on the clean HBN
+6-task; otherwise the noise injection is generic regularisation rather
+than artifact-specific robustness. When TUH access lands, also report
+on TUAR (TUH EEG Artifact dataset), which has manually annotated
+artifacts.
 
 == 10 — Masking strategy
 
@@ -949,7 +954,7 @@ strict-win — combines all three (W4) and asks whether the combination
 beats the best individual.
 
 *How we pick a winner.* The standard rule with a lower bar (0.5 pp
-TUEV BAC) for individual quick wins. For W4, the combination must
+HBN 6-task BAC) for individual quick wins. For W4, the combination must
 strict-win against the *best* of the three individuals, not merely
 against the baseline; this protects against false additivity claims.
 
@@ -1004,8 +1009,9 @@ become uninformative about dataset identity. This is the standard
 
 *How we pick a winner.* This experiment has two parallel decisions.
 First, *do not lose*: the variant must be within 0.5 percentage
-points of the baseline on TUEV BAC. Second, *invariance achieved*:
-the source-dataset linear-probe accuracy at the end of training must
+points of the baseline on HBN 6-task BAC. Second, *invariance
+achieved*: the site / subject linear-probe accuracy at the end of
+training must
 be below 50 % to count as a strict pass. A variant must satisfy both
 conditions to be adopted. If no variant does, the headline run ships
 without the adversary and the cortico-ssl-hypothesis's H6 prediction
@@ -1030,7 +1036,9 @@ family and (b) actually beneficial for representation quality.
 
 The claim is plausible on theory grounds. EEGM2 — a recent Mamba-2
 based EEG foundation model — reported that performance peaks at
-30-second windows on the TUAB benchmark before plateauing. But
+30-second windows on the TUAB benchmark before plateauing (we will
+replicate primarily on HBN ADHD-binary, with TUAB as the
+literature-comparable secondary when TUH access lands). But
 experiments 02–13 all use the standard 4-second window, so we have
 not actually verified the long-context benefit in our recipe.
 
@@ -1109,10 +1117,11 @@ schedule stretched over twice as many steps).
 *How we pick a winner.* For Phase A, we expect non-degradation
 rather than improvement: the hypothesis recipe should be near-optimal,
 and we are checking that small perturbations do not break it. A
-perturbation that loses by 0.5 percentage points or more on TUEV BAC
-is *rejected* and indicates the recipe is brittle along that axis.
-For Phase B, the hypothesis curriculum (Cu1) is preferred if it beats
-the no-curriculum baseline by 0.5 pp on TUEV BAC, *or* if it raises
+perturbation that loses by 0.5 percentage points or more on HBN
+6-task BAC is *rejected* and indicates the recipe is brittle along
+that axis. For Phase B, the hypothesis curriculum (Cu1) is preferred
+if it beats the no-curriculum baseline by 0.5 pp on HBN 6-task BAC,
+*or* if it raises
 end-of-training FSQ codebook utilisation from below 50 % (the
 structural failure mode the curriculum is designed to prevent) to
 above 80 %.
@@ -1186,8 +1195,9 @@ channel-aggregation work in `brain/experiments/pretraining-experiment/`,
 not a settled axis.
 
 *How we pick a winner.* The primary metric is *frozen-probing*
-performance on TUEV (balanced accuracy), with the standard rule from
-§7. A variant must additionally not lose by more than 0.5 percentage
+performance on HBN 6-task (balanced accuracy), with the standard rule
+from §7. A variant must additionally not lose by more than 0.5
+percentage
 points under fine-tuning — we want NSP to help, but not at the cost of
 fine-tune quality. We also report per-statistic correlations between
 the NSP head's predictions and the ground-truth statistic on a
@@ -1237,22 +1247,37 @@ whose representation is only good once the encoder has been
 re-optimised for a specific task — that is not a foundation model in
 the sense the term is usually used.
 
-The three frozen-probing tasks are:
+The three primary frozen-probing tasks are:
 
-- *Linear probe on TUAB (binary).* The Temple University Hospital
-  Abnormal EEG dataset, normal-vs-abnormal classification. Single-layer
-  linear head on top of the frozen encoder. Metric: AUROC.
-- *Linear probe on TUEV (multi-class).* The TUH Event corpus, six
-  clinical event classes (spike-and-wave, generalised periodic
-  discharges, periodic lateralised epileptiform discharges, eye
-  movement artifact, generic artifact, background). Same protocol as
-  TUAB. Metric: balanced accuracy and weighted F1. This is the
-  headline metric for most of the experiments in §6.
-- *k-NN on a 10 000-sample TUEV subset.* A 5-nearest-neighbours
+- *Linear probe on HBN ADHD-vs-no-diagnosis (binary).* The Healthy
+  Brain Network EEG corpus, ADHD diagnosis vs no DSM-V diagnosis,
+  subject-disjoint train/test split. Single-layer linear head on top
+  of the frozen encoder. Metric: AUROC. This is the cheap, monotone,
+  good-early-signal probe; it replaces TUAB's role in the EEG-FM
+  literature.
+- *Linear probe on HBN 6-task classification (multi-class).* Six
+  cognitive tasks from HBN (resting state, sequence learning, symbol
+  search, surround suppression, contrast change detection, video
+  watching). Same protocol as the binary probe. Metric: balanced
+  accuracy and weighted F1. This is the headline metric for most of
+  the experiments in §6, and it has a perfect 6-class symmetry with
+  the role TUEV plays in the TUEG-using literature.
+- *k-NN on a 10 000-sample HBN subset.* A 5-nearest-neighbours
   classifier on the frozen encoder's mean-pooled output, using cosine
   distance. This requires no training at all and so cannot be gamed by
   clever head architecture; it is particularly sensitive to
   representational collapse.
+
+A secondary fourth probe is added when TUH NEDC access lands:
+
+- *Linear probe on TUAB (binary AUROC) + TUEV (6-class BAC + weighted
+  F1).* The canonical EEG-FM literature benchmark, used for direct
+  apples-to-apples comparison against LaBraM, CBraMod, BIOT, REVE.
+  Reported alongside the HBN primary metrics but *not* used for the
+  decision rule. Pretrain-on-HBN → eval-on-TUH is also a
+  cross-distribution test (pediatric pretrain → adult clinical eval),
+  which is a *stronger* probe of universal representation quality
+  than same-distribution eval.
 
 == End-to-end fine-tuning (the secondary protocol)
 
@@ -1279,9 +1304,13 @@ Four monitors that do not depend on any labels:
   ratio signals exploding individual features.
 - *Encoder covariance rank.* Should remain at least half the feature
   dimension; collapse manifests as low rank.
-- *Source-dataset linear probe.* Should *decrease* over training; a
-  rising probe means the encoder is learning rig identity instead of
-  brain content.
+- *Recording-site linear probe + subject-ID k-NN.* HBN was collected
+  at four CMI sites (RU, CBIC, CUNY, SI), so we predict site from
+  encoder features as the analogue of the "source-dataset probe" in a
+  multi-corpus mix; in parallel we run a subject-ID k-NN on a held-out
+  batch. Both should *decrease* over training; a rising site or
+  subject probe means the encoder is learning site/subject identity
+  instead of brain content.
 
 == Matched-noise twin
 
@@ -1320,7 +1349,8 @@ decisions:
   in the project methodology and only happens after these
   mini-experiments have settled the configuration.
 - *EEG-to-text fine-tuning.* The evaluation suite here is restricted
-  to TUAB / TUEV linear probe and k-NN, which run cheaply (under ten
+  to the HBN primary linear probes (and TUAB / TUEV as a secondary
+  when TUH access lands) plus k-NN, which run cheaply (under ten
   minutes per experiment cell). Whether the resulting encoder is
   good enough to feed into the ZuCo / Brennan / Chisco fine-tunes is
   a separate decision once we have a winner.
@@ -1511,14 +1541,47 @@ document with one-sentence definitions.
   *Transformer.* The standard attention-based architecture; quadratic
   in sequence length.
 
-  *TUAB.* TUH Abnormal EEG corpus. A standard benchmark for
-  normal-vs-abnormal classification.
+  *HBN-EEG.* Healthy Brain Network EEG corpus. ~3,000 children and
+  young adults (ages 5–22), 128-channel HydroCel @ 500 Hz native, six
+  cognitive tasks (resting state, sequence learning, symbol search,
+  surround suppression, contrast change detection, video watching),
+  collected at four CMI sites. Openly available on AWS public storage
+  and OpenNeuro under CC0. Used as our primary pretraining corpus
+  (§4.1 of mini_experiments.md) and the source of our primary
+  frozen-probing eval (HBN ADHD-binary AUROC + HBN 6-task BAC + WF1).
 
-  *TUEG.* TUH EEG corpus. A large unlabelled clinical EEG dataset
-  used for pretraining.
+  *TUAB.* TUH Abnormal EEG corpus. A standard binary normal-vs-
+  abnormal classification benchmark in the EEG-FM literature (LaBraM,
+  CBraMod, BIOT, REVE all report AUROC on it). Credentialed access
+  via TUH NEDC. Used as our *secondary* eval — the literature-
+  comparable AUROC reported alongside the primary HBN ADHD-binary
+  AUROC, conditional on TUH access.
 
-  *TUEV.* TUH EEG Events corpus. A standard benchmark with six
-  clinical event classes.
+  *TUEG.* TUH EEG corpus. A large multi-decade unlabelled clinical
+  EEG dataset (~27,000 hours, 23-channel typical, varied rates) used
+  as the de facto pretraining corpus in the EEG-FM literature. Our
+  mini-experiments switched to HBN-EEG as the pretraining corpus
+  because HBN is open-access (no NEDC application wait) and yields
+  ~2.5× more iid examples per recording-hour from its 128-channel
+  montage; see §4.1 of mini_experiments.md for the full rationale.
+
+  *TUEV.* TUH EEG Events corpus. The standard 6-class clinical event
+  classification benchmark (SPSW, GPED, PLED, EYEM, ARTF, BCKG).
+  Credentialed access via TUH NEDC. Same secondary status as TUAB:
+  reported alongside our primary HBN 6-task BAC + WF1 once TUH access
+  lands, used for direct comparability with the EEG-FM literature.
+
+  *TUAR.* TUH EEG Artifact corpus. A held-out artifact-detection
+  evaluation set with manually annotated chewing / eye / muscle
+  artifacts; used as the literature-comparable secondary in §6.9
+  multi-condition input alongside our primary HBN-Artifact-Synth
+  (synthetic artifacts on HBN windows).
+
+  *TUH NEDC.* Temple University Hospital Neural Engineering Data
+  Consortium. The credentialed access portal for the TUH EEG family
+  (TUEG / TUAB / TUEV / TUSZ / TUSL / TUEP / TUAR). Application is a
+  one-page form emailed to `help@nedcdata.org`; turnaround is 1–2
+  business days.
 
   *VICReg.* Variance-Invariance-Covariance Regularisation. A
   self-supervised loss based on three penalties (invariance to

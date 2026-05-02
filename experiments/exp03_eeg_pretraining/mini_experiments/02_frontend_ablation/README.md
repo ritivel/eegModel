@@ -82,7 +82,7 @@ metrics *and* leave noise metrics flat.
 
 ## Held constant
 
-- Pretraining data: the 100h TUEG subset per
+- Pretraining data: the 100h HBN-EEG subset per
   [`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus).
 - Sampling rate: uniform 250 Hz (multi-rate is exp05's question).
 - Backbone: bidirectional Mamba-2, 6 layers, d=256, state N=64.
@@ -97,24 +97,26 @@ metrics *and* leave noise metrics flat.
   the LR is the only HP that does not transfer between data recipes; we
   re-tune it per frontend.
 - Training duration: 8 epochs over the 100h corpus = ≈ 35M training tokens.
-- Eval suite: TUAB AUROC + TUEV balanced accuracy + weighted F1 + k-NN
-  top-1, plus the §4.3 label-free monitors.
+- Eval suite per [`mini_experiments.md` §4.3](../../mini_experiments.md#43-evaluation-suite-for-every-experiment-unless-overridden):
+  primary = HBN ADHD-binary AUROC + HBN 6-task balanced accuracy + weighted F1
+  + k-NN top-1; secondary = TUAB AUROC + TUEV BAC/WF1 (when TUH NEDC access
+  lands); plus the §4.3 label-free monitors.
 
 ## Decision rule
 
 For each variant V relative to the F0 baseline:
 
-- **Strict win**: V's mean TUEV BAC exceeds F0's mean by ≥ 2 percentage
+- **Strict win**: V's mean HBN 6-task BAC exceeds F0's mean by ≥ 2 percentage
   points with non-overlapping 95 % bootstrap CIs *and* the matched-noise
   twin shows no improvement (paired sign-flip permutation test
   p > 0.10 on the noise side).
-- **Weak win**: ≥ 1 pp improvement on TUEV BAC with overlapping CIs but
+- **Weak win**: ≥ 1 pp improvement on HBN 6-task BAC with overlapping CIs but
   paired permutation test p < 0.05.
-- **Tie**: TOST equivalence within ε = 1 pp on TUEV BAC.
-- **Loss**: V's mean TUEV BAC is below F0's by ≥ 1 pp with p < 0.05.
+- **Tie**: TOST equivalence within ε = 1 pp on HBN 6-task BAC.
+- **Loss**: V's mean HBN 6-task BAC is below F0's by ≥ 1 pp with p < 0.05.
 
 Phase-preservation requirement (a hard constraint per the conversation):
-even if V wins on TUEV BAC, if a follow-on phase-sensitive eval (a
+even if V wins on HBN 6-task BAC, if a follow-on phase-sensitive eval (a
 phase-locking-value reconstruction test on a held-out segment) shows V is
 worse than F0 by > 10 %, V is disqualified from carrying forward unless we
 add a phase loss in exp07 that recovers it.
@@ -123,11 +125,11 @@ add a phase loss in exp07 that recovers it.
 
 | Variant | Prediction | Reasoning |
 | ------- | ---------- | --------- |
-| F0 vanilla | The floor. TUAB ~75 %, TUEV BAC ~40 %. | LaBraM-Base level on equivalent compute. |
-| F1 (+ Snake + BlurPool) | Weak win on both, ~+1 pp on TUEV BAC | Snake adds a periodic prior matching EEG oscillations; BlurPool prevents aliasing. Both should be free wins. |
-| F2 (SincNet) | Strict win on TUEV BAC, ~+2–3 pp; tied on TUAB | Bandpass priors should help on the multi-class TUEV more than the binary TUAB. |
-| F3 (frozen scattering) | Strict win on noise robustness (the matched-noise twin shows no improvement), ~+1–2 pp on TUEV BAC | Lipschitz stability bounds the gradient contribution of artifacts. |
-| F4 (complex Gabor) | Best on the phase-locking-value eval; competitive but not top on TUEV BAC | Phase preservation comes at the cost of doubling the channel count (real+imag). |
+| F0 vanilla | The floor. HBN ADHD-binary AUROC ~70 %, HBN 6-task BAC ~30 % (random = 16.7 %). | Comparable to LaBraM-Base level on equivalent compute, normalised for the 6-task vs TUEV symmetry. |
+| F1 (+ Snake + BlurPool) | Weak win on both, ~+1 pp on HBN 6-task BAC | Snake adds a periodic prior matching EEG oscillations; BlurPool prevents aliasing. Both should be free wins. |
+| F2 (SincNet) | Strict win on HBN 6-task BAC, ~+2–3 pp; tied on HBN ADHD-binary | Bandpass priors should help on the multi-class 6-task more than the binary diagnosis label. |
+| F3 (frozen scattering) | Strict win on noise robustness (the matched-noise twin shows no improvement), ~+1–2 pp on HBN 6-task BAC | Lipschitz stability bounds the gradient contribution of artifacts. |
+| F4 (complex Gabor) | Best on the phase-locking-value eval; competitive but not top on HBN 6-task BAC | Phase preservation comes at the cost of doubling the channel count (real+imag). |
 
 If F2 and F3 both strict-win independently, exp02 carries forward
 **F2 + F3 hybrid** (SincNet → frozen scattering on top → linear projection)
@@ -172,7 +174,7 @@ and re-evaluates as a sixth cell. This is the only post-hoc cell allowed.
 | All variants tie because 100h is too little data to differentiate | Add a 50h Sleep-EDF subset and re-run. Sleep stages have strong frequency-band signatures; should differentiate spectral frontends. |
 | F3 Kymatio scattering output dimension is too high (~384) and dominates | Project to D=256 explicitly; the projection is part of the variant. |
 | F2 SincNet cutoffs collapse to identical values | Add the standard SincNet repulsive regulariser on cutoffs to keep them spread. |
-| Random-init linear probe (from exp01) is unexpectedly high — variants barely move it | This is the floor problem flagged in [`methodology.md` §1](../../methodology.md#1-the-mental-model-pretraining-is-capability-engineering-not-luck). Switch to a harder downstream task (TUEV instead of TUAB-binary, or BCIC-IV-2a). |
+| Random-init linear probe (from exp01) is unexpectedly high — variants barely move it | This is the floor problem flagged in [`methodology.md` §1](../../methodology.md#1-the-mental-model-pretraining-is-capability-engineering-not-luck). Switch to a harder downstream task (HBN 6-task instead of HBN ADHD-binary, or BCIC-IV-2a). |
 
 ## What gets carried forward
 

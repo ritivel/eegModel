@@ -96,16 +96,21 @@ remains the original clean version.
 
 Same as prior experiments:
 
-- Strict win = ≥ 1 pp TUEV BAC, non-overlapping CIs, noise-twin flat.
+- Strict win = ≥ 1 pp HBN 6-task BAC (per §4.3 Protocol A.2), non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 0.5 pp with paired permutation p < 0.05.
 
 Two multi-condition-specific criteria:
 
 - **Robustness on artifact-heavy held-out set**: evaluate each variant on
-  TUAR (TUH Artifact dataset) — a held-out subset where artifact
-  prevalence is high. A multi-condition-pretrained encoder should
-  improve more on TUAR than on TUEV. If it doesn't, the noise injection
-  is generic regularisation rather than artifact-specific robustness.
+  HBN-Artifact-Synth — a held-out subset of HBN windows into which we
+  inject realistic recorded EOG / EMG segments from `EEGdenoiseNet` at
+  SNR ∈ [0, 5] dB to construct an artifact-rich eval. A multi-condition-
+  pretrained encoder should improve more on HBN-Artifact-Synth than on
+  the clean HBN 6-task baseline. If it doesn't, the noise injection is
+  generic regularisation rather than artifact-specific robustness. When
+  TUH NEDC access lands, also report on TUAR (TUH EEG Artifact dataset)
+  as a real-data secondary — TUAR has manually annotated artifacts
+  (chewing, eye, muscle) so it's the ground-truth artifact eval.
 - **Reconstruction loss on noise-injected vs clean input**: the variant
   must show *less* reconstruction-loss degradation when the input is
   noise-injected at test time vs the clean baseline (because the encoder
@@ -114,18 +119,18 @@ Two multi-condition-specific criteria:
 
 ## Pre-registered predictions
 
-| Variant | Prediction TUEV BAC | Prediction TUAR |
-| ------- | ------------------- | --------------- |
+| Variant | Prediction HBN 6-task BAC (clean) | Prediction HBN-Artifact-Synth BAC |
+| ------- | ----------------------------------- | ----------------------------------- |
 | N0 baseline | reference | reference |
-| N1 EOG only | tied or weak win, ~+0.5 pp on TUEV; weak win, ~+1 pp on TUAR (TUAR has lots of EOG) | |
-| N2 EMG only | tied; weak win on TUAR for EMG-heavy windows |  |
-| N3 mixed @ 0.3 | strict win, ~+1 pp TUEV; strict win, ~+2 pp TUAR | |
-| N4 mixed @ 0.5 | tied or weak win on TUEV (might be over-noised); strict win on TUAR, ~+3 pp |  |
+| N1 EOG only | tied or weak win, ~+0.5 pp clean; weak win, ~+1 pp on artifact-synth (eye-heavy windows benefit most) | |
+| N2 EMG only | tied; weak win on artifact-synth for EMG-heavy windows |  |
+| N3 mixed @ 0.3 | strict win, ~+1 pp clean; strict win, ~+2 pp on artifact-synth | |
+| N4 mixed @ 0.5 | tied or weak win clean (might be over-noised); strict win on artifact-synth, ~+3 pp |  |
 
-The honest expected outcome: **N3 (mixed @ 0.3) wins on TUEV; N4 (mixed
-@ 0.5) wins on TUAR**. The choice depends on whether artifact-heavy
-recordings are the priority (clinical use case) or general representation
-quality is (BCI use case). Both can be reported.
+The honest expected outcome: **N3 (mixed @ 0.3) wins on clean HBN 6-task;
+N4 (mixed @ 0.5) wins on the artifact-synth eval**. The choice depends on
+whether artifact-heavy recordings are the priority (clinical use case) or
+general representation quality is (BCI use case). Both can be reported.
 
 ## Implementation pointers
 
@@ -159,8 +164,8 @@ quality is (BCI use case). Both can be reported.
 
 `mini_experiments/09_multicondition_input/results.md` containing:
 
-1. 5 × 2 (× 3 seed) results table on TUEV.
-2. Same table on TUAR.
+1. 5 × 2 (× 3 seed) results table on clean HBN 6-task.
+2. Same table on HBN-Artifact-Synth (and on TUAR when TUH access lands).
 3. Reconstruction-loss-on-noisy-input table (showing whether the model
    learned to be robust).
 4. Optional: results with realistic recorded EOG / EMG (from

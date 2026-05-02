@@ -115,7 +115,7 @@ capacity in some incidental way (e.g. better gradient scaling).
 
 Same as exp02 / exp03 / exp04:
 
-- Strict win = ≥ 2 pp TUEV BAC, non-overlapping CIs, noise-twin flat.
+- Strict win = ≥ 2 pp HBN 6-task BAC (per §4.3 Protocol A.2), non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 1 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 1 pp.
 
@@ -135,7 +135,7 @@ Two loss-specific criteria:
 
 ## Pre-registered predictions
 
-| Variant | Prediction on TUEV BAC | Prediction on noise-twin |
+| Variant | Prediction on HBN 6-task BAC | Prediction on noise-twin |
 | ------- | ---------------------- | ------------------------ |
 | L0 L2 | floor (~+0.0) | flat |
 | L1 L1 | weak win, ~+0.5 pp | flat |
@@ -176,7 +176,7 @@ amplitude-scale invariance problem simultaneously.
 2. Per-variant gradient-norm trajectory plot.
 3. For Barron: per-channel α distribution plot at end of training.
 4. For IS: spectral fidelity (PSNR on the held-out spectrum reconstruction)
-   in addition to TUEV BAC.
+   in addition to HBN 6-task BAC.
 5. Encoder feature health per variant.
 6. The chosen reconstruction loss with decision-rule justification.
 

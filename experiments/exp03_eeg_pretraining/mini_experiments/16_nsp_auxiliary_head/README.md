@@ -122,8 +122,8 @@ sample entropy of pure Gaussian noise are well-defined and meaningful
 quantities (a noise window has a flat-ish spectrum and a high entropy
 score). The encoder trained with NSP on a noise twin should still
 predict those statistics accurately on its own training distribution
-without that translating to *EEG-task* improvements. If TUEV / TUAB
-metrics rise on the noise twin under NSP, the gain is being attributed
+without that translating to *EEG-task* improvements. If HBN 6-task /
+HBN ADHD-binary metrics rise on the noise twin under NSP, the gain is being attributed
 to representations that are sensitive to broadband statistics rather
 than to neural structure, and we discount it.
 
@@ -138,7 +138,7 @@ Everything from the exp02–exp15 winners. Specifically:
 - Adversarial head: exp13 winner.
 - Loss weights and curriculum: exp15 winner — we add $lambda_"NSP"$ as
   a new weight on top.
-- Pretraining duration: 8 epochs over the 100 h TUEG subset.
+- Pretraining duration: 8 epochs over the 100 h HBN-EEG subset (per [`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus)).
 - Optimiser: AdamW, LR carried forward.
 
 ## Decision rule
@@ -148,16 +148,15 @@ Two parallel decisions:
 **Output A — frozen-probing performance** (the primary metric, given the
 DeeperBrain motivation):
 
-- *Strict win*: ≥ 1 pp TUEV BAC under frozen-probing (linear probe on
-  frozen encoder pool), non-overlapping CIs, noise-twin flat.
+- *Strict win*: ≥ 1 pp HBN 6-task BAC under frozen-probing (per §4.3 Protocol A.2; linear probe on frozen encoder pool), non-overlapping CIs, noise-twin flat.
 - *Weak win*: ≥ 0.5 pp with paired permutation $p < 0.05$.
 - *Loss*: ≥ 0.5 pp below baseline with $p < 0.05$ — disqualifies the
   variant.
 
 **Output B — fine-tune performance** (the safety check):
 
-- *Pass*: TUEV BAC under end-to-end fine-tuning within 0.5 pp of the
-  baseline. The intent is that NSP not destroy fine-tune quality even
+- *Pass*: HBN 6-task BAC under end-to-end fine-tuning within 0.5 pp of
+  the baseline. The intent is that NSP not destroy fine-tune quality even
   if it does not help frozen-probing.
 - *Fail*: ≥ 0.5 pp below baseline under fine-tuning. NSP is hurting
   rather than helping; reject the variant.
@@ -175,7 +174,7 @@ We expect a similar pattern.
 
 ## Pre-registered predictions
 
-| Variant | Frozen-probe TUEV BAC | Fine-tune TUEV BAC | $r$ on alpha power | $r$ on entropy | $r$ on CFC |
+| Variant | Frozen-probe HBN 6-task BAC | Fine-tune HBN 6-task BAC | $r$ on alpha power | $r$ on entropy | $r$ on CFC |
 | ------- | ---------------------- | ------------------- | ------------------- | --------------- | ----------- |
 | N0 baseline | reference | reference | n/a | n/a | n/a |
 | N1 linear $lambda=0.3$ | weak win, ~+0.5 pp | tied | $approx 0.6$ | $approx 0.6$ | $approx 0.05$ |
@@ -248,8 +247,9 @@ loss_nsp = F.smooth_l1_loss(nsp_head(H), Y_NS, beta=1.0)
 
 `mini_experiments/16_nsp_auxiliary_head/results.md` containing:
 
-1. 5 × 2 (× 3 seed) results table — TUEV BAC, TUAB AUROC, k-NN — under
-   *both* frozen-probing and end-to-end fine-tuning.
+1. 5 × 2 (× 3 seed) results table — HBN 6-task BAC, HBN ADHD-binary AUROC,
+   k-NN (and TUEV BAC, TUAB AUROC when TUH access lands) — under *both*
+   frozen-probing and end-to-end fine-tuning.
 2. NSP target reconstruction quality per statistic (correlations as in
    DeeperBrain Fig. 6) — alpha / theta / beta / gamma power, sample
    entropy, three CFC components, PLV (N4 only).

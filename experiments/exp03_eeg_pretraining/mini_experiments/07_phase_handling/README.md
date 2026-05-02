@@ -141,14 +141,14 @@ measurement of what each phase variant is supposed to be improving.
 Two parallel decision rules, because the experiment has two outputs:
 
 **Output A — chosen phase loss** (the standard win/loss as in prior
-experiments, on TUEV BAC). Strict win = ≥ 1 pp TUEV BAC, non-overlapping
-CIs, noise-twin flat.
+experiments, on HBN 6-task BAC per §4.3 Protocol A.2). Strict win = ≥ 1 pp
+HBN 6-task BAC, non-overlapping CIs, noise-twin flat.
 
 **Output B — phase fidelity** (whether the chosen variant actually
 preserves phase, separate from downstream metrics). Strict pass: PLV at θ
 and α bands ≥ 0.7 (the threshold is loose because EEG PLV is hard); strict
-fail: PLV < 0.4. A variant can win on TUEV BAC but fail PLV — in that case
-it's recorded as "good representation but not phase-aware".
+fail: PLV < 0.4. A variant can win on HBN 6-task BAC but fail PLV — in
+that case it's recorded as "good representation but not phase-aware".
 
 The dual rule lets us distinguish "phase loss helps downstream because
 phase is inherently useful" from "phase loss helps downstream as a
@@ -158,12 +158,12 @@ have phase-coded representations.
 
 ## Pre-registered predictions
 
-| Variant | TUEV BAC | PLV (θ, α) |
-| ------- | -------- | ---------- |
+| Variant | HBN 6-task BAC | PLV (θ, α) |
+| ------- | -------------- | ---------- |
 | P0 magnitude only | baseline | low (0.2–0.4) — magnitude doesn't constrain phase |
 | P1 complex STFT | weak win, ~+0.5 pp | moderate (0.5–0.7) — phase reconstructed implicitly |
 | P2 sin/cos | weak win, ~+0.5–1 pp | high (0.7–0.85) — direct supervision |
-| P3 bispectral | weak win, ~+1 pp on cross-freq tasks; tied on TUEV | unrelated to PLV; bispectral measures cross-freq coupling |
+| P3 bispectral | weak win, ~+1 pp on cross-freq tasks; tied on HBN 6-task | unrelated to PLV; bispectral measures cross-freq coupling |
 | P4 combined | strict win, ~+1.5–2 pp | high (0.7–0.85) |
 
 The honest expected outcome: **P2 sin/cos wins on PLV, P3 bispectral wins
@@ -211,7 +211,7 @@ goal in itself (P2 mandatory) or just a means to better downstream metrics
 | ---- | ---------- |
 | Phase loss makes the optimisation unstable (the loss surface is multimodal because of the angle wrapping) | Use sin/cos parameterisation (P2) which avoids wrapping. Avoid raw `angle` MSE. |
 | Bispectral consistency is too noisy as a per-batch loss | Accumulate over 4 batches before computing the loss; this is roughly equivalent to Welch averaging. |
-| Phase loss helps PLV but not TUEV — the eval doesn't reward phase | Add a phase-sensitive eval task: e.g. ERP latency estimation accuracy on a held-out evoked-response dataset. |
+| Phase loss helps PLV but not HBN 6-task BAC — the eval doesn't reward phase | Add a phase-sensitive eval task: e.g. ERP latency estimation accuracy on a held-out evoked-response dataset (HBN's contrast-change-detection task is naturally evoked, so it's a candidate). |
 | Restricting bispectral to [θ × γ] misses other meaningful coupling | First run with the full 0–80 × 0–80 quadrant; if it works restrict to physiologically motivated subregions. |
 
 ## What gets carried forward

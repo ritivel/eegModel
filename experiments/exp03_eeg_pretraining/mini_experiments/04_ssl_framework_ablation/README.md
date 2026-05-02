@@ -44,7 +44,10 @@ choice strongly determines:
   branch) or only via the loss (MAE with sin/cos circular loss).
 
 Each framework attacks low-SNR via a different mechanism. exp04 asks which
-mechanism actually wins on TUEV / TUAB linear probe.
+mechanism actually wins on the standard frozen-probing eval suite from
+[`mini_experiments.md` §4.3](../../mini_experiments.md#43-evaluation-suite-for-every-experiment-unless-overridden)
+— primary HBN 6-task BAC + HBN ADHD-binary AUROC + k-NN, with TUAB/TUEV as
+the literature-comparable secondary once TUH access lands.
 
 ## Variants
 
@@ -98,7 +101,7 @@ representation structure), the EEG result is partly hallucinated.
 
 ## Held constant
 
-- Pretraining data: 100h TUEG subset, 250 Hz uniform.
+- Pretraining data: 100h HBN-EEG subset (per [`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus)), 250 Hz uniform.
 - Frontend: F0 vanilla strided conv (or exp02 winner).
 - Backbone: bidirectional Mamba-2, 6 layers (or exp03 winner).
 - Bottleneck: continuous (no quantization).
@@ -118,7 +121,7 @@ the augmentations the SelfEEG library implements for both methods.
 
 Same as exp02 / exp03:
 
-- Strict win = ≥ 2 pp TUEV BAC, non-overlapping CIs, noise-twin flat.
+- Strict win = ≥ 2 pp HBN 6-task BAC (per §4.3 Protocol A.2), non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 1 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 1 pp.
 - Loss = ≥ 1 pp below baseline with p < 0.05.
@@ -132,18 +135,19 @@ Two framework-specific criteria:
   dataset from encoder features" probe accuracy at end-of-training must be
   *lower* than at start-of-training. This is the anti-shortcut sanity from
   [`methodology.md` §6.4](../../methodology.md#64-pretraining-objectives--what-works-and-what-doesnt).
-  A framework that wins TUEV BAC but increases source-probe accuracy is
-  learning rig fingerprint, not neural content; it's disqualified.
+  A framework that wins HBN 6-task BAC but increases source-probe accuracy
+  (now "predict recording site" + "predict subject ID" per §4.3) is learning
+  site/subject fingerprint, not neural content; it's disqualified.
 
 ## Pre-registered predictions
 
 | Variant | Prediction | Reasoning |
 | ------- | ---------- | --------- |
 | S0 MAE-raw | The floor. Loss curve looks great, downstream is mediocre. | The classic raw-MAE failure on noisy signals — model reconstructs noise. |
-| S1 MAE-denoised | Strict win over S0, ~+2–3 pp on TUEV BAC | The single most direct attack on low SNR. EEG-X reports this; we replicate it without the EMA branch. |
-| S2 VICReg | Weak win on subject-fingerprinting (source probe trends down faster than S0/S1) but tied or weak loss on TUEV BAC | VICReg attacks subject confound but not the raw-noise reconstruction issue. |
-| S3 TF-C | Best on phase-locking-value reconstruction; strict win on TUEV BAC against S0; tied with S1 | The complex STFT branch carries phase explicitly and is naturally noise-robust. |
-| S4 EEGDM diffusion | Strict win on TUEV BAC, ~+3–4 pp; expensive but most principled for low SNR | Score matching at multiple noise levels structurally distinguishes signal from noise. EEGDM beats LaBraM/CBraMod with 19× fewer params per [`brain/eeg-research.md` §7.3](../../../../../brain/eeg-research.md#73-the-diffusion-wave). |
+| S1 MAE-denoised | Strict win over S0, ~+2–3 pp on HBN 6-task BAC | The single most direct attack on low SNR. EEG-X reports this; we replicate it without the EMA branch. |
+| S2 VICReg | Weak win on subject-fingerprinting (subject-ID probe trends down faster than S0/S1) but tied or weak loss on HBN 6-task BAC | VICReg attacks subject confound but not the raw-noise reconstruction issue. |
+| S3 TF-C | Best on phase-locking-value reconstruction; strict win on HBN 6-task BAC against S0; tied with S1 | The complex STFT branch carries phase explicitly and is naturally noise-robust. |
+| S4 EEGDM diffusion | Strict win on HBN 6-task BAC, ~+3–4 pp; expensive but most principled for low SNR | Score matching at multiple noise levels structurally distinguishes signal from noise. EEGDM beats LaBraM/CBraMod with 19× fewer params per [`brain/eeg-research.md` §7.3](../../../../../brain/eeg-research.md#73-the-diffusion-wave). |
 | S5 MER + NSP | Tied or weak win over S1 on end-to-end fine-tuning; **strict win on frozen-probing**, ~+5–10 pp on emotion / motor imagery (the DeeperBrain pattern) | NSP forces the encoder representation itself to encode dynamical order parameters, making linear-probe readout viable. |
 
 The expected outcome: **S1 MAE-denoised wins on practical metrics under
@@ -210,7 +214,7 @@ quality.
 | S2 VICReg collapses (variance → 0 or covariance → identity) | Logging with a hard-stop trigger; restart with γ_var = 5.0 if it happens. |
 | S4 EEGDM diffusion is too slow to fit budget | Run with 100 noise steps instead of 1000 during pretraining; this is standard. |
 | S1 denoised target wins because the eval is dominated by the same bandpass artifact | Re-evaluate S1 on Sleep-EDF too, where bandpass is well-justified anyway. |
-| All frameworks tie because 100h is too small to differentiate | Add the HBN-EEG 100h subset, compare on the union. |
+| All frameworks tie because 100h is too small to differentiate | Scale to 300h of HBN-EEG (still well within the 3000 h available) and re-run the top 2 frameworks; this is cheap because preprocessing is cached in S3. |
 | The chosen frontend (F0 default) handicaps spectral frameworks (S3) | If exp02 has chosen a spectral frontend before exp04 launches, swap it in. Note that this couples the experiments. |
 
 ## What gets carried forward

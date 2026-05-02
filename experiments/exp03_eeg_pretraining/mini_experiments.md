@@ -9,6 +9,17 @@
 > is the *why* (Phase 0–4 framework, eval discipline, monitoring); this file and
 > its child folders are the *what to actually run*.
 >
+> Last refreshed: **2026-05-02** — switched the pretraining corpus from TUEG
+> to **HBN-EEG** (open access, on AWS public storage, larger iid yield from a
+> 128-ch montage), and the primary frozen-probing eval from TUAB+TUEV to
+> **HBN ADHD-vs-no-diagnosis binary AUROC + HBN 6-task classification BAC/WF1
+> + k-NN on a 10k HBN subset**. TUAB+TUEV remain a *secondary* eval (§4.3
+> Protocol A.4) for direct literature comparability, conditional on pending
+> TUH NEDC access — they are reported alongside the primary HBN metrics but
+> are **not** used for the §4.4 winner-picker decision rule. See §4.1 for
+> the rationale (open access, no NEDC wait, 2.5× more iid examples per
+> recording-hour, modern uniform montage).
+>
 > Last refreshed: **2026-05-01** — added experiments 13 (adversarial dataset probe),
 > 14 (context-length scaling), 15 (loss-weight sensitivity + curriculum) on the
 > basis of [`brain/cortico-ssl-hypothesis.typ`](../../../brain/cortico-ssl-hypothesis.typ);
@@ -170,17 +181,56 @@ experiment's README explicitly overrides them.
 ### 4.1 Pretraining corpus
 
 Use the same fixed pretraining subset for every comparison: **100 hours of
-TUEG**, single-channel iid-expanded (so a 23-channel 4-second epoch becomes
-23 independent training examples), preprocessed with the canonical V2
-pipeline from `[../exp01_eeg_to_text/](../exp01_eeg_to_text/)` —
-notch (50/60 Hz, Q=30) → low-pass anti-alias → resample to 250 Hz → high-pass
+HBN-EEG drawn from at least 200 subjects**, single-channel iid-expanded (so
+a 128-channel 4-second epoch becomes 128 independent training examples),
+preprocessed with the canonical V2 pipeline from
+`[../exp01_eeg_to_text/](../exp01_eeg_to_text/)` —
+notch (50/60 Hz, Q=30) → low-pass anti-alias → resample 500 → 250 Hz → high-pass
 (0.5 Hz) → robust per-channel z-score → 5-σ clip → 4-second non-overlapping
-windows. Multi-rate experiments (05) override the resample step.
+windows. Multi-rate experiments (05) override the resample step and bring in
+small auxiliary corpora (Sleep-EDF at 100 Hz, MOABB BCIC-IV-2a at 250 Hz) for
+real device-rate diversity, since HBN is single-rate at 500 Hz.
 
-100 hours at 250 Hz × ~20 channels gives roughly 4.5 million training
-examples after iid expansion — enough to be in the regime where SSL signal
-overcomes initialization noise, small enough that one full pretraining pass
-is 4–8 hours on H100.
+HBN-EEG ([Healthy Brain Network EEG, Shirazi et al. 2024 bioRxiv](https://www.biorxiv.org/content/10.1101/2024.10.03.615261v2))
+is a 3,000+-subject pediatric/young-adult corpus (ages 5–22), 128-channel EGI
+HydroCel @ 500 Hz native, openly distributed on AWS public storage
+(`s3://fcp-indi/data/Projects/HBN/EEG/`) and OpenNeuro (`ds005516`) — no
+credentialed-access wait. 100 hours at 250 Hz × 128 channels gives roughly
+**11.5 million training examples** after iid expansion — enough to be in the
+regime where SSL signal overcomes initialization noise, small enough that one
+full pretraining pass is 4–8 hours on H100.
+
+**Why HBN-EEG over TUEG.** TUEG (Temple University EEG Corpus) is the *de
+facto* pretraining corpus in the EEG-FM literature (BENDR, LaBraM, CBraMod,
+REVE all use it). We deliberately switch to HBN-EEG for these
+mini-experiments because:
+
+1. **Open access, no application wait.** HBN is on AWS public storage and
+   OpenNeuro under CC0; we can sync it into our warehouse bucket today and
+   bootstrap mini-experiment 01 immediately. TUEG is gated via TUH NEDC
+   (~1–2 business days for credentials).
+2. **2.5× more iid examples per recording-hour.** HBN's 128-channel montage
+   versus TUEG's typical 23-channel montage means each hour of recording
+   yields ~5.6× more (subject, channel) iid pairs. After matching for the
+   100-hour budget, we get ~11.5M iid examples vs TUEG's ~4.5M — better
+   coverage of the iid-expansion axis we actually scale on.
+3. **Modern uniform montage.** HydroCel-128 is a single sensor topology
+   collected with a single device class at four CMI sites. TUEG is a
+   multi-decade, multi-device clinical corpus with ~7 distinct montages and
+   a wide range of sampling rates that have to be reconciled in
+   preprocessing — the source of much of the §4.4 "predict source
+   dataset" anti-shortcut headache.
+
+**Tradeoff acknowledged.** HBN is pediatric/young-adult and clinically
+enriched (~50 % at least one DSM-V diagnosis: ADHD, anxiety, learning
+disorders), so this corpus teaches features that are *low-noise scalp EEG of
+adolescents*, not adult clinical EEG. A model pretrained on HBN evaluated on
+TUAB (adult clinical) is a **cross-distribution** test of representation
+quality, which is a *stronger* probe of "did SSL learn universal features"
+than in-distribution eval (per the same DeeperBrain argument that motivates
+frozen-probing over fine-tuning, §4.3 below). For literature comparability,
+TUAB + TUEV are kept as a *secondary* eval (Protocol A.4) and reported
+alongside the primary HBN metrics once TUH NEDC access lands.
 
 ### 4.2 Default architecture (for any axis not under test)
 
@@ -226,15 +276,30 @@ of the mean-pooled encoder output. This is the canonical "linear probe"
 of the image-SSL literature and is what we report as the headline
 metric for every comparison.
 
-1. **Linear probe on TUAB binary** (normal vs abnormal). Frozen encoder,
-   single-layer linear head, train on TUAB train split, evaluate on
-   TUAB eval. Metric: AUROC.
-2. **Linear probe on TUEV 6-class** (event classification — SPSW, GPED,
-   PLED, EYEM, ARTF, BCKG). Same protocol. Metric: balanced accuracy and
-   weighted F1.
-3. **k-NN on a 10k-sample TUEV subset** (k = 5, cosine distance on encoder
+1. **Linear probe on HBN ADHD-vs-no-diagnosis binary** (primary). Frozen
+   encoder, single-layer linear head, train on HBN train split (subject-
+   disjoint LNSO), evaluate on HBN held-out subjects. Metric: AUROC.
+   ADHD is the most common HBN clinical label and is well-balanced
+   (~40 % positive); the binary task replaces TUAB's normal-vs-abnormal
+   role in the eval suite.
+2. **Linear probe on HBN 6-task classification** (primary) — which of the
+   six cognitive tasks the subject is performing: resting state (eyes
+   open + closed), sequence learning, symbol search, surround suppression,
+   contrast change detection, video watching. Same protocol. Metric:
+   balanced accuracy and weighted F1. Perfect 6-class symmetry with the
+   role TUEV played in the original spec.
+3. **k-NN on a 10k-sample HBN subset** (k = 5, cosine distance on encoder
    pooled output). Metric: top-1 accuracy. Cheap, architecture-independent,
    detects representational collapse without training a probe at all.
+4. **(Secondary, when TUH NEDC access is approved) Linear probe on TUAB
+   binary AUROC + TUEV 6-class BAC/WF1** — same protocol as 1 and 2, on
+   the canonical EEG-FM literature benchmark. Reported for direct
+   comparability with LaBraM, CBraMod, BIOT, REVE; **not** used for the
+   §4.4 winner-picker decision rule. Until TUH access lands, this row is
+   left blank in results tables. Note that pretrain-on-HBN →
+   eval-on-TUAB/TUEV is a cross-distribution test (pediatric → adult
+   clinical), which is a *more* honest probe of universal representation
+   quality than same-distribution eval — see DeeperBrain reasoning above.
 
 **Protocol B — end-to-end fine-tuning (secondary).** The full encoder
 is unfrozen; the same head is added; everything is jointly optimised on
@@ -255,9 +320,13 @@ margin its experiment specifies.
 - Encoder feature absmax / std ratio (should be bounded)
 - Encoder covariance rank (should stay > 0.5 × feature dim — see
   [methodology.md §6.1](./methodology.md#61-encoder-feature-health))
-- "Predict source dataset" linear probe on encoder features — should
-  **decrease** over training, otherwise the model is learning rig
-  fingerprint not neural content.
+- "Predict recording site" linear probe on encoder features (HBN was
+  collected at four CMI sites: RU, CBIC, CUNY, SI) — should **decrease**
+  over training, otherwise the model is learning site-rig fingerprint
+  rather than neural content. Plus a "predict subject ID" k-NN on a
+  held-out batch as a stronger anti-shortcut signal (an encoder that
+  identifies subjects too well has likely learned a per-subject
+  fingerprint instead of a transferable representation).
 
 Total eval time per cell: ≈ 15 minutes on one H100 (now that frozen
 probing and fine-tuning both run). Still trivial overhead relative to
@@ -321,9 +390,10 @@ or architectural ideas may still be borrowed inside one of the cells).
 and only happens after these mini-experiments have settled the
 configuration.
 - **No EEG-to-text fine-tuning evaluation.** The eval here is restricted to
-TUAB / TUEV linear probe + k-NN, which are cheap and run in <10 minutes
-per cell. Whether the resulting encoder is good enough to feed into the
-ZuCo / Brennan / Chisco fine-tunes is decided once we have a winner.
+the HBN-derived linear probes + k-NN (and TUAB/TUEV as a secondary check
+once TUH access lands), which are cheap and run in <10 minutes per cell.
+Whether the resulting encoder is good enough to feed into the ZuCo /
+Brennan / Chisco fine-tunes is decided once we have a winner.
 - **No hyperparameter optimisation beyond LR sweeps.** Per
 `[methodology.md` §4](./methodology.md#4-hyperparameter-transfer-when-small-scale-tuning-is-trustworthy),
 every recipe gets a 3-LR × 3-seed sweep at proxy scale; no exotic

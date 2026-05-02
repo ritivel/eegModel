@@ -119,7 +119,7 @@ Everything from the exp02–exp14 winners. Specifically:
 - Adversarial head: exp13 winner (the choice of head architecture and
   $\lambda_\text{adv}$, but only the *initial* weight; this experiment
   also re-explores the weight as part of the L0..L7 sweep).
-- Pretraining duration: 8 epochs of the 100 h TUEG subset.
+- Pretraining duration: 8 epochs of the 100 h HBN-EEG subset (per [`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus)).
 - Optimiser: AdamW, LR carried forward.
 
 The new ingredients are the loss-weight perturbations (Phase A) and the
@@ -133,11 +133,11 @@ For each weight perturbation, we are *not* looking for a strict win — we
 expect the hypothesis recipe to be near-optimal. We are looking for
 **non-degradation**:
 
-- *Pass*: TUEV BAC within 0.5 pp of the L0 baseline (TOST equivalence
+- *Pass*: HBN 6-task BAC within 0.5 pp of the L0 baseline (TOST equivalence
   $\varepsilon = 0.5$ pp). The baseline is robust along this axis.
-- *Adopt*: ≥ 0.5 pp TUEV BAC improvement with non-overlapping CIs. The
+- *Adopt*: ≥ 0.5 pp HBN 6-task BAC improvement with non-overlapping CIs. The
   perturbation is preferable to the hypothesis recipe.
-- *Reject*: ≥ 0.5 pp TUEV BAC degradation with $p < 0.05$. The
+- *Reject*: ≥ 0.5 pp HBN 6-task BAC degradation with $p < 0.05$. The
   hypothesis recipe is brittle along this axis; the headline run sticks
   to the unperturbed weight or, if multiple perturbations reject, the
   L7 GradNorm variant is adopted.
@@ -148,11 +148,11 @@ point only.
 
 **Phase B — curriculum**:
 
-- *Pass for Cu1 (hypothesis curriculum)*: ≥ 0.5 pp TUEV BAC over
+- *Pass for Cu1 (hypothesis curriculum)*: ≥ 0.5 pp HBN 6-task BAC over
   Cu0 (no curriculum) with $p < 0.05$, *or* end-of-training FSQ
   utilisation ≥ 80 % when Cu0's is < 50 % (the structural failure
   mode the curriculum is designed to prevent).
-- *Choose Cu2 (FSQ-only)*: if Cu2 ≥ Cu1 on TUEV BAC, prefer Cu2 because
+- *Choose Cu2 (FSQ-only)*: if Cu2 ≥ Cu1 on HBN 6-task BAC, prefer Cu2 because
   it is simpler.
 - *Choose Cu3 (longer warmup)*: only if both Cu1 and Cu2 fail to
   stabilise FSQ utilisation.
@@ -164,7 +164,7 @@ clean, useful negative result.
 
 ## Pre-registered predictions
 
-| Variant | Predicted TUEV BAC | Predicted FSQ utilisation | Predicted gradient stability |
+| Variant | Predicted HBN 6-task BAC | Predicted FSQ utilisation | Predicted gradient stability |
 | ------- | ------------------- | -------------------------- | ----------------------------- |
 | L0 hypothesis | reference | ~85 % | stable |
 | L1 –Barron | tied or weak loss (~–0.3 pp); P1 attack weakens | unchanged | slightly higher gradient variance |
@@ -220,11 +220,12 @@ two "small wins") or stick with the manual weights + Cu1.
 
 `mini_experiments/15_loss_weight_curriculum/results.md` containing:
 
-1. Phase A: 8 × 2 (× 3 seed) results table with TUEV BAC, TUAB AUROC,
+1. Phase A: 8 × 2 (× 3 seed) results table with HBN 6-task BAC, HBN
+   ADHD-binary AUROC (and TUEV BAC, TUAB AUROC when TUH access lands),
    per-head loss, per-head gradient norm at end of training.
 2. Phase B: 4 × 2 (× 3 seed) results table; FSQ utilisation trajectory
    per curriculum.
-3. Sensitivity heatmap: TUEV BAC as a function of each weight
+3. Sensitivity heatmap: HBN 6-task BAC as a function of each weight
    perturbation (visualises ridge or basin behaviour).
 4. The chosen loss-weight vector and the chosen curriculum schedule.
 5. Compute estimate for the headline run at the chosen configuration.

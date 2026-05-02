@@ -91,8 +91,11 @@ model never sees consistent inputs (Karpathy's example again);
 ### Check D — Random-init linear probe floor
 
 Take a freshly-initialised encoder (all the way through, no pretraining at
-all). Run the standard eval suite: TUAB AUROC, TUEV balanced accuracy +
-weighted F1, k-NN top-1.
+all). Run the standard eval suite per `[../../mini_experiments.md` §4.3
+Protocol A](../../mini_experiments.md#43-evaluation-suite-for-every-experiment-unless-overridden):
+HBN ADHD-vs-no-diagnosis binary AUROC, HBN 6-task classification balanced
+accuracy + weighted F1, k-NN top-1 on a 10k HBN subset (and TUAB AUROC +
+TUEV BAC/WF1 once TUH NEDC access lands, as Protocol A.4 secondaries).
 
 The result is the **ablation floor**. Any future pretrained encoder whose
 linear-probe metrics fall within 1 % of this floor is broken — either the
@@ -136,8 +139,9 @@ All of the following must be true. No partial-credit:
 - B: input-independent baseline does not improve loss by more than 1 %
 relative to its own init value
 - C: one-batch overfit hits < 1 % of init loss within 1000 steps
-- D: random-init linear probe number recorded for TUAB AUROC, TUEV BAC +
-WF1, k-NN top-1, with 95 % CI
+- D: random-init linear probe number recorded for the primary suite (HBN
+ADHD-binary AUROC, HBN 6-task BAC + WF1, k-NN top-1) with 95 % CI; secondary
+TUAB AUROC + TUEV BAC + WF1 added when TUH NEDC access lands
 - E: shape table reviewed and signed off
 
 If any check fails, fix the bug and re-run *all* checks (because the fix may
@@ -151,8 +155,11 @@ A single file `mini_experiments/01_sanity_baselines/results.md` containing:
 2. The input-independent baseline curve over 5000 steps (showing it stays
   flat).
 3. The one-batch overfit curve (showing < 1 % within 1000 steps).
-4. The random-init linear probe table for TUAB / TUEV / k-NN with means and
-  95 % bootstrap CIs.
+4. The random-init linear probe table for the primary suite (HBN ADHD-binary
+  AUROC, HBN 6-task BAC + WF1, k-NN top-1) with means and 95 % bootstrap CIs.
+  Secondary row for TUAB / TUEV (left blank with a note "pending TUH NEDC
+  access; see mini_experiments.md §4.3 Protocol A.4") that gets filled in
+  later without re-running the rest of the experiment.
 5. The shape audit table as printed.
 6. The git SHA and config hash that was tested.
 
@@ -175,7 +182,7 @@ pipeline change (added to CI).
 | Risk                                                                                          | Mitigation                                                                              |
 | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | Loss-at-init off by 20–50 % because batch normalisation hasn't run yet                        | Run 1 forward pass of warmup before measuring loss-at-init                              |
-| Random-init linear probe gives suspiciously high numbers on TUAB                              | TUAB binary is easy; the floor can be 60–70 % AUROC. Cross-check on TUEV (multi-class). |
+| Random-init linear probe gives suspiciously high numbers on the binary task                   | Binary clinical labels (HBN ADHD-binary, or TUAB normal/abnormal) are easy; the floor can be 60–70 % AUROC. Cross-check on the 6-class task (HBN 6-task, or TUEV) where the random floor is much lower. |
 | Input-independent baseline accidentally trains because positional embeddings carry the signal | Use the same positional embedding the real model uses, but zero out all token content   |
 | One-batch overfit succeeds via batch-leak (model predicts other batch entries)                | Already detected by Check E. If E passes, C cannot fail this way.                       |
 

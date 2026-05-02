@@ -22,15 +22,26 @@ pretraining?
 
 ## Why it matters
 
-The pretraining corpus spans an order of magnitude in sampling rate
-(100 Hz Sleep-EDF, 250 Hz TUEG, 500 Hz HBN-EEG / ZuCo, 1000 Hz THINGS-EEG2,
-2000 Hz some clinical recordings — see
+EEG corpora span an order of magnitude in sampling rate (100 Hz Sleep-EDF,
+250 Hz BCIC-IV / TUEG, 500 Hz HBN-EEG / ZuCo, 1000 Hz THINGS-EEG2, 2000 Hz
+some clinical recordings — see
 [`brain/experiments/tokenization/01-preprocessing.md` §2.1](../../../../../brain/experiments/tokenization/01-preprocessing.md#21-whats-at-stake)).
 Every published EEG-FM solves this by uniform resampling to 200 / 250 / 256
 Hz, throwing away high-γ and HFO content above 100 Hz Nyquist. The strict
 information-theoretic reading is that this discards the band where lexical
 and inner-speech content is known to live, which directly limits downstream
 EEG-to-text and high-γ tasks.
+
+**Note vs the master spec.** The other mini-experiments pretrain on a
+single-rate HBN-EEG subset (500 → 250 Hz, see
+[`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus)).
+exp05 is the only experiment where this single-rate constraint is
+*deliberately* relaxed: the question is precisely about how to handle
+multiple device rates, so the corpus must contain multiple real device
+rates. We assemble an open-access mixed-rate corpus (HBN @ 500 Hz +
+Sleep-EDF @ 100 Hz + THINGS-EEG2 @ 1000 Hz) totalling 100 hours, all
+without TUH access; the 2000 Hz held-out rate is constructed by
+information-preserving upsampling.
 
 The four alternatives are real but each has unproven scaling for EEG:
 
@@ -71,10 +82,11 @@ is "input rate at eval", not just signal vs noise:
 | M2 branches      | ✓            | ✓ (native, branch routed) | ✓ (native, branch routed) | ✓ (native, branch routed) | ✓ |
 | M3 SincNet+scattering | ✓       | ✓ (native)   | ✓ (native)    | ✓ (native)    | ✓ |
 
-Pretraining is on the *mixed-rate* corpus (50h TUEG @ 250 Hz + 30h ZuCo @
-500 Hz + 20h THINGS-EEG2 @ 1000 Hz) for a total of 100h, so the model has
-seen 250 / 500 / 1000 Hz during pretraining. **2000 Hz is the held-out
-test rate**: only seen at evaluation. M1 / M2 / M3 should retain
+Pretraining is on the open-access *mixed-rate* corpus (50h HBN-EEG @
+500 Hz + 30h Sleep-EDF @ 100 Hz + 20h THINGS-EEG2 @ 1000 Hz) for a total
+of 100h, so the model has seen 100 / 500 / 1000 Hz during pretraining.
+**2000 Hz is the held-out test rate**: only seen at evaluation, constructed
+by `scipy.signal.resample_poly` upsampling. M1 / M2 / M3 should retain
 performance at 2000 Hz; M0 will resample everything down anyway.
 
 ## Held constant
@@ -86,12 +98,14 @@ performance at 2000 Hz; M0 will resample everything down anyway.
 - SSL framework: exp04 winner (default S1 MAE-denoised).
 - Loss: L1 + 0.3 × MR-STFT log-magnitude.
 - Pretraining duration: 8 epochs over the 100h mixed-rate corpus.
-- Eval downstream task: TUEV (originally 250 Hz, but we will *upsample*
-  it to 500 / 1000 / 2000 Hz to test out-of-pretrain rates) + an actual
-  high-rate dataset (THINGS-EEG2 at 1000 Hz native, used for image-class
-  retrieval) for the 1000 Hz native check.
+- Eval downstream task: HBN 6-task classification (originally 500 Hz, but
+  we will *resample* it to 100 / 250 / 500 / 1000 / 2000 Hz to test
+  out-of-pretrain rates) + THINGS-EEG2 at 1000 Hz native (for the high-γ
+  content check via image-class retrieval). When TUH access lands, also
+  add TUEV at 250 Hz native + upsampled to higher rates as a
+  literature-comparable secondary.
 
-The 2000 Hz held-out test rate is constructed by upsampling TUEV via
+The 2000 Hz held-out test rate is constructed by upsampling HBN via
 `scipy.signal.resample_poly` to 2000 Hz; this is information-preserving
 (all frequency content stays the same; just more samples per second). The
 question is whether M1 / M2 / M3 process the upsampled signal as well as
@@ -101,12 +115,12 @@ the native one.
 
 Two metrics matter:
 
-1. **In-pretraining-rate performance**: TUEV BAC at 250 Hz. Each variant
-   must be within 1 pp of the best. A variant that wins on multi-rate but
-   tanks at the standard rate isn't useful.
-2. **Out-of-pretraining-rate performance**: TUEV BAC at 2000 Hz (the
+1. **In-pretraining-rate performance**: HBN 6-task BAC at 500 Hz native.
+   Each variant must be within 1 pp of the best. A variant that wins on
+   multi-rate but tanks at the standard rate isn't useful.
+2. **Out-of-pretraining-rate performance**: HBN 6-task BAC at 2000 Hz (the
    held-out rate). The strict win condition: a variant maintains ≥ 95 %
-   of its 250 Hz performance at 2000 Hz, while M0 (the resample baseline)
+   of its 500 Hz performance at 2000 Hz, while M0 (the resample baseline)
    does too because it just resamples down — so the comparison must
    *also* include the high-γ-relevant evaluation (THINGS-EEG2 at 1000 Hz
    native, which has actual content above 125 Hz).
@@ -122,10 +136,10 @@ upsampled from 250 Hz shouldn't differ for a well-behaved encoder.
 
 ## Pre-registered predictions
 
-| Variant | TUEV @ 250 Hz | TUEV @ 2000 Hz | THINGS-EEG2 @ 1000 Hz top-1 retrieval |
-| ------- | ------------- | -------------- | ------------------------------------------ |
+| Variant | HBN 6-task @ 500 Hz | HBN 6-task @ 2000 Hz (held-out) | THINGS-EEG2 @ 1000 Hz top-1 retrieval |
+| ------- | ------------------- | --------------------------------- | ------------------------------------------ |
 | M0 resample | baseline | identical to 250 (resampled) | floor — high-γ content discarded |
-| M1 Mamba-Δ | tied or weak loss vs M0 | ≥ 95 % of 250 Hz; passes | weak win over M0 |
+| M1 Mamba-Δ | tied or weak loss vs M0 | ≥ 95 % of 500 Hz; passes | weak win over M0 |
 | M2 branches | tied | passes | strict win over M0 |
 | M3 SincNet+scattering | tied | passes; potentially the best because both layers are explicitly rate-agnostic | strict win over M0 |
 

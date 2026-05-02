@@ -65,8 +65,8 @@ The experiment runs in two phases.
 | W2 | W0 + BlurPool before every stride in the conv frontend | replace `Conv1d(stride=s)` with `Conv1d(stride=1) → BlurPool(stride=s)` |
 | W3 | W0 + VICReg auxiliary loss with weight 0.1 | sample two augmented views per batch, compute VICReg on encoder pooled output, add to total loss |
 
-Each isolated change must strict-win individually (ε ≥ 0.5 pp TUEV BAC
-with non-overlapping CIs) to be considered for stacking.
+Each isolated change must strict-win individually (ε ≥ 0.5 pp HBN 6-task
+BAC with non-overlapping CIs) to be considered for stacking.
 
 ### Phase B — stacked combination (only includes the Phase A winners)
 
@@ -124,8 +124,8 @@ run uses W0 (the simpler config). If W4 wins, the headline run uses W4.
 
 Same as prior experiments:
 
-- Strict win = ≥ 0.5 pp TUEV BAC for individual quick wins (lower bar
-  because these are supposed to be small effects), ≥ 1 pp for the W4
+- Strict win = ≥ 0.5 pp HBN 6-task BAC for individual quick wins (lower
+  bar because these are supposed to be small effects), ≥ 1 pp for the W4
   stacked combination.
 - Weak win = ≥ 0.25 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 0.5 pp.
@@ -135,11 +135,11 @@ Same as prior experiments:
 Anti-shortcut criterion: VICReg auxiliary is specifically expected to
 *decrease* the source-dataset probe accuracy. Log this; if the source
 probe accuracy goes *up* under W3, the auxiliary loss is being
-counterproductive and W3 is disqualified regardless of TUEV gains.
+counterproductive and W3 is disqualified regardless of HBN 6-task gains.
 
 ## Pre-registered predictions
 
-| Variant | Prediction TUEV BAC | Source-probe trajectory |
+| Variant | Prediction HBN 6-task BAC | Source-probe trajectory |
 | ------- | ------------------- | ------------------------ |
 | W0 baseline | reference | already trending down per exp02–exp11 monitoring |
 | W1 + Snake | weak win, ~+0.3 pp | unchanged |

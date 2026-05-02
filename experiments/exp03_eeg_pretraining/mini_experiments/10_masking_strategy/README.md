@@ -99,7 +99,7 @@ amplitude-aware semantics.
 
 Same as prior experiments:
 
-- Strict win = ≥ 1 pp TUEV BAC, non-overlapping CIs, noise-twin flat.
+- Strict win = ≥ 1 pp HBN 6-task BAC (per §4.3 Protocol A.2), non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 0.5 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 0.5 pp.
 
@@ -114,7 +114,7 @@ One masking-specific criterion:
 
 ## Pre-registered predictions
 
-| Variant | Prediction TUEV BAC |
+| Variant | Prediction HBN 6-task BAC |
 | ------- | ------------------- |
 | K0 random | reference |
 | K1 block | tied; block forces some non-trivial prediction but mask is too coarse |
@@ -123,7 +123,8 @@ One masking-specific criterion:
 | K4 AAMP | strict win, ~+1 pp; amplitude-awareness directly attacks the dominant pathology |
 
 The honest expected outcome: **K4 AAMP wins on a low-SNR-sensitive eval
-(TUAR), K3 multi-block wins on the standard TUEV BAC**. They might also
+(HBN-Artifact-Synth from exp09, or TUAR when TUH access lands), K3
+multi-block wins on the standard HBN 6-task BAC**. They might also
 combine cleanly: AAMP-style amplitude scoring within the multi-block
 selection. We allow one post-hoc combined cell K5 = AAMP-restricted
 multi-block to be added if K3 and K4 both strict-win independently.
@@ -159,7 +160,7 @@ multi-block to be added if K3 and K4 both strict-win independently.
 | K4 AAMP changes the effective mask ratio per batch (because high-amplitude patches cluster in some recordings) | Add a normalisation step: after selecting amplitude-targeted patches, randomly subsample to exactly the target mask fraction. |
 | K3 multi-block's higher mask ratio (60 %) gives a different effective training signal that's hard to compare iso-anything | This is the I-JEPA paper's choice; we keep 60 % to match. The decision rule already accounts for this by comparing on downstream metrics, not on loss. |
 | K2 SSP preserves the wrong subsequences (e.g. picks the high-amplitude artifact regions to preserve) | Add an amplitude prior to the SSP starting-point selection — bias starting points toward moderate-amplitude regions. (This is essentially "AAMP-aware SSP", an organic post-hoc combination.) |
-| All masking strategies tie because the dataset is too small | Re-run with the full TUEG (~5 % of full corpus) instead of 100h. |
+| All masking strategies tie because the dataset is too small | Re-run with 300h of HBN-EEG instead of 100h (still well within the ~3000h available; preprocessing already cached in S3). |
 
 ## What gets carried forward
 

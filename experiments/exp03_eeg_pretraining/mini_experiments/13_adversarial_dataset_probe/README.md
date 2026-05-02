@@ -83,7 +83,7 @@ recipe carries forward both heads.
 
 The matched-noise twin here is informative as a sanity check rather than a
 win/loss criterion: a model trained with an adversary on Gaussian noise
-should not improve its TUEV / TUAB metrics (there is no signal to learn).
+should not improve its HBN 6-task / HBN ADHD-binary metrics (there is no signal to learn).
 If it does, the adversarial head is somehow stabilising the optimisation
 rather than enforcing invariance.
 
@@ -111,10 +111,10 @@ the loss weight $\lambda_\text{adv}$.
 
 ## Decision rule
 
-**Output A — chosen adversarial configuration** (TUEV BAC, the standard
-metric):
+**Output A — chosen adversarial configuration** (HBN 6-task BAC, the
+standard metric per §4.3 Protocol A.2):
 
-- Strict win = ≥ 0.5 pp TUEV BAC over A0, non-overlapping CIs,
+- Strict win = ≥ 0.5 pp HBN 6-task BAC over A0, non-overlapping CIs,
   noise-twin flat. (Lower bar than other experiments because the
   adversary's primary purpose is invariance, not representation quality.)
 - Tie = TOST equivalence within $\varepsilon = 0.5$ pp.
@@ -128,7 +128,7 @@ report end-of-training source-dataset linear-probe accuracy:
 - Soft pass: 50–70 %.
 - Fail: > 70 %.
 
-A variant must (i) not lose on TUEV BAC *and* (ii) reach at least the soft
+A variant must (i) not lose on HBN 6-task BAC *and* (ii) reach at least the soft
 pass on invariance. If no variant passes both, the recipe ships without
 the adversary and §11 H6 is downgraded from "prediction" to "open
 question".
@@ -139,7 +139,7 @@ to count as subject-invariance achieved.
 
 ## Pre-registered predictions
 
-| Variant | Predicted TUEV BAC | Predicted dataset-probe acc | Subject-probe acc |
+| Variant | Predicted HBN 6-task BAC | Predicted site-probe acc | Subject-probe acc |
 | ------- | ------------------ | ---------------------------- | ------------------ |
 | A0 baseline | reference | 70–85 % (the H6 worry) | 60–80 % |
 | A1 linear $\lambda=0.05$ | tied | 55–70 % | 55–70 % |
@@ -147,9 +147,10 @@ to count as subject-invariance achieved.
 | A3 MLP $\lambda=0.10$ | tied | 35–55 % (probably passes) | 50–65 % |
 | A4 dataset+subject MLPs | tied or weak loss | 35–50 % | 30–45 % (best on subject) |
 
-The honest expected outcome: **A3 wins on the dataset-probe target and
-ties TUEV; A4 additionally suppresses subject identity at the cost of a
-small TUEV regression**. The decision then depends on whether the
+The honest expected outcome: **A3 wins on the site-probe target and
+ties HBN 6-task; A4 additionally suppresses subject identity at the cost
+of a small HBN 6-task regression**. The decision then depends on whether
+the
 deployment scenario emphasises clinical multi-rig generalisation
 (A3 / A4) or peak within-rig accuracy (A0).
 
@@ -171,10 +172,12 @@ deployment scenario emphasises clinical multi-rig generalisation
 - Adversarial heads: standard `nn.Linear` (A1, A2) or `nn.Sequential(Linear, GeLU, Linear)`
   (A3, A4) over the encoder's mean-pooled output. Loss is plain
   cross-entropy over the dataset/subject labels.
-- Source-dataset metadata: the iid-channel pretraining corpus is built
-  from `K=4` named datasets (TUEG, Sleep-EDF, ZuCo, THINGS-EEG2 in the
-  default mix); each `(channel, recording, window)` example carries a
-  scalar dataset ID. Subject ID is similarly available.
+- Source-dataset metadata: the iid-channel pretraining corpus is HBN-EEG
+  collected at `K=4` Child Mind Institute sites (RU, CBIC, CUNY, SI); each
+  `(channel, recording, window)` example carries a scalar site ID. Subject
+  ID is similarly available. (When the broader multi-corpus mix lands —
+  HBN + Sleep-EDF + THINGS-EEG2 + TUEG — the site label is replaced by a
+  joint site×corpus label.)
 - Reference DANN training loop: standard, see
   [`fungtion/DANN`](https://github.com/fungtion/DANN) or the
   `domainbed` benchmark.
@@ -186,7 +189,7 @@ deployment scenario emphasises clinical multi-rig generalisation
 
 `mini_experiments/13_adversarial_dataset_probe/results.md` containing:
 
-1. 5 × 2 (× 3 seed) results table with TUEV BAC, TUAB AUROC, k-NN, source-probe acc.
+1. 5 × 2 (× 3 seed) results table with HBN 6-task BAC, HBN ADHD-binary AUROC, k-NN, site-probe acc, subject-probe acc (and TUAB/TUEV when TUH access lands).
 2. Source-dataset probe trajectory per variant (must trend down for the
    adversarial variants; A0 is the control).
 3. Subject-ID probe results for A4.
@@ -202,7 +205,7 @@ deployment scenario emphasises clinical multi-rig generalisation
 | ---- | ---------- |
 | The adversary destabilises training (loss spikes during GRL ramp-up) | Smooth the ramp from 0 → 1 over the first 10 % of steps; reduce $\lambda_\text{adv}$ if instability persists. |
 | The dataset labels are too coarse (4 datasets, easy to predict from rate alone) | Add a finer-grained label: subject ID *within* dataset (≥ 50 unique IDs in the mix). This is what A4 does. |
-| The adversary suppresses real signal that happens to differ across datasets (e.g. age-related $\alpha$ peak shifts) | Compare variant A0 and the best A* on a *single-dataset* held-out subset (TUEG only) — if A* loses there, the adversary is destroying signal, not just nuisance. |
+| The adversary suppresses real signal that happens to differ across sites (e.g. age-related $\alpha$ peak shifts that correlate with site demographics) | Compare variant A0 and the best A* on a *single-site* held-out subset (HBN/RU only) — if A* loses there, the adversary is destroying signal, not just nuisance. |
 | The MLP head is too strong and the encoder cannot recover | Cap the head capacity; A3's MLP is intentionally small (hidden $D/2$). |
 | Source-probe accuracy of A0 is already < 50 % (no problem to solve) | Then no variant can strict-win on Output B. The conclusion is *adversary is unnecessary* — record this and ship A0. |
 

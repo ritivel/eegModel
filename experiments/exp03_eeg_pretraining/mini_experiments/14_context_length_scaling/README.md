@@ -21,9 +21,10 @@ into better representations on downstream tasks, or is the optimal pretraining
 window the standard 4-second window after all?
 
 Concretely: at fixed total tokens, does pretraining at 4 s / 8 s / 16 s /
-30 s windows on TUEG produce different downstream behaviour, and does the
-expected scaling pattern of EEGM2 ([Hong et al. 2025](https://arxiv.org/abs/2502.17873))
-— performance peaks at ~ 30 s before plateauing — replicate under our
+30 s windows on HBN-EEG produce different downstream behaviour, and does
+the expected scaling pattern of EEGM2 ([Hong et al. 2025](https://arxiv.org/abs/2502.17873))
+— performance peaks at ~ 30 s before plateauing on TUAB — replicate under
+our
 recipe?
 
 ## Why it matters
@@ -31,8 +32,10 @@ recipe?
 Three claims in the cortico-ssl-hypothesis depend critically on long-context
 capability:
 
-1. *H1 / H3.* The headline-run bar is TUAB AUROC ≥ 0.89 and rate
-   invariance up to 2 kHz; at 2 kHz a 30-second window is **60 000
+1. *H1 / H3.* The headline-run bar is HBN ADHD-binary AUROC ≥ 0.85
+   (plus TUAB AUROC ≥ 0.89 as the literature-comparable secondary when
+   TUH access lands) and rate invariance up to 2 kHz; at 2 kHz a 30-second
+   window is **60 000
    samples**. A Transformer with FlashAttention-2 is intractable at this
    scale on H100 (memory grows quadratically in sequence length). The
    entire argument for picking Mamba-2 over a Transformer rests on the
@@ -49,7 +52,9 @@ capability:
    forces the model to either re-aggregate at fine-tune time or to give
    up on sleep-staging benchmarks. EEGM2's 30-second peak on TUAB
    ([Hong et al. 2025](https://arxiv.org/abs/2502.17873)) is consistent
-   with both arguments.
+   with both arguments. (We will replicate this finding primarily on
+   HBN ADHD-binary, with TUAB as a literature-comparable secondary when
+   TUH access lands.)
 
 The claim is plausible on theory grounds but **never directly tested in our
 recipe**. exp02–exp13 all use the standard 4-second window. exp14 settles
@@ -100,7 +105,7 @@ positional correlations in the noise, not EEG content.
 
 ## Held constant
 
-- Pretraining data: 100 h TUEG subset, single rate 250 Hz (mixed-rate is
+- Pretraining data: 100 h HBN-EEG subset (per [`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus)), single rate 250 Hz (mixed-rate is
   exp05's question — a clean scaling sweep needs one rate held constant).
 - Frontend: exp02 winner.
 - SSL framework: exp04 winner.
@@ -121,10 +126,12 @@ positional correlations in the noise, not EEG content.
 
 Two metrics matter:
 
-1. **Downstream representation quality**: TUEV BAC + TUAB AUROC at the
-   *standard 4-second eval window* (so the eval suite is identical across
-   variants — only pretraining window varies).
-   - Strict win = ≥ 1 pp TUEV BAC over C0, non-overlapping CIs,
+1. **Downstream representation quality**: HBN 6-task BAC + HBN
+   ADHD-binary AUROC (primary; per §4.3) at the *standard 4-second eval
+   window* (so the eval suite is identical across variants — only
+   pretraining window varies). When TUH access lands, also report TUEV
+   BAC + TUAB AUROC as the literature-comparable secondary.
+   - Strict win = ≥ 1 pp HBN 6-task BAC over C0, non-overlapping CIs,
      noise-twin flat.
    - Weak win = ≥ 0.5 pp with paired permutation $p < 0.05$.
 2. **Long-context-only metric**: sleep-stage classification on
@@ -148,7 +155,7 @@ Two scaling-specific criteria:
 
 ## Pre-registered predictions
 
-| Variant | Backbone | Predicted TUEV BAC | Predicted Sleep-EDF acc | Throughput |
+| Variant | Backbone | Predicted HBN 6-task BAC | Predicted Sleep-EDF acc | Throughput |
 | ------- | -------- | ------------------ | ------------------------ | ---------- |
 | C0 4 s | Mamba-2 | reference | floor on Sleep-EDF | reference |
 | C0 4 s | Transformer | tied | floor | reference |
@@ -191,7 +198,7 @@ windows, C0 / C1 may be sufficient.
 
 `mini_experiments/14_context_length_scaling/results.md` containing:
 
-1. 4 × 2 × 3-seed results table on TUEV BAC, TUAB AUROC.
+1. 4 × 2 × 3-seed results table on HBN 6-task BAC, HBN ADHD-binary AUROC (and TUEV BAC, TUAB AUROC when TUH access lands).
 2. Same on Sleep-EDF accuracy + macro-F1.
 3. Throughput table (samples/s/H100) per cell — annotated with the
    "feasibility cliff" line for the Transformer.
@@ -210,10 +217,10 @@ windows, C0 / C1 may be sufficient.
 | ---- | ---------- |
 | Mamba-2 segsum NaN at 60 k samples destroys the C3 cell | Use the official Triton kernel; verify on 100-step toy run before launching the full sweep; fallback to chunked-state mode if needed. |
 | 30-second pretraining is too slow to complete in 24 H100-hours | Run C3 at iso-step instead of iso-token; report the result with the caveat. |
-| Sleep-EDF eval doesn't differentiate variants because TUEG-pretrained encoders need substantial fine-tuning to transfer to sleep | Add the TUSL (TUH Sleep Laboratory) eval — closer to TUEG's distribution. |
+| Sleep-EDF eval doesn't differentiate variants because HBN-pretrained encoders need substantial fine-tuning to transfer to sleep | Add the HBN resting-state-eyes-closed task (well-defined sleep-adjacent state) for closer-to-pretrain transfer; add TUSL when TUH access lands. |
 | Iso-token comparison is unfair to short windows because batch-size effects on convergence are nonlinear | Run a follow-up with iso-step matching; report both. |
 | The 100 h corpus is too small to differentiate long-context cells (each window appears once) | Repeat with the 500 h subset; expected to widen the gap because longer windows benefit more from data scale. |
-| All cells tie because the standard eval suite (TUEV / TUAB) is dominated by short-range features | Add the [HBN-EEG ChallengeC1 cross-task](https://hbn-challenge-2025.github.io/) RT decoding, which involves ~10 s prestimulus context. |
+| All cells tie because the standard eval suite (HBN 6-task / HBN ADHD-binary) is dominated by short-range features | Add the [HBN-EEG ChallengeC1 cross-task](https://hbn-challenge-2025.github.io/) RT decoding, which involves ~10 s prestimulus context. |
 
 ## What gets carried forward
 

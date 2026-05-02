@@ -87,7 +87,7 @@ correlations, not EEG content.
 
 ## Held constant
 
-- Pretraining data: 100h TUEG subset, single rate 250 Hz.
+- Pretraining data: 100h HBN-EEG subset (per [`mini_experiments.md` §4.1](../../mini_experiments.md#41-pretraining-corpus)), single rate 250 Hz.
 - Frontend: F0 vanilla strided conv (the §4.2 default; if exp02 has settled
   before exp03 launches, swap in the exp02 winner).
 - Bottleneck: continuous.
@@ -108,7 +108,7 @@ correlations, not EEG content.
 
 Same as exp02:
 
-- Strict win = ≥ 2 pp TUEV BAC, non-overlapping CIs, noise-twin flat.
+- Strict win = ≥ 2 pp HBN 6-task BAC (per §4.3 Protocol A.2), non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 1 pp with paired permutation p < 0.05.
 - Tie = TOST within ε = 1 pp.
 - Loss = ≥ 1 pp below baseline with p < 0.05.
@@ -129,10 +129,10 @@ Two additional backbone-specific criteria:
 
 | Variant | Prediction | Reasoning |
 | ------- | ---------- | --------- |
-| B0 Transformer | Best on TUEV BAC at 1k-sample windows; fails the long-sequence sanity at 60k | Standard Transformer is competitive at short seq; quadratic cost kills it long. |
-| B1 Mamba-2 | Strict win on long-sequence sanity; tied or weak win on TUEV BAC at 1k | EEGM2 result (better at long seq); selectivity helps low-SNR. |
-| B2 LRU | Best on phase-locking-value eval (the structural advantage); weak loss on TUEV BAC | Phase tracking comes at the cost of no input selectivity for noise gating. |
-| B3 Hybrid | Marginal weak win over B1 on TUEV BAC; same long-sequence performance as B1 | Local attention adds short-range precision; cost is implementation complexity. |
+| B0 Transformer | Best on HBN 6-task BAC at 1k-sample windows; fails the long-sequence sanity at 60k | Standard Transformer is competitive at short seq; quadratic cost kills it long. |
+| B1 Mamba-2 | Strict win on long-sequence sanity; tied or weak win on HBN 6-task BAC at 1k | EEGM2 result (better at long seq); selectivity helps low-SNR. |
+| B2 LRU | Best on phase-locking-value eval (the structural advantage); weak loss on HBN 6-task BAC | Phase tracking comes at the cost of no input selectivity for noise gating. |
+| B3 Hybrid | Marginal weak win over B1 on HBN 6-task BAC; same long-sequence performance as B1 | Local attention adds short-range precision; cost is implementation complexity. |
 
 The honest expected outcome: **B1 Mamba-2 wins**, with B2 LRU being
 explicitly preserved as an alternative if exp07 (phase handling) reveals
@@ -179,7 +179,7 @@ that explicit phase loss can't compensate for B1's real-valued state.
 | LRU parallel scan has buggy backward pass for complex tensors | Compare gradient against finite-difference on a small example; if buggy, fall back to S5 (which has matured implementations). |
 | Transformer wins at 1k-sample windows but cannot scale to 60k — do we still credit the win? | No. The headline run uses 30-second windows at 2 kHz. A backbone that wins only at toy scale loses outright. |
 | Hybrid B3 is too compute-expensive to fit in budget | Drop to 7:1 Mamba:attention ratio per Jamba; this is the last variant to run, so cost overrun affects nothing else. |
-| All variants tie on TUEV BAC (the test is too easy) | Switch the headline metric to TUEV WF1 or to the Sleep-EDF macro-F1, which is harder. |
+| All variants tie on HBN 6-task BAC (the test is too easy) | Switch the headline metric to HBN 6-task WF1 or to the Sleep-EDF macro-F1, which is harder. (Or, if TUH access lands, fall back to TUEV BAC for a richer multi-class signal.) |
 
 ## What gets carried forward
 

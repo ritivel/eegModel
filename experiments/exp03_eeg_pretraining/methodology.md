@@ -156,8 +156,10 @@ For **SSL pretraining specifically**, the canonical sanity tests are:
    broken — and you'd never figure that out in a 100k-step run with 60k
    hours of EEG.
 4. **Linear probe on a frozen randomly-initialised encoder.** Run your
-  downstream eval (e.g. TUEV event classification, motor imagery, sleep
-   staging) with a frozen random encoder. This is your **ablation floor**
+  downstream eval (in our case the HBN 6-task classification + HBN
+   ADHD-vs-no-diagnosis binary; in the broader EEG-FM literature this is
+   typically TUEV event classification + TUAB binary normal/abnormal) with
+   a frozen random encoder. This is your **ablation floor**
    — anything below it is broken; anything within ~1% of it is also
    broken (see
    [EEG-FM-Bench finding (1)](https://arxiv.org/html/2508.17742v1)
@@ -241,8 +243,9 @@ include:
 
 | Task                                                                                                                                                   | Why                                                                                   | Prior precedent                                                                                                              |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| **Linear probe on TUEV** (event classification, 6 classes)                                                                                             | Standard SSL probe; well-understood baseline                                          | LaBraM, BIOT, EEGPT all report it                                                                                            |
-| **Linear probe on TUAB** (binary normal/abnormal)                                                                                                      | Cheap, monotone, good early signal                                                    | LaBraM, BIOT, EEGPT all report it                                                                                            |
+| **Linear probe on HBN 6-task classification** (which of the 6 cognitive tasks the subject is performing — primary)                                     | 6-class symmetry with TUEV's role; uses HBN's natural task labels                     | NeurIPS 2025 EEG Foundation Challenge winners (e.g. ST-EEGFormer); in TUH-using literature this slot is TUEV                 |
+| **Linear probe on HBN ADHD-vs-no-diagnosis binary** (primary)                                                                                          | Cheap, monotone, good early signal; ~40 % positive (well-balanced)                    | Same role as TUAB binary normal/abnormal in the LaBraM / BIOT / EEGPT eval recipe                                            |
+| **Linear probe on TUAB + TUEV** (secondary, when TUH NEDC access lands)                                                                                | Direct apples-to-apples vs LaBraM / BIOT / EEGPT / CBraMod / REVE                     | The canonical EEG-FM literature benchmark; reported alongside HBN but not used for the §4.4 winner-picker                    |
 | **k-NN classification** on a small labelled set                                                                                                        | Architecture-independent representation quality                                       | ([Wightman et al. notes;](https://lilianweng.github.io/posts/2019-11-10-self-supervised/) DINO uses this)                    |
 | **Embedding rank / silhouette** (label-free)                                                                                                           | Detects collapse without needing labels                                               | [Lourenço & Storkey 2024 (label-free SSL monitoring)](https://arxiv.org/html/2409.06612v1)                                   |
 | **The downstream task you actually care about** (in our case, EEG-to-text §4.3 noise gap from exp01/exp02) — at *least* one fine-tune run per ablation | Reality check on whether your representation is doing anything useful for *your* task | Best reference: [Brain4FMs (arXiv 2602.11558)](https://arxiv.org/pdf/2602.11558) — they fine-tune all 15 BFMs on 18 datasets |
@@ -466,7 +469,11 @@ dimensional collapse
 ### 6.2 Linear probe trajectory on tiny labelled set
 
 Run a *nightly* (or every-5%-of-steps) frozen-encoder linear probe on
-TUEV (small labelled subset, ~10k samples). Expected shape:
+the HBN 6-task classification (small labelled subset, ~10k samples; same
+labels we use in §4.3 Protocol A.2). When TUH access lands, also run the
+TUEV probe in parallel — both should track the same trajectory shape if
+the representation is universal across the pediatric → adult clinical
+distribution shift. Expected shape:
 
 - Probe accuracy should rise monotonically until ~50% of pretraining
 steps, then plateau or slightly decrease (this is the "critical
@@ -665,9 +672,11 @@ suggest; (b) augmentations can hurt
 reconstruction](https://arxiv.org/html/2403.03222v1) Knowledge-guided
 EEG paper); (c) latent-space objectives (EEGPT, MTDP) generally
 outperform pixel/raw-signal objectives.
-- **Heterogeneous label semantics**: TUAB binary "abnormal" is a much
-weaker signal than per-event labels (TUEV). Running both as ablation
-evals is cheap insurance.
+- **Heterogeneous label semantics**: a binary clinical label (HBN
+ADHD-vs-no-diagnosis, or TUAB normal/abnormal) is a much weaker signal
+than a per-class label (HBN 6-task classification, or TUEV per-event
+labels). Running both a binary AUROC and a multi-class BAC/WF1 probe as
+the ablation eval suite is cheap insurance.
 
 ### 8.3 Assessment of "treat each EEG channel as a different signal /
 

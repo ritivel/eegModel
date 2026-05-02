@@ -114,7 +114,7 @@ This is the UNITE paper's structural pattern for joint training.
 
 Same as prior experiments:
 
-- Strict win = ≥ 1 pp TUEV BAC, non-overlapping CIs, noise-twin flat.
+- Strict win = ≥ 1 pp HBN 6-task BAC (per §4.3 Protocol A.2), non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 0.5 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 1 pp.
 
@@ -124,16 +124,17 @@ Two FSQ-specific criteria:
   steps. FSQ guarantees 100 % structural utilization, but if the encoder
   collapses to a small region of FSQ-space, effective utilization can
   still be low. Should reach > 80 % of codes used by end of training.
-- **Cross-subject transfer test**: in addition to TUEV BAC on the standard
-  split, run TUEV with leave-one-subject-out on a 5-subject subset.
-  Discrete bottlenecks are theoretically expected to help cross-subject
-  transfer (they enforce subject-invariant compression). If FSQ doesn't
+- **Cross-subject transfer test**: in addition to HBN 6-task BAC on the
+  standard split, run HBN 6-task with leave-one-subject-out on a 5-subject
+  subset. Discrete bottlenecks are theoretically expected to help cross-
+  subject transfer (they enforce subject-invariant compression). If FSQ
+  doesn't
   help cross-subject transfer, the entire discrete-bottleneck argument
   loses force.
 
 ## Pre-registered predictions
 
-| Variant | TUEV BAC (within-split) | TUEV LOSO | Codebook utilization |
+| Variant | HBN 6-task BAC (within-split) | HBN 6-task LOSO | Codebook utilization |
 | ------- | ------------------------ | ---------- | --------------------- |
 | Q0 continuous | reference | reference | n/a |
 | Q1 FSQ 15K | tied or weak loss vs Q0 (~-0.5 pp); weak win on LOSO (~+0.5 pp) | ~85 % | |
@@ -177,8 +178,8 @@ within-split number.
 
 `mini_experiments/11_bottleneck_continuous_vs_fsq/results.md` containing:
 
-1. 3 × 2 (× 3 seed) results table on TUEV within-split.
-2. Same on TUEV LOSO 5-subject.
+1. 3 × 2 (× 3 seed) results table on HBN 6-task within-split.
+2. Same on HBN 6-task LOSO 5-subject.
 3. Codebook utilization trajectory per FSQ variant.
 4. Reconstruction loss trajectory per variant (does FSQ slow down the
    reconstruction objective?).

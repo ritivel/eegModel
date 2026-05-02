@@ -116,8 +116,8 @@ any handle on Gaussian noise.
 
 Same as exp02 / exp03 / exp04 / exp06 / exp07:
 
-- Strict win = ≥ 2 pp TUEV BAC over T0 raw, non-overlapping CIs,
-  noise-twin flat.
+- Strict win = ≥ 2 pp HBN 6-task BAC over T0 raw (per §4.3 Protocol A.2),
+  non-overlapping CIs, noise-twin flat.
 - Weak win = ≥ 1 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 1 pp.
 
@@ -140,10 +140,10 @@ Two target-specific criteria:
 | ------- | ---------- |
 | T0 raw target | floor — the failure case from exp04 S0 |
 | T1 bandpass 0.5–40 | weak win, ~+1 pp; cheap, but high-γ content discarded |
-| T2 ICA + ICLabel | strict win, ~+2–3 pp on TUEV BAC; substantial preprocessing cost upfront |
+| T2 ICA + ICLabel | strict win, ~+2–3 pp on HBN 6-task BAC; substantial preprocessing cost upfront |
 | T3 PCA top-8 | weak win, ~+0.5–1 pp; the cheapest single-channel-friendly method |
 | T4 wavelet denoising | weak win, ~+1 pp; comparable to bandpass |
-| T5 IC-U-Net cleaning | strict win, ~+2–4 pp on TUEV BAC; but adds external dependency on a pretrained model (which the user said no two-stage — so this is a soft violation) |
+| T5 IC-U-Net cleaning | strict win, ~+2–4 pp on HBN 6-task BAC; but adds external dependency on a pretrained model (which the user said no two-stage — so this is a soft violation) |
 
 The honest expected outcome: **T2 ICA cleaning wins on absolute metric, T1
 bandpass wins on practicality** (no per-recording configuration, no
