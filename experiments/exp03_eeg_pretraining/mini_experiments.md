@@ -318,12 +318,38 @@ of the mean-pooled encoder output. This is the canonical "linear probe"
 of the image-SSL literature and is what we report as the headline
 metric for every comparison.
 
-1. **Linear probe on HBN ADHD-vs-no-diagnosis binary** (primary). Frozen
-   encoder, single-layer linear head, train on HBN train split (subject-
-   disjoint LNSO), evaluate on HBN held-out subjects. Metric: AUROC.
-   ADHD is the most common HBN clinical label and is well-balanced
-   (~40 % positive); the binary task replaces TUAB's normal-vs-abnormal
-   role in the eval suite.
+1. **Linear probe regression on HBN continuous CBCL factors** (primary).
+   Frozen encoder, single-layer linear head (one output per factor),
+   train on HBN train split (subject-disjoint LNSO), evaluate on held-
+   out subjects. Three sub-metrics:
+
+   - **A.1a — externalizing-factor regression.** R² + MAE on the CBCL
+     "externalizing" Pearson-z column from HBN's participants.tsv.
+     **Matches the [NeurIPS 2025 EEG Foundation Challenge C2](https://eeg2025.github.io/)
+     task directly** — reporting on this enables apples-to-apples
+     comparison with ST-EEGFormer (challenge winner, 0.88668) and other
+     competition entries. This is the most-tested HBN-derived eval slot
+     in the 2026 EEG-FM literature.
+   - **A.1b — attention-factor regression.** R² + MAE on the CBCL
+     "attention" Pearson-z (the closest continuous analogue of "ADHD
+     severity"; also the closest analogue of TUAB's normal/abnormal
+     binary in spirit).
+   - **A.1c — attention-binary AUROC** (secondary, for AUROC continuity
+     with the original binary-clinical-label slot pattern). Threshold
+     the attention factor at z > +0.5σ → ~28% positive rate (similar
+     class balance to TUAB normal/abnormal). AUROC.
+
+   Why regression replaces the originally-spec'd "ADHD-binary AUROC":
+   verification against R1's actual `participants.tsv` (2026-05-02,
+   136 subjects, 24 columns) revealed HBN ships **no DSM-V Dx columns**
+   at all — the literal strings "ADHD" / "attention deficit" do not
+   appear in any column. What HBN ships instead are the four
+   Pearson-z CBCL continuous factors (`p_factor`, `attention`,
+   `internalizing`, `externalizing`), which are (i) more informative
+   than a binary diagnosis label, (ii) directly comparable to the
+   NeurIPS 2025 EEG-FM challenge benchmark, and (iii) trivially
+   convertible to a binary AUROC at an arbitrary threshold for the
+   subset of analyses that prefer it.
 2. **Linear probe on HBN 6-task classification** (primary) — which of the
    six cognitive tasks the subject is performing: resting state (eyes
    open + closed), sequence learning, symbol search, surround suppression,

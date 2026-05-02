@@ -61,13 +61,20 @@ from typing import Iterable
 
 # HBN's six cognitive tasks → label index per `mini_experiments.md` §4.3
 # Protocol A.2 (HBN 6-task classification). Task names as they appear in BIDS
-# filenames are case-sensitive and have HBN-specific quirks: seqLearning8target
-# has a digit inside the name; surroundSupp + contrastChangeDetection ship
-# with multiple `_run-<N>` runs we collapse to one label; the "Video" category
-# splits across four distinct movie-clip task names.
+# filenames are case-sensitive and have HBN-specific quirks:
+#   - sequence learning ships in two variants per release (6-target and
+#     8-target); each subject typically has one or the other, never both.
+#     We collapse both to label 1 ("sequence learning").
+#   - surroundSupp + contrastChangeDetection ship with multiple `_run-<N>`
+#     runs per subject; the regex strips _run-N and we collapse all runs
+#     to one label (3, 4 respectively).
+#   - "Video" category splits across four distinct movie-clip task names
+#     (DespicableMe, DiaryOfAWimpyKid, FunwithFractals, ThePresent), all
+#     → label 5.
 TASK_LABEL: dict[str, int] = {
     "RestingState":             0,
-    "seqLearning8target":       1,
+    "seqLearning6target":       1,   # ~half of subjects have this variant
+    "seqLearning8target":       1,   # other half have this one
     "symbolSearch":             2,
     "surroundSupp":             3,
     "contrastChangeDetection":  4,
@@ -78,15 +85,15 @@ TASK_LABEL: dict[str, int] = {
     "ThePresent":               5,
 }
 
-# Reverse map: label → canonical task name (we pick a representative for
-# label 5 for display purposes).
+# Reverse map: label → canonical task name (we pick a representative
+# string for display purposes; the actual filenames vary).
 TASK_NAME_BY_LABEL: dict[int, str] = {
     0: "RestingState",
-    1: "seqLearning8target",
+    1: "seqLearning",      # 6target or 8target depending on subject
     2: "symbolSearch",
     3: "surroundSupp",
     4: "contrastChangeDetection",
-    5: "Video",
+    5: "Video",            # one of {DespicableMe, DiaryOfAWimpyKid, FunwithFractals, ThePresent}
 }
 
 # Filename-parse regex. BIDS filenames look like:
@@ -411,60 +418,97 @@ def load_recording(set_path: Path):
 # ---------------------------------------------------------------------------
 
 
-# Match any DSM-V diagnosis column that mentions ADHD / Attention-Deficit.
-# HBN uses several free-text labels: "ADHD-Combined Type", "ADHD-Inattentive
-# Type", "ADHD, Combined Presentation", etc. The regex is intentionally loose.
+# HBN's continuous CBCL Pearson-z factor columns — the actual eval-target
+# label set per `mini_experiments.md` §4.3 Protocol A.1. Verified against
+# release R1's participants.tsv (2026-05-02): all 4 columns present with
+# 132/136 non-NaN values; 4 missing rows are subjects where CBCL
+# scoring was not completed.
+CBCL_FACTOR_COLS: tuple[str, ...] = (
+    "p_factor",       # general psychopathology
+    "attention",      # ADHD-severity proxy (CBCL Attention factor)
+    "internalizing",  # anxiety / depression
+    "externalizing",  # conduct / aggression — NeurIPS 2025 EEG-FM Challenge C2 target
+)
+
+# Legacy ADHD-binary column. HBN releases verified 2026-05-02 ship NO DSM-V
+# Dx columns of any kind, so this regex never matches anything; kept as a
+# parquet-schema-compatibility sentinel that always evaluates to -1
+# ("missing"). If a future HBN release adds Dx columns, this regex will
+# light up automatically and `adhd` will start populating with 0/1.
 ADHD_DX_PATTERN = re.compile(r"\b(?:ADHD|attention[\s\-_]*deficit)\b", re.IGNORECASE)
 
 
 def load_participants(participants_tsv: Path):
-    """Read participants.tsv into a pandas DataFrame.
+    """Read participants.tsv → pandas DataFrame with HBN's actual eval-target
+    columns standardised.
 
-    Adds derived columns:
-        adhd:  1 if any Dx_* column matches ADHD_DX_PATTERN,
-               0 if none of them match and ≥1 is non-empty,
-              -1 (missing) if all Dx_* columns are empty/NaN.
-        site:  RU / CBIC / CUNY / SI if present in the row, else "" .
-        age:   float; NaN if missing.
-        sex:   "M" / "F" / "" .
+    HBN BIDS releases (verified R1, 2026-05-02) ship 24 columns including:
+      participant_id, release_number, sex, age, ehq_total, commercial_use,
+      full_pheno, p_factor, attention, internalizing, externalizing,
+      RestingState, DespicableMe, ..., contrastChangeDetection_1, ..., etc.
 
-    The column names HBN uses vary slightly across releases ("p_factor",
-    "EHQ_Total", etc.) — we keep all of them and only standardise the
-    columns we need for the §4.3 eval suite.
+    NO DSM-V Dx columns. The four CBCL Pearson-z factors (p_factor,
+    attention, internalizing, externalizing) are the canonical eval-target
+    columns for §4.3 Protocol A.1.
+
+    Returned DataFrame has the original columns plus standardised:
+        subject_id     string  (without "sub-" prefix)
+        site           string
+        age            float
+        sex            string  ("M" / "F" / "")
+        p_factor       float   (NaN if missing)
+        attention      float   (NaN if missing)
+        internalizing  float   (NaN if missing)
+        externalizing  float   (NaN if missing)
+        adhd           int8    (always -1 for current HBN; reserved for
+                                schema-compat with downstream code that
+                                expects the field — see ADHD_DX_PATTERN)
     """
     import pandas as pd
 
-    df = pd.read_csv(participants_tsv, sep="\t", dtype=str, keep_default_na=False, na_values=[""])
+    df = pd.read_csv(participants_tsv, sep="\t", dtype=str,
+                     keep_default_na=False, na_values=[""])
 
-    # Normalise the participant_id column → bare subject ID without "sub-"
+    # Subject ID (strip "sub-" prefix)
     if "participant_id" in df.columns:
         df["subject_id"] = df["participant_id"].str.replace(r"^sub-", "", regex=True)
     elif "subject_id" not in df.columns:
-        raise KeyError(f"participants.tsv missing participant_id / subject_id: cols={list(df.columns)}")
+        raise KeyError(
+            f"participants.tsv missing participant_id / subject_id: "
+            f"cols={list(df.columns)}"
+        )
 
-    # ADHD label
+    # Continuous CBCL factors (the actual eval targets per §4.3 Protocol A.1)
+    for col in CBCL_FACTOR_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = float("nan")
+
+    # Legacy ADHD-binary slot — scan any Dx_* / diagnosis_* columns if any
+    # appear in a future release. Current HBN has none, so this stays at -1.
     dx_cols = [c for c in df.columns if c.lower().startswith(("dx_", "diagnosis_"))]
     if dx_cols:
-        adhd = []
+        adhd_vals = []
         for _, row in df[dx_cols].iterrows():
             non_empty = [v for v in row.values if isinstance(v, str) and v.strip()]
             if not non_empty:
-                adhd.append(-1)
+                adhd_vals.append(-1)
             elif any(ADHD_DX_PATTERN.search(v) for v in non_empty):
-                adhd.append(1)
+                adhd_vals.append(1)
             else:
-                adhd.append(0)
-        df["adhd"] = adhd
+                adhd_vals.append(0)
+        df["adhd"] = adhd_vals
     else:
         df["adhd"] = -1
 
-    # Site (best-effort: HBN uses "site" or "Site" or per-release tags)
+    # Site (best-effort: HBN uses "site" or "Site" depending on release)
     site_col = next((c for c in df.columns if c.lower() == "site"), None)
     df["site"] = df[site_col].fillna("") if site_col else ""
 
     # Age + sex
     if "age" in df.columns:
-        df["age"] = df["age"].astype("float", errors="ignore")
+        df["age"] = pd.to_numeric(df["age"], errors="coerce")
     else:
         df["age"] = float("nan")
     if "sex" not in df.columns:
@@ -475,21 +519,55 @@ def load_participants(participants_tsv: Path):
 
 
 def metadata_for_subject(subject_id: str, participants_df) -> dict:
-    """Look up demographics + ADHD label for one subject.
+    """Look up demographics + CBCL factors for one subject.
 
-    Returns a dict with keys (adhd, site, age, sex) compatible with the
-    parquet base_metadata field. Missing values are filled with sentinels:
-        adhd = -1, site = "", age = NaN, sex = "".
+    Returns a dict with keys
+        site, age, sex,
+        p_factor, attention, internalizing, externalizing,
+        adhd
+    suitable as the parquet base_metadata. Missing values use sentinels:
+        site = "", age = NaN, sex = "",
+        p_factor / attention / internalizing / externalizing = NaN,
+        adhd = -1.
     """
+    import pandas as pd
+
+    missing = {
+        "site": "", "age": float("nan"), "sex": "",
+        "p_factor": float("nan"),
+        "attention": float("nan"),
+        "internalizing": float("nan"),
+        "externalizing": float("nan"),
+        "adhd": -1,
+    }
+    if participants_df is None:
+        return missing
     rows = participants_df[participants_df["subject_id"] == subject_id]
     if rows.empty:
-        return {"adhd": -1, "site": "", "age": float("nan"), "sex": ""}
+        return missing
     r = rows.iloc[0]
+
+    def _f(col: str) -> float:
+        v = r.get(col, float("nan"))
+        if isinstance(v, str):
+            try:
+                return float(v) if v.strip() else float("nan")
+            except ValueError:
+                return float("nan")
+        try:
+            return float(v) if pd.notna(v) else float("nan")
+        except (TypeError, ValueError):
+            return float("nan")
+
     return {
-        "adhd": int(r.get("adhd", -1)),
-        "site": str(r.get("site", "")),
-        "age": float(r.get("age", float("nan"))) if r.get("age", "") not in ("", None) else float("nan"),
-        "sex": str(r.get("sex", "")),
+        "site":          str(r.get("site", "")),
+        "age":           _f("age"),
+        "sex":           str(r.get("sex", "")),
+        "p_factor":      _f("p_factor"),
+        "attention":     _f("attention"),
+        "internalizing": _f("internalizing"),
+        "externalizing": _f("externalizing"),
+        "adhd":          int(r["adhd"]) if pd.notna(r.get("adhd")) else -1,
     }
 
 

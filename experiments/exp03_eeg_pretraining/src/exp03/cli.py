@@ -394,6 +394,11 @@ def preprocess_cmd(
                     "sample_rate_hz": int(sr_pp),
                     "age": float(meta_subject["age"]),
                     "sex": meta_subject["sex"],
+                    # CBCL Pearson-z factors per §4.3 Protocol A.1
+                    "p_factor": float(meta_subject["p_factor"]),
+                    "attention": float(meta_subject["attention"]),
+                    "internalizing": float(meta_subject["internalizing"]),
+                    "externalizing": float(meta_subject["externalizing"]),
                     "adhd": int(meta_subject["adhd"]),
                     "pipeline": pl,
                     "src_sha256_8": src_sha8,

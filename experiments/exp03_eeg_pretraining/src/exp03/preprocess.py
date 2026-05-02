@@ -28,12 +28,13 @@ Output schema (one row per (channel, 4-sec window) after iid expansion):
 
     subject_id      string         e.g. "NDARABCD1234"
     site            string         RU / CBIC / CUNY / SI (HBN site code)
-    recording_id    string         e.g. "task-RestingState_run-1"
-    task_label      int8           0..5  (RestingState=0 / SequenceLearning=1 /
-                                          SymbolSearch=2 / SurroundSuppression=3 /
-                                          ContrastChangeDetection=4 / Video=5)
-    channel_idx     int16          0..127 (HydroCel position; see hbn.HYDROCEL_128_NAMES)
-    channel_name    string         e.g. "E62"
+    recording_id    string         e.g. "task-RestingState"
+    task_label      int8           0..5  (RestingState=0 / seqLearning=1 /
+                                          symbolSearch=2 / surroundSupp=3 /
+                                          contrastChangeDetection=4 / Video=5)
+    channel_idx     int16          0..128 (HydroCel position; see hbn.HYDROCEL_128_NAMES;
+                                   index 128 = Cz reference, typically dropped downstream)
+    channel_name    string         e.g. "E62" or "Cz"
     window_idx      int32          0, 1, 2, ... per recording
     window_start_s  float32        offset within recording, in seconds
     sample_rate_hz  int16          500 for minimal, 250 for v2_clean
@@ -41,10 +42,35 @@ Output schema (one row per (channel, 4-sec window) after iid expansion):
     signal          list<float16>  the actual EEG window (length = n_samples)
     age             float32        subject age at recording, NaN if missing
     sex             string         "M" / "F" / "" (missing)
-    adhd            int8           1 if any DSM-V Dx column matches /ADHD|attention.deficit/i
-                                   0 if none, -1 if dx columns are all empty (label missing)
+
+    # CBCL Pearson-z factors (the §4.3 Protocol A.1 eval targets — these
+    # replaced the originally-spec'd ADHD-binary label after empirical
+    # verification that HBN releases ship NO DSM-V Dx columns; see
+    # mini_experiments.md §4.3 Protocol A.1 for rationale)
+    p_factor        float32        general psychopathology, NaN if missing
+    attention       float32        ADHD-severity proxy (CBCL Attention factor), NaN if missing
+    internalizing   float32        anxiety / depression, NaN if missing
+    externalizing   float32        conduct / aggression — NeurIPS 2025 EEG-FM Challenge C2 target,
+                                   NaN if missing
+
+    adhd            int8           legacy/compatibility slot; always -1 for current HBN
+                                   (no Dx columns exist); reserved for the case where a
+                                   future HBN release ships DSM-V Dx columns that match
+                                   `hbn.ADHD_DX_PATTERN`
+
     pipeline        string         "minimal" or "v2_clean"
-    src_sha256_8    string         first 8 hex chars of sha256(raw .set+.fdt) — provenance
+    src_sha256_8    string         first 8 hex chars of sha256(raw .set [+ .fdt if present]) — provenance
+
+Amplitude-scale note: MNE's `read_raw_eeglab(...).get_data()` returns raw
+sample values in volts as a numerical convention, but HBN .set files store
+the values themselves in microvolts; the per-channel std from MNE on an HBN
+RestingState recording is therefore ~5e-3 (which would be ~5 mV if taken
+literally, or ~5 µV in the file's native units). This mismatch is
+**numerically harmless** because both pipelines apply per-channel z-score
+which is scale-invariant — the parquet shards always end up at unit
+variance per channel regardless of the input unit interpretation. We do
+NOT rescale to true microvolts in the offline pipeline, because the
+downstream model never sees µV anyway.
 """
 
 from __future__ import annotations
@@ -335,7 +361,9 @@ PARQUET_SCHEMA_FIELDS = (
     "subject_id", "site", "recording_id", "task_label",
     "channel_idx", "channel_name", "window_idx", "window_start_s",
     "sample_rate_hz", "n_samples", "signal",
-    "age", "sex", "adhd",
+    "age", "sex",
+    "p_factor", "attention", "internalizing", "externalizing",
+    "adhd",
     "pipeline", "src_sha256_8",
 )
 
@@ -361,6 +389,12 @@ def rows_to_parquet_table(rows: list[dict]):
         pa.field("signal", pa.list_(pa.float16())),
         pa.field("age", pa.float32()),
         pa.field("sex", pa.string()),
+        # CBCL Pearson-z factors (the §4.3 Protocol A.1 eval targets)
+        pa.field("p_factor", pa.float32()),
+        pa.field("attention", pa.float32()),
+        pa.field("internalizing", pa.float32()),
+        pa.field("externalizing", pa.float32()),
+        # Legacy ADHD-binary slot (always -1 for current HBN)
         pa.field("adhd", pa.int8()),
         pa.field("pipeline", pa.string()),
         pa.field("src_sha256_8", pa.string()),

@@ -1280,12 +1280,21 @@ the sense the term is usually used.
 
 The three primary frozen-probing tasks are:
 
-- *Linear probe on HBN ADHD-vs-no-diagnosis (binary).* The Healthy
-  Brain Network EEG corpus, ADHD diagnosis vs no DSM-V diagnosis,
-  subject-disjoint train/test split. Single-layer linear head on top
-  of the frozen encoder. Metric: AUROC. This is the cheap, monotone,
+- *Linear probe regression on HBN externalizing- and attention-
+  factor.* The Healthy Brain Network EEG corpus does not ship DSM-V
+  diagnosis columns (verified empirically against release R1, 2026-05-02);
+  what it ships instead are four continuous Pearson-z CBCL factors
+  (`p_factor`, `attention`, `internalizing`, `externalizing`). We probe
+  the frozen encoder against the externalizing factor (matching the
+  NeurIPS 2025 EEG Foundation Challenge C2 task directly, so our
+  numbers are apples-to-apples with ST-EEGFormer and the other
+  competition entries) and against the attention factor (the
+  closest continuous analogue of "ADHD severity"). Subject-disjoint
+  train/test split. Metrics: R² and MAE. This is the cheap, monotone,
   good-early-signal probe; it replaces TUAB's role in the EEG-FM
-  literature.
+  literature with a *stronger* (continuous-target) variant. A
+  secondary AUROC report at attention z > +0.5σ is also produced for
+  binary-AUROC continuity with the original TUAB-binary slot pattern.
 - *Linear probe on HBN 6-task classification (multi-class).* Six
   cognitive tasks from HBN (resting state, sequence learning, symbol
   search, surround suppression, contrast change detection, video
