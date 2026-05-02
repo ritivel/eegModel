@@ -145,7 +145,9 @@ def download_cmd(
         recordings = hbn.list_subject_recordings(sub, release)
         for rec in recordings:
             set_path, fdt_path = hbn.download_recording(rec, s.raw_hbn, overwrite=overwrite)
-            total_bytes += set_path.stat().st_size + fdt_path.stat().st_size
+            total_bytes += set_path.stat().st_size
+            if fdt_path is not None:
+                total_bytes += fdt_path.stat().st_size
 
     dt = time.time() - t0
     console.print(
@@ -208,9 +210,6 @@ def audit_cmd(
         if not eeg_dir.exists():
             continue
         for set_path in eeg_dir.glob("*.set"):
-            fdt_path = set_path.with_suffix(".fdt")
-            if not fdt_path.exists():
-                continue
             try:
                 eeg, sr, ch_names = hbn.load_recording(set_path)
             except Exception as e:  # noqa: BLE001
@@ -350,20 +349,18 @@ def preprocess_cmd(
         )
 
         for set_path in sorted(eeg_dir.glob("*.set")):
-            fdt_path = set_path.with_suffix(".fdt")
-            if not fdt_path.exists():
-                continue
-
             parsed = hbn.parse_task_from_filename(set_path.stem)
             if parsed is None:
                 continue
             _task, task_label = parsed
             recording_id = set_path.stem.replace(f"sub-{sub_id}_", "").replace("_eeg", "")
 
-            # Compute provenance hash once per recording
+            # Compute provenance hash over .set + optional .fdt
             sha = hashlib.sha256()
             sha.update(set_path.read_bytes())
-            sha.update(fdt_path.read_bytes())
+            fdt_sibling = set_path.with_suffix(".fdt")
+            if fdt_sibling.exists():
+                sha.update(fdt_sibling.read_bytes())
             src_sha8 = sha.hexdigest()[:8]
 
             try:

@@ -151,32 +151,38 @@ def parse_task_from_filename(filename: str) -> tuple[str, int] | None:
 
 @dataclass(frozen=True)
 class Recording:
-    """One ``.set/.fdt`` recording for one subject.
+    """One EEGLAB ``.set`` (and optional ``.fdt`` sidecar) recording.
 
-    Identifiers in S3 + on local disk (note: the local layout mirrors the
-    BIDS S3 layout including the ``cmi_bids_<release>/`` prefix, so a flat
+    Modern HBN BIDS releases (cmi_bids_R1..R9, NC) ship single-file ``.set``
+    where the binary samples are embedded inside the .set file itself and
+    *no* ``.fdt`` sidecar is present. Earlier EEGLAB versions used a paired
+    ``.set`` (header) + ``.fdt`` (binary) layout. We support both: the
+    ``.fdt`` key/path is Optional and may be ``None``.
+
+    Identifiers in S3 + on local disk (the local layout mirrors the BIDS
+    S3 layout including the ``cmi_bids_<release>/`` prefix, so a flat
     ``rclone`` between local and S3 is a no-op rename):
 
         s3_set:  s3://fcp-indi/data/Projects/HBN/BIDS_EEG/cmi_bids_<release>/sub-<id>/eeg/<basename>.set
-        s3_fdt:  ...<basename>.fdt
+        s3_fdt:  ...<basename>.fdt   (None if absent)
         local:   <storage.raw_hbn>/cmi_bids_<release>/sub-<id>/eeg/<basename>.set
     """
 
-    subject_id: str           # "NDARABCD1234"
-    release: str              # "NC", "R1", ...
-    task: str                 # canonical task name from TASK_LABEL keys
-    task_label: int           # 0..5 (label index for §4.3 Protocol A.2)
-    basename: str             # e.g. "sub-NDARABCD1234_task-RestingState_eeg"
-    s3_set_key: str           # full S3 key of the .set
-    s3_fdt_key: str           # full S3 key of the .fdt
+    subject_id: str               # "NDARABCD1234"
+    release: str                  # "NC", "R1", ...
+    task: str                     # canonical task name from TASK_LABEL keys
+    task_label: int               # 0..5 (label index for §4.3 Protocol A.2)
+    basename: str                 # e.g. "sub-NDARABCD1234_task-RestingState_eeg"
+    s3_set_key: str               # full S3 key of the .set (always present)
+    s3_fdt_key: str | None = None # full S3 key of the .fdt; None for single-file .set
 
     @property
     def s3_set_uri(self) -> str:
         return f"s3://{HBN_S3_BUCKET}/{self.s3_set_key}"
 
     @property
-    def s3_fdt_uri(self) -> str:
-        return f"s3://{HBN_S3_BUCKET}/{self.s3_fdt_key}"
+    def s3_fdt_uri(self) -> str | None:
+        return f"s3://{HBN_S3_BUCKET}/{self.s3_fdt_key}" if self.s3_fdt_key else None
 
     def _local_eeg_dir(self, raw_root: Path) -> Path:
         return raw_root / release_s3_prefix(self.release) / f"sub-{self.subject_id}" / "eeg"
@@ -184,7 +190,9 @@ class Recording:
     def local_set_path(self, raw_root: Path) -> Path:
         return self._local_eeg_dir(raw_root) / f"{self.basename}.set"
 
-    def local_fdt_path(self, raw_root: Path) -> Path:
+    def local_fdt_path(self, raw_root: Path) -> Path | None:
+        if self.s3_fdt_key is None:
+            return None
         return self._local_eeg_dir(raw_root) / f"{self.basename}.fdt"
 
 
@@ -236,38 +244,44 @@ def list_subjects(release: str, *, max_subjects: int | None = None) -> list[str]
 
 
 def list_subject_recordings(subject_id: str, release: str) -> list[Recording]:
-    """List all recordings for one subject in one release."""
+    """List all recordings for one subject in one release.
+
+    Single S3 listing pass; bucket .set and .fdt keys by basename so we can
+    construct a Recording with the correct optional s3_fdt_key (HBN's modern
+    BIDS releases are single-file .set with no .fdt sidecar).
+    """
     s3 = _anonymous_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     prefix = f"{HBN_S3_PREFIX}/{release_s3_prefix(release)}/sub-{subject_id}/eeg/"
 
-    recordings: list[Recording] = []
-    seen_basenames: set[str] = set()
+    # basename → {".set": s3_key, ".fdt": s3_key}
+    by_basename: dict[str, dict[str, str]] = {}
     for page in paginator.paginate(Bucket=HBN_S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []) or []:
             key = obj["Key"]
-            if not key.endswith(".set"):
+            ext = Path(key).suffix
+            if ext not in (".set", ".fdt"):
                 continue
-            basename = Path(key).stem
-            if basename in seen_basenames:
-                continue
-            seen_basenames.add(basename)
+            stem = Path(key).stem
+            by_basename.setdefault(stem, {})[ext] = key
 
-            parsed = parse_task_from_filename(basename)
-            if parsed is None:
-                continue
-            task, task_label = parsed
-
-            fdt_key = key[:-4] + ".fdt"  # parallel filename; .set / .fdt come as a pair
-            recordings.append(Recording(
-                subject_id=subject_id,
-                release=release,
-                task=task,
-                task_label=task_label,
-                basename=basename,
-                s3_set_key=key,
-                s3_fdt_key=fdt_key,
-            ))
+    recordings: list[Recording] = []
+    for basename, ext_keys in sorted(by_basename.items()):
+        if ".set" not in ext_keys:
+            continue  # orphan .fdt without .set — skip
+        parsed = parse_task_from_filename(basename)
+        if parsed is None:
+            continue
+        task, task_label = parsed
+        recordings.append(Recording(
+            subject_id=subject_id,
+            release=release,
+            task=task,
+            task_label=task_label,
+            basename=basename,
+            s3_set_key=ext_keys[".set"],
+            s3_fdt_key=ext_keys.get(".fdt"),  # None if no sidecar
+        ))
     return recordings
 
 
@@ -277,26 +291,33 @@ def list_subject_recordings(subject_id: str, release: str) -> list[Recording]:
 
 
 def download_recording(rec: Recording, raw_root: Path,
-                       *, overwrite: bool = False) -> tuple[Path, Path]:
-    """Download a single ``.set + .fdt`` pair to local NVMe.
+                       *, overwrite: bool = False) -> tuple[Path, Path | None]:
+    """Download a single recording's ``.set`` (and optional ``.fdt`` sidecar).
 
-    Returns (local_set_path, local_fdt_path). Skips files that already exist
-    unless ``overwrite=True``.
+    Returns (local_set_path, local_fdt_path_or_None). Skips files that
+    already exist unless ``overwrite=True``. The ``.fdt`` is only downloaded
+    if the recording metadata indicates a sidecar exists (``rec.s3_fdt_key``
+    is not None) — modern HBN BIDS releases are single-file .set with no
+    .fdt.
     """
     s3 = _anonymous_s3_client()
     set_path = rec.local_set_path(raw_root)
-    fdt_path = rec.local_fdt_path(raw_root)
     set_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for s3_key, local_path in [
-        (rec.s3_set_key, set_path),
-        (rec.s3_fdt_key, fdt_path),
-    ]:
-        if local_path.exists() and not overwrite:
-            continue
-        tmp_path = local_path.with_suffix(local_path.suffix + ".part")
-        s3.download_file(HBN_S3_BUCKET, s3_key, str(tmp_path))
-        tmp_path.replace(local_path)
+    # .set is mandatory
+    if not (set_path.exists() and not overwrite):
+        tmp_path = set_path.with_suffix(set_path.suffix + ".part")
+        s3.download_file(HBN_S3_BUCKET, rec.s3_set_key, str(tmp_path))
+        tmp_path.replace(set_path)
+
+    # .fdt is optional
+    fdt_path: Path | None = None
+    if rec.s3_fdt_key is not None:
+        fdt_path = rec.local_fdt_path(raw_root)
+        if fdt_path is not None and not (fdt_path.exists() and not overwrite):
+            tmp_path = fdt_path.with_suffix(fdt_path.suffix + ".part")
+            s3.download_file(HBN_S3_BUCKET, rec.s3_fdt_key, str(tmp_path))
+            tmp_path.replace(fdt_path)
 
     return set_path, fdt_path
 
@@ -356,7 +377,12 @@ def download_release_metadata(release: str, raw_root: Path,
 
 
 def load_recording(set_path: Path):
-    """Read a ``.set/.fdt`` pair via MNE → return (eeg, sr, channel_names).
+    """Read an EEGLAB ``.set`` file via MNE → return (eeg, sr, channel_names).
+
+    Modern EEGLAB single-file ``.set`` embeds the binary samples; older
+    paired-file format requires a sibling ``.fdt`` next to the ``.set``. MNE
+    handles both transparently as long as the .fdt is co-located when needed
+    — we don't pre-check, just let MNE raise if it's actually missing.
 
     Returns:
         eeg: float32 ndarray of shape (n_channels, n_samples), in **volts**
@@ -365,17 +391,13 @@ def load_recording(set_path: Path):
         sr:  float, sampling rate in Hz.
         channel_names: list[str], length n_channels.
 
-    Raises FileNotFoundError if the .set or its sibling .fdt is missing.
+    Raises FileNotFoundError if the .set itself is missing.
     """
     import mne
 
     set_path = Path(set_path)
     if not set_path.exists():
         raise FileNotFoundError(f"missing .set file: {set_path}")
-    fdt_path = set_path.with_suffix(".fdt")
-    if not fdt_path.exists():
-        # MNE will fail with a less helpful error if the .fdt is missing.
-        raise FileNotFoundError(f"missing .fdt sidecar: {fdt_path}")
 
     raw = mne.io.read_raw_eeglab(str(set_path), preload=True, verbose="ERROR")
     eeg = raw.get_data().astype("float32")  # (n_channels, n_samples), volts
