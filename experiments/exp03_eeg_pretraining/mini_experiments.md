@@ -183,22 +183,64 @@ experiment's README explicitly overrides them.
 Use the same fixed pretraining subset for every comparison: **100 hours of
 HBN-EEG drawn from at least 200 subjects**, single-channel iid-expanded (so
 a 128-channel 4-second epoch becomes 128 independent training examples),
-preprocessed with the canonical V2 pipeline from
-`[../exp01_eeg_to_text/](../exp01_eeg_to_text/)` —
-notch (50/60 Hz, Q=30) → low-pass anti-alias → resample 500 → 250 Hz → high-pass
-(0.5 Hz) → robust per-channel z-score → 5-σ clip → 4-second non-overlapping
-windows. Multi-rate experiments (05) override the resample step and bring in
-small auxiliary corpora (Sleep-EDF at 100 Hz, MOABB BCIC-IV-2a at 250 Hz) for
-real device-rate diversity, since HBN is single-rate at 500 Hz.
+**at the native 500 Hz sampling rate**, with **minimum-offline** preprocessing:
+
+```
+NaN sanitation  →  per-channel z-score  →  ±5σ clip  →
+4-second non-overlapping windowing  →  iid-channel expansion  →
+float16 parquet shards
+```
+
+That is **all** the offline preprocessing. Notch filtering, bandpass
+filtering, and resampling are **deliberately not done offline** — they are
+hypotheses tested by:
+
+- **exp02 (frontend ablation)**: F2 SincNet learns Hz-parameterised bandpass
+  cutoffs end-to-end, F3 frozen scattering provides a fixed wavelet basis,
+  F4 complex Gabor provides a Hz-spaced complex bandpass. If we offline-
+  bandpass at 0.5–100 Hz before the frontend sees the signal, we strictly
+  reduce what these learnable / Hz-parameterised filters can express. The
+  comparison would be biased toward F0 (vanilla strided conv, no learned
+  filtering) since F0 alone benefits from offline filtering it cannot learn
+  itself. Hence we feed *raw* signal to all five frontends in the headline
+  ablation cell.
+- **exp05 (multi-rate strategy)**: the entire question is "how should
+  multiple device sample rates be handled without losing high-γ content
+  above 100 Hz Nyquist". Resampling everything to 250 Hz before the
+  frontend sees it predetermines this experiment. We keep HBN at 500 Hz
+  native and bring in Sleep-EDF (100 Hz) and THINGS-EEG2 (1000 Hz) at
+  *their* native rates for exp05; the held-out 2000 Hz test is constructed
+  by information-preserving upsampling.
+- **exp14 (context-length scaling)**: a 30-second window at 2 kHz is
+  60,000 samples — exactly the regime where Mamba-2's O(N) attention
+  beats Transformer's O(N²). Resampling to 250 Hz reduces 60,000 →
+  7,500 samples and makes the long-context argument moot.
+
+A **literature-comparability cell** is run exactly once, in exp02: F0
+vanilla strided conv is additionally trained on a *preprocessed* input
+stream (60 Hz notch + 0.5–100 Hz Butterworth bandpass + 500 → 250 Hz
+polyphase resample applied per recording before iid expansion). This cell
+is the apples-to-apples cell against BENDR / LaBraM-Base / CBraMod / REVE,
+which were all measured on preprocessed input. It is reported in the
+exp02 results table but is **not** used for the §4.4 winner-picker
+decision rule — it exists purely so we can claim a comparable number for
+the literature.
+
+The 100-hour HBN-EEG subset is sampled subject-disjoint from the train
+split; LNSO (leave-N-subjects-out) eval splits are constructed from the
+remainder. Source: AWS public bucket `s3://fcp-indi/data/Projects/HBN/EEG/`
+(BIDS-iEEG layout, EEGLAB `.set/.fdt`); fall-back to OpenNeuro `ds005516`.
 
 HBN-EEG ([Healthy Brain Network EEG, Shirazi et al. 2024 bioRxiv](https://www.biorxiv.org/content/10.1101/2024.10.03.615261v2))
 is a 3,000+-subject pediatric/young-adult corpus (ages 5–22), 128-channel EGI
 HydroCel @ 500 Hz native, openly distributed on AWS public storage
 (`s3://fcp-indi/data/Projects/HBN/EEG/`) and OpenNeuro (`ds005516`) — no
-credentialed-access wait. 100 hours at 250 Hz × 128 channels gives roughly
-**11.5 million training examples** after iid expansion — enough to be in the
+credentialed-access wait. 100 hours × 128 channels at 4-second non-overlapping
+windows gives roughly **11.5 million training examples** after iid expansion
+(invariant to sample rate; each example is a 2,000-sample float16 vector at
+the native 500 Hz, ~50 GB total at parquet float16) — enough to be in the
 regime where SSL signal overcomes initialization noise, small enough that one
-full pretraining pass is 4–8 hours on H100.
+full pretraining pass is 4–8 hours on H100 at this sequence length.
 
 **Why HBN-EEG over TUEG.** TUEG (Temple University EEG Corpus) is the *de
 facto* pretraining corpus in the EEG-FM literature (BENDR, LaBraM, CBraMod,
@@ -246,7 +288,7 @@ When an experiment varies one axis, the others are pinned to:
 | Reconstruction loss | L1 on raw signal + 0.3 × multi-resolution STFT log-magnitude                       | Reasonable starting point per [BioCodec](https://arxiv.org/abs/2510.09095).                                 |
 | Phase               | Magnitude-only spectral loss (no explicit phase term)                              | Default. Whether to add phase is exp07.                                                                     |
 | Mask                | Random patch mask, 50% ratio                                                       | Vanilla MAE default.                                                                                        |
-| Multi-rate          | Uniform resample to 250 Hz                                                         | Default until exp05 says otherwise.                                                                         |
+| Multi-rate          | Native 500 Hz HBN, no offline resampling                                            | The minimum-offline §4.1 spec — resampling is a hypothesis (exp05), not a default. Multi-rate aux corpora (Sleep-EDF 100 Hz, THINGS-EEG2 1000 Hz) only enter in exp05. |
 
 
 This pinning is critical: when exp02 tests 5 frontend variants, the **only**

@@ -653,12 +653,32 @@ measuring how well your model memorises individuals. Always enforce
 leave-N-subjects-out (LNSO).
 - **Source-ID leakage**: similarly, the model can learn to recognise the
 *recording rig* (sampling rate fingerprint, notch filter signature,
-channel-naming convention) and use that as a shortcut. Defenses:
-pre-process every recording to a canonical pipeline (resample, notch,
-bandpass, per-recording z-score, 15-σ clip) — exactly the V2 pipeline
-we settled on in exp01 §1.1. Verify by training a cheap "predict the
-source dataset" probe on your encoder features — accuracy should drop
-over training, not rise.
+channel-naming convention) and use that as a shortcut. The exp01/exp02
+defense was *aggressive* canonical offline preprocessing (resample +
+notch + bandpass + per-recording z-score + 15-σ clip). For exp03 SSL
+pretraining we deliberately depart from this orthodoxy: offline
+preprocessing is reduced to the minimum (NaN sanitation + per-channel
+z-score + ±5σ clip + 4-second windowing per
+[`mini_experiments.md` §4.1](./mini_experiments.md#41-pretraining-corpus)),
+because notch / bandpass / resampling are themselves the questions
+asked by exp02 (frontend), exp05 (multi-rate), and exp14 (context
+length). Doing them offline pre-decides those experiments. The
+anti-shortcut defenses become **architectural and adversarial** rather
+than preprocessing-based:
+
+  * The "predict recording site" probe (HBN's 4 CMI sites are the
+    closest analogue of source-dataset in our HBN-only corpus) and
+    "predict subject ID" k-NN, both run every checkpoint and required
+    to **decrease** over training (§4.3 monitor).
+  * Optionally, the gradient-reversal adversarial head from exp13 if
+    the passive monitors show the rig fingerprint isn't fading on its
+    own.
+
+  The orthodox "pre-process to a canonical pipeline" approach remains
+  appropriate for *fine-tuning* a frozen pretrained encoder (where the
+  encoder's input expectation is fixed and you're trying to match it),
+  which is why exp01 / exp02 still use the V2 pipeline. The departure
+  is specific to the SSL-pretraining-from-scratch setting.
 - **Channel-mismatch zero-padding**: when sources have different channel
 counts, padding with zeros means most rows are mostly zero. LaBraM and
 REVE both solve this with channel-as-token; do the same.

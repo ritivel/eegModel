@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exp03-eeg-pretraining"
+version = "0.1.0"
+description = "Exp03 — self-supervised EEG pretraining (iid-channel single-channel recipe). Pretrains on HBN-EEG (Healthy Brain Network, 3000+ pediatric/young-adult subjects, 128-ch HydroCel @ 500 Hz native, openly distributed on AWS public storage). Frozen-probing eval primarily on HBN ADHD-binary AUROC + HBN 6-task classification BAC/WF1, with TUAB+TUEV as a literature-comparability secondary when TUH NEDC access lands. Self-contained: deliberately does not import from packages/eeg_common — that package is shaped around fine-tuning frozen pretrained encoders, whereas exp03 trains from scratch with a different preprocessing philosophy (minimum offline, maximum in-model)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pavan Kalyan Tankala" }]
+
+dependencies = [
+  # Core scientific stack
+  "numpy>=1.26,<3",
+  "scipy>=1.13",          # F0-prep filter chain only (notch + bandpass + resample); minimal pipeline is pure numpy
+  "pyarrow>=16",          # parquet shard write/read
+  "pandas>=2.2",          # metadata, eval splits, participants.tsv parsing
+
+  # EEG file IO
+  "mne>=1.7",             # read EEGLAB .set/.fdt + BIDS metadata; no GUI deps pulled in
+
+  # Object storage
+  "boto3>=1.34",          # programmatic S3 (HBN public bucket + our warehouse)
+
+  # CLI + UX
+  "typer>=0.12",
+  "tqdm>=4.66",
+  "rich>=13.7",           # console tables for the data audit
+
+  # PyTorch + ML stack — added in a later commit when we scaffold model.py / train.py
+  # "torch>=2.8",
+  # "transformers>=5",
+  # "wandb>=0.18",
+]
+
+[project.scripts]
+exp03 = "exp03.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

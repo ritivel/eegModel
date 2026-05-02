@@ -187,6 +187,28 @@ what the hypothesis document is for. It is to describe the *small
 experiments* we plan to run before committing the compute for the full
 training run, in case any individual design choice is wrong.
 
+== A note on preprocessing — minimum offline, maximum in-model
+
+A specific design choice that flows through every later section: we
+deliberately push almost everything that is conventionally "EEG
+preprocessing" into the model rather than running it offline. Concretely,
+the offline pipeline is six lines of numpy: NaN sanitation, per-channel
+z-score, ±5σ clip, 4-second non-overlapping windowing, iid-channel
+expansion, and a float16 parquet cast. Native 500 Hz HBN sampling is
+preserved. *Notch filtering, bandpass filtering, and resampling are
+deliberately not done offline*, because those operations are themselves
+the questions asked by experiments 02 (front-end ablation, where SincNet
+learns Hz-parameterised bandpass cutoffs end-to-end), 05 (multi-rate
+strategy, the entire question), and 14 (context length, where 30-second
+windows at 2 kHz → 60 000 samples is the regime that matters). Doing
+them offline would pre-decide those experiments. A single
+literature-comparability cell in experiment 02 (called "F0-prep") does
+add the conventional offline filter chain back, but only for direct
+numerical comparability against BENDR / LaBraM-Base / CBraMod / REVE; it
+is reported alongside the other cells but excluded from the §4.4
+winner-picker rule. See `mini_experiments.md` §4.1 for the full
+specification.
+
 #pagebreak()
 
 = Why mini-experiments at all
@@ -668,6 +690,15 @@ common rate (usually 250 Hz), which discards every frequency above
 information. Three published alternatives, each with their own
 trade-offs, have not been compared head-to-head on EEG.
 
+Note that the other 15 experiments in this series sidestep this
+question entirely by pretraining on HBN-EEG at its native 500 Hz —
+no offline resampling at all (see §7 on the minimum-offline
+preprocessing philosophy and `mini_experiments.md` §4.1). This
+experiment is the one place where the multi-rate question is
+deliberately confronted by importing aux corpora at their native rates
+(Sleep-EDF at 100 Hz, THINGS-EEG2 at 1000 Hz) into a mixed-rate
+training mix.
+
 *What we will try.* Four strategies.
 
 #table(
@@ -1050,11 +1081,11 @@ and Transformer backbones.
   inset: 5pt,
   align: (left, left, left, left),
   stroke: 0.4pt + rgb("#aaa"),
-  table.header([*Code*], [*Window*], [*\# samples at 250 Hz*], [*Notes*]),
-  [C0], [4 s], [1 000], [Default; both backbones feasible.],
-  [C1], [8 s], [2 000], [Both feasible; Transformer starts to slow.],
-  [C2], [16 s], [4 000], [Mamba-2 still cheap; Transformer painful.],
-  [C3], [30 s], [7 500], [Mamba-2 feasible; Transformer expected to OOM at 2 kHz eval.],
+  table.header([*Code*], [*Window*], [*\# samples at 500 Hz native*], [*Notes*]),
+  [C0], [4 s], [2 000], [Default; both backbones feasible.],
+  [C1], [8 s], [4 000], [Both feasible; Transformer starts to slow.],
+  [C2], [16 s], [8 000], [Mamba-2 still cheap; Transformer painful.],
+  [C3], [30 s], [15 000], [Mamba-2 feasible; Transformer expected to OOM at 2 kHz eval (60 000 samples).],
 )
 
 Each variant is trained on the same number of total samples seen

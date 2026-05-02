@@ -6,8 +6,9 @@
 > [`methodology.md` §3 matrix shape](../../methodology.md#3-how-to-design-one-ablation-the-matrix-shape),
 > [`brain/experiments/tokenization/04-frequency-domain.md`](../../../../../brain/experiments/tokenization/04-frequency-domain.md)
 >
-> **Compute budget:** 18 H100-hours (5 frontend variants × 2 control columns ×
-> 3 seeds = 30 cells × 35 min average)
+> **Compute budget:** 19 H100-hours (5 frontend variants + 1 F0-prep
+> literature-comparability cell, × 2 control columns × 3 seeds =
+> 36 cells × 32 min average)
 >
 > **Gates:** experiments 05, 06, 07, 08, 09, 10, 11, 12
 
@@ -55,10 +56,23 @@ backbone's expected input width).
 | Code | Variant | Parameters | Phase preserving | Multi-rate native | Noise-robust theorem |
 | ---- | ------- | ---------- | ---------------- | ----------------- | -------------------- |
 | F0 | Vanilla strided conv (3-layer, kernels (7,7,7), strides (2,2,2), GeLU, no BlurPool) | ~50k | ✗ | ✗ | none |
+| F0-prep | F0 fed *preprocessed* input (60 Hz notch + 0.5–100 Hz Butterworth bandpass + 500→250 Hz polyphase resample applied per recording before iid expansion). **Literature-comparability cell only**, NOT a winner-picker candidate. | ~50k | ✗ | ✗ | none |
 | F1 | F0 + Snake activations + BlurPool before every stride | ~50k | partial | ✗ | shift-invariant via BlurPool |
 | F2 | SincNet (80 filters, Hz-parameterised cutoffs) → linear projection to D | ~160 + small projection | partial (real sinc) | ✓ (cutoffs in Hz) | 1-Lipschitz (bandpass is bounded) |
 | F3 | Frozen Kymatio Scattering1D (J=6, Q=8) → linear projection to D | 0 + small projection | partial (modulus) | ✓ (wavelets are scale-natural) | provably 1-Lipschitz to deformations |
 | F4 | Complex Gabor filterbank (40 filters, log-spaced 0.5–80 Hz) → real+imag concat → linear projection | ~80 + small projection | ✓ (complex-valued) | ✓ (Hz-spaced) | bandpass + small spectrum |
+
+**Why F0-prep exists.** F0 (vanilla CNN) cannot learn to remove line noise
+or perform a bandpass — those are explicit operations that strided convs
+will spend capacity on relearning. F1–F4 each have a structural answer
+(BlurPool / SincNet / scattering / Gabor). The fair comparison is "raw
+input for everyone" — F0 will lose, that's the point. But the literature
+(BENDR, LaBraM-Base, CBraMod, REVE) all measured their numbers on
+preprocessed input, so for *direct numerical comparability* we additionally
+run F0-prep, the preprocessed version. F0-prep is reported in the results
+table but is excluded from the §4.4 winner-picker (it's not a candidate
+frontend, just a calibration cell against the literature). Compute
+overhead: ~1 H100-hour (a sixth cell instead of a fifth).
 
 All variants are followed by an identical positional embedding and
 identical Mamba-2 backbone (the default per
