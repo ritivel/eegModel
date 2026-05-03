@@ -28,11 +28,35 @@ dependencies = [
   "typer>=0.12",
   "tqdm>=4.66",
   "rich>=13.7",           # console tables for the data audit
+]
 
-  # PyTorch + ML stack — added in a later commit when we scaffold model.py / train.py
-  # "torch>=2.8",
-  # "transformers>=5",
-  # "wandb>=0.18",
+[project.optional-dependencies]
+# GPU-only ML stack. Installed on the GPU box (and any reproducer machine)
+# via:  uv pip install -e "experiments/exp03_eeg_pretraining[gpu]"
+#
+# Reproducibility note: PyPI versions are pinned to compatible-release ranges
+# here; the exact resolved versions across all transitive deps are captured
+# in the committed `uv.lock` (run `uv lock` after any change to this group).
+# If we ever need a third-party patch, we fork the upstream repo to our own
+# org and switch the install URL to `git+https://github.com/<us>/<repo>@<sha>`
+# — never installing from a mutable upstream branch.
+gpu = [
+  "torch>=2.8,<3",
+  "torchaudio>=2.8,<3",         # MR-STFT loss spectrograms (Check A)
+  "transformers>=4.51,<6",      # ships Mamba2Model + Trainer; v5 is the latest stable family
+  "accelerate>=1.0,<2",         # mixed precision + multi-GPU runtime; lighter than full Trainer
+  "einops>=0.8,<1",             # tensor reshape readability for masking + bidirectional Mamba
+  "scikit-learn>=1.5,<2",       # linear probe + k-NN for Check D
+  "wandb>=0.18,<1",             # logging from step 1 (per Karpathy: monitor or you'll regret)
+
+  # Mamba-2 official kernel + its prerequisite depthwise-conv kernel.
+  # Both are CUDA-built; installing them needs `--no-build-isolation` so
+  # they link against the same torch as the venv. We do that as a separate
+  # `uv pip install --no-build-isolation` step in the bootstrap, not from
+  # this extras list, because uv's normal resolver would otherwise try to
+  # build them in an isolated env and fail.
+  # "mamba-ssm>=2.2,<3",
+  # "causal-conv1d>=1.4,<2",
 ]
 
 [project.scripts]
