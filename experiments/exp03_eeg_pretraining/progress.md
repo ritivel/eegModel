@@ -11,7 +11,7 @@
 
 **Reply turnaround: ~7 h 51 min** (vs the 1–2 business-day budget I'd written
 into yesterday's "Next steps when you return" §5). Approval arrived at
-`2026-05-02T14:51:59Z` from Joseph Picone <joseph.picone@gmail.com> (Gmail
+`2026-05-02T14:51:59Z` from Joseph Picone [joseph.picone@gmail.com](mailto:joseph.picone@gmail.com) (Gmail
 msg `19de92cd0ed38a4a`, same thread ID; subject `NEDC TUH EEG: credentials`).
 Templated boilerplate (`To: undisclosed-recipients:;`), so this is not an
 individualized review — Joe just asks each approved applicant to reply with
@@ -21,21 +21,21 @@ installs into `authorized_keys` on their SFTP host.
 Followed up at `2026-05-03T04:01 UTC`:
 
 - **Generated dedicated keypair** at `~/.ssh/id_ed25519_nedc` on the local
-  Mac (no passphrase, comment `pavan@ritivel.com`):
+Mac (no passphrase, comment `pavan@ritivel.com`):
   ```bash
   ssh-keygen -t ed25519 -C "pavan@ritivel.com" -f ~/.ssh/id_ed25519_nedc -N ""
   ```
   - **Kept separate from the pre-existing default `~/.ssh/id_ed25519`**
-    (Oct 2025) so NEDC access can be rotated / revoked without touching the
-    rest of the SSH identity. SSH config entry will be added once Joe replies
-    with the SFTP host (then `IdentityFile ~/.ssh/id_ed25519_nedc` +
-    `IdentitiesOnly yes` for that host).
+  (Oct 2025) so NEDC access can be rotated / revoked without touching the
+  rest of the SSH identity. SSH config entry will be added once Joe replies
+  with the SFTP host (then `IdentityFile ~/.ssh/id_ed25519_nedc` +
+  `IdentitiesOnly yes` for that host).
   - Fingerprint `SHA256:vN8E2yaqJVzhUJ7Qa+MddsoB1t7sjFnIwF8PPNKUtT0`.
   - Public key:
-    `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7c2j78jBJdzoc9KfSZfzwIwqAUch0JqjzQYgB+zwjB pavan@ritivel.com`
+  `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7c2j78jBJdzoc9KfSZfzwIwqAUch0JqjzQYgB+zwjB pavan@ritivel.com`
 - **Replied in-thread** (`19de92cd0ed38a4a`) to `joseph.picone@gmail.com`
-  with the public-key line + asked for the SFTP host and download instructions.
-  Sent Gmail msg `19debffb390b9ddd`.
+with the public-key line + asked for the SFTP host and download instructions.
+Sent Gmail msg `19debffb390b9ddd`.
 
 **Decision: stayed on `pavan@ritivel.com` (Ritivel Labs Inc., custom Google
 Workspace domain) rather than switching to `@microsoft.com`.** Joe's note
@@ -52,7 +52,7 @@ the SFTP host. When that lands:
 1. Add the SSH config entry routing the NEDC host through `~/.ssh/id_ed25519_nedc`.
 2. Pull **TUAB + TUEV** onto the GPU box's NVMe (~80 GB raw, minutes not hours).
 3. Run through `SPEC_V2_CLEAN` (notch + bandpass + 250 Hz resample) — the
-   literature-comparable pipeline matching LaBraM / CBraMod / BIOT / REVE for
+  literature-comparable pipeline matching LaBraM / CBraMod / BIOT / REVE for
    direct numerical comparison in the §4.3 Protocol A.4 secondary eval.
 4. Sync derived parquet to `s3://eegmodel-warehouse/derived/v2_clean_tuh/`.
 
@@ -72,14 +72,16 @@ processed; no per-release failures recorded in the per-release logs.
 
 **Final state in S3** (`s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`):
 
-| Metric | Value |
-|---|---|
-| Releases | 10 / 10 ✅ |
-| Subject directories | **2,639** (NC=447, R1=136, R2=150, R3=184, R4=324, R5=330, R6=135, R7=381, R8=257, R9=295) |
-| Parquet shards | **24,270 files** |
-| S3 size | **783 GB** (under the ~1 TB projected) |
+
+| Metric                       | Value                                                                                              |
+| ---------------------------- | -------------------------------------------------------------------------------------------------- |
+| Releases                     | 10 / 10 ✅                                                                                          |
+| Subject directories          | **2,639** (NC=447, R1=136, R2=150, R3=184, R4=324, R5=330, R6=135, R7=381, R8=257, R9=295)         |
+| Parquet shards               | **24,270 files**                                                                                   |
+| S3 size                      | **783 GB** (under the ~1 TB projected)                                                             |
 | Per-release completion (UTC) | R1@13:31, R2@13:43, R3@14:13, R6@16:10, NC@16:53, R4@18:27, R5@18:32, R8@20:15, R7@21:12, R9@22:28 |
-| Pipeline wall-clock | 11h 06min |
+| Pipeline wall-clock          | 11h 06min                                                                                          |
+
 
 **Phase-0 logs synced to S3** (audit + pipeline records, 19 files / 2.5 MB):
 `s3://eegmodel-warehouse/runs/exp03/00_phase0/2026-05-02/`
@@ -92,6 +94,7 @@ next session. NVMe scratch wiped (intended — preprocessed parquet was
 already in S3).
 
 **Cost summary for the May 2 session** (rough):
+
 - Provisioning + bootstrap + Tier-1 + audit: ~$170 (5h CPU work, 0% GPU)
 - Full HBN pipeline (download + preprocess + sync × 10 releases): ~$365 (11h)
 - Idle between job-end (22:28 UTC May 2) and stop (03:58 UTC May 3): ~$180 (5.5h)
@@ -102,14 +105,13 @@ already in S3).
 
 1. Start the instance (AWS console or `aws ec2 start-instances`); ~1 min.
 2. New public IP gets assigned (we did not allocate an Elastic IP). Get it
-   from the AWS console or `aws ec2 describe-instances --instance-ids
-   i-0b8ee8096fd9176c0 --query "Reservations[0].Instances[0].PublicIpAddress"`.
+  from the AWS console or `aws ec2 describe-instances --instance-ids  i-0b8ee8096fd9176c0 --query "Reservations[0].Instances[0].PublicIpAddress"`.
 3. SSH in. `git pull` for the latest code.
 4. To get parquet shards back on NVMe (only needed if a training run is
-   about to start): `exp03 sync-derived-down --pipeline minimal` —
+  about to start): `exp03 sync-derived-down --pipeline minimal` —
    ~10 min for 783 GB.
 5. Mini-experiment 01 (the 5 sanity baselines) is the natural next thing
-   — see `mini_experiments/01_sanity_baselines/README.md`. Will need
+  — see `mini_experiments/01_sanity_baselines/README.md`. Will need
    `src/exp03/{model.py, train.py, eval.py, sanity.py}` to be scaffolded;
    that's the next code-writing task.
 
@@ -293,10 +295,10 @@ Box can be safely stopped after the job finishes — see §"Where things live"
   closest continuous analogue of "ADHD severity").
   - A.1c: binary AUROC at attention z>+0.5σ (~28% positive rate, for
   AUROC continuity with the original TUAB-binary slot pattern).
-    Plus: `seqLearning6target` added to TASK_LABEL (R1 has subjects
-    with EITHER 6-target OR 8-target; both → label 1). Parquet schema
-    extended with 4 float32 factor fields; legacy `adhd` int8 stays
-    (always -1) for compat.
+  Plus: `seqLearning6target` added to TASK_LABEL (R1 has subjects
+  with EITHER 6-target OR 8-target; both → label 1). Parquet schema
+  extended with 4 float32 factor fields; legacy `adhd` int8 stays
+  (always -1) for compat.
 13. **Tier-1 preprocessing → parquet shards verified end-to-end**: 56
   shards, 545,928 rows, **1.82 GB on NVMe** (also synced to S3, see
     "Where things live" below). All schema + sanity checks green:
