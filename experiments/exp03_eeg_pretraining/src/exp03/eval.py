@@ -426,7 +426,8 @@ def run_protocol_a(
     # ---------- A.2 — 6-task classification ----------
     y_task = extracted.task_label
     if len(set(y_task[train_idx].tolist())) >= 2:
-        clf = LogisticRegression(max_iter=5000, n_jobs=1, multi_class="auto",
+        # sklearn 1.8 deprecated `multi_class`; lbfgs auto-detects multinomial.
+        clf = LogisticRegression(max_iter=5000, n_jobs=1,
                                  solver="lbfgs").fit(X_train, y_task[train_idx])
         y_pred = clf.predict(X_test)
         bac_full = balanced_accuracy_score(y_task[test_idx], y_pred)
