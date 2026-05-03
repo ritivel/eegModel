@@ -688,7 +688,16 @@ class EEGSSLModel(nn.Module):
         self.decoder = build_decoder(cfg.decoder)
 
         # --- reconstruction head: per-token Linear → patch_samples raw values
+        # Zero-init the bias and use a small Normal for the weight, per MAE
+        # 2022 §3 and the discussion in `01_sanity_baselines/README.md` Check A.
+        # This makes the model output ≈ 0 at init, so the loss-at-init values
+        # match the closed-form theory (L2 ≈ Var(target) = 1.0 for z-scored
+        # input, L1 ≈ √(2/π) ≈ 0.7979). Without this, PyTorch's default
+        # Linear init produces output variance σ_r² ≈ 0.4 that adds to the
+        # target variance and confuses Check A.
         self.recon_head = nn.Linear(cfg.decoder.d_model, cfg.patch_samples, bias=True)
+        nn.init.normal_(self.recon_head.weight, std=0.01)
+        nn.init.zeros_(self.recon_head.bias)
 
         if cfg.target.kind != "raw":
             raise NotImplementedError(
