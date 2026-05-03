@@ -79,11 +79,23 @@ def synthetic_batch(
     if kind == "gauss":
         x = torch.randn(B, T, generator=g, dtype=torch.float32)
     elif kind == "ar1":
-        eps = torch.randn(B, T, generator=g, dtype=torch.float32)
-        x = torch.zeros(B, T, dtype=torch.float32)
-        x[:, 0] = eps[:, 0]
-        for t in range(1, T):
-            x[:, t] = rho * x[:, t - 1] + math.sqrt(1.0 - rho * rho) * eps[:, t]
+        # Vectorised AR(1) via truncated impulse-response convolution.
+        # Recursion x[t] = rho*x[t-1] + sigma*eps[t] has closed form
+        #     x[t] = sum_{k=0..t} rho^k * sigma * eps[t-k]
+        # which is a 1-D convolution with kernel [sigma, sigma*rho, sigma*rho^2, ...].
+        # Truncate when rho^k drops below 1e-5 (k≈220 at rho=0.95). Earlier
+        # versions had a Python `for t in range(T)` loop that bottlenecked
+        # Check B at ~10x slower-than-GPU (2000 iters × 16 batch / step).
+        import torch.nn.functional as F
+        sigma = math.sqrt(1.0 - rho * rho)
+        max_lag = max(2, int(math.ceil(math.log(1e-5) / math.log(rho))))
+        max_lag = min(max_lag, T)
+        kernel = (rho ** torch.arange(max_lag, dtype=torch.float32)) * sigma
+        eps = torch.randn(B, T + max_lag - 1, generator=g, dtype=torch.float32)
+        # F.conv1d is cross-correlation; flip the kernel for convolution.
+        kernel_flipped = kernel.flip(0).view(1, 1, -1)
+        x = F.conv1d(eps.unsqueeze(1), kernel_flipped).squeeze(1)
+        # Output length T + max_lag - 1 - max_lag + 1 = T  ✓
     elif kind == "constant":
         x = torch.full((B, T), float(constant_value), dtype=torch.float32)
     else:
