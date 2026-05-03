@@ -78,11 +78,20 @@
   #v(1.0em)
 
   #text(size: 10pt)[
-    Pavan Kalyan Tankala — v1.1, May 2026 \
+    Pavan Kalyan Tankala — v1.2, May 2026 \
     Companion document to `experiments/exp03_eeg_pretraining/mini_experiments.md` \
     and `brain/cortico-ssl-hypothesis.typ`. \
     Updated to incorporate
-    #link("https://arxiv.org/abs/2601.06134")[DeeperBrain (Wang et al., Dec 2025)].
+    #link("https://arxiv.org/abs/2601.06134")[DeeperBrain (Wang et al., Dec 2025)],
+    plus the *2026-05-03 deep-research design refresh* which added four
+    new mini-experiments (17 generative paradigm, 18 reconstruction target,
+    19 decoder design, 20 position embedding) and revised eight existing
+    experiments based on findings from
+    #link("https://arxiv.org/abs/2410.00871")[MAP (Liu \& Yi, CVPR 2025)],
+    #link("https://arxiv.org/abs/2406.11838")[MAR (Li et al., NeurIPS 2024)],
+    #link("https://arxiv.org/abs/2301.08243")[I-JEPA (Assran et al., CVPR 2023)],
+    #link("https://arxiv.org/abs/2510.21585")[REVE (NeurIPS 2025)],
+    and others.
   ]
 
   #v(1.5em)
@@ -421,7 +430,7 @@ our constraints.
 
 = The full list of mini-experiments
 
-There are sixteen experiments in total, grouped into four blocks. We
+There are *twenty* experiments in total, grouped into five blocks. We
 present them in the order in which they would naturally run.
 
 #table(
@@ -432,36 +441,51 @@ present them in the order in which they would naturally run.
   table.header([*\#*], [*Topic*], [*Question*], [*Days*]),
 
   [01], [Sanity baselines], [Does the training and evaluation pipeline behave correctly on toy inputs before we run anything real?], [0.5],
-  [02], [Front-end choice], [How should the raw EEG be turned into the token sequence the rest of the network sees?], [2],
-  [03], [Backbone choice], [Which architecture (Transformer / Mamba-2 / LRU / hybrid) should sit at the centre of the network?], [3],
-  [04], [Self-supervised framework], [Which scratch SSL recipe (masked autoencoder, VICReg, TF-C, diffusion) gives the best low-noise representation?], [3],
-  [05], [Multi-rate handling], [How should we accommodate recordings sampled at different rates (200 Hz to 2000 Hz)?], [2],
+  [02], [Front-end choice], [How should the raw EEG be turned into the token sequence the rest of the network sees? (★ priority on SincNet F2 and complex-Gabor F4 cells per the 2026-05-03 EEG-specific evidence review.)], [2],
+  [03], [Backbone choice], [Which architecture (Transformer / Mamba-2 / LRU / hybrid / Fourier-operator FGNO) should sit at the centre of the network?], [3],
+  [04], [Self-supervised framework], [Which scratch SSL recipe (masked autoencoder, VICReg, TF-C, diffusion, MER+NSP) gives the best low-noise representation? (Cells re-anchored on the experiment-17 winner generative paradigm.)], [3],
+  [05], [Multi-rate handling], [How should we accommodate recordings sampled at different rates (200 Hz to 2000 Hz)? Plus a Phase B disambiguation: is the multi-rate gain from rate-specific frontend branches, or from auxiliary multi-scale loss?], [2],
   [06], [Reconstruction loss], [Which time-domain loss (L2, L1, Huber, Barron, Itakura-Saito) handles the heavy-tailed EEG amplitude distribution best?], [1.5],
   [07], [Phase handling], [Does an explicit phase-aware loss term materially improve representations over a magnitude-only loss?], [2],
-  [08], [Denoising target], [Which offline cleaning method (bandpass / ICA / PCA / wavelet / IC-U-Net) gives the best target signal for the masked autoencoder to predict?], [2],
+  [08], [Denoising target], [Which offline cleaning method (bandpass / ICA / PCA / wavelet / IC-U-Net / Wiener-filter) gives the best target signal for the masked autoencoder to predict?], [2],
   [09], [Multi-condition input], [Does mixing synthetic eye-blink and muscle noise into the training input (while keeping the target clean) make the encoder more robust?], [1.5],
-  [10], [Masking strategy], [Within a masked autoencoder, does amplitude-aware or block-structured masking beat plain random masking?], [1],
+  [10], [Masking strategy × ratio], [Within a masked-style framework, what combination of masking strategy (random / span / multi-block / amplitude-aware) and masking ratio (50 / 65 / 75 / 85 %) produces the best representation? (Rewritten 2026-05-03 as a 4×4 matrix.)], [1.5],
   [11], [Bottleneck], [Can the FSQ discrete bottleneck be trained jointly with the SSL objective in a single stage, and does it beat the continuous baseline?], [2],
-  [12], [Quick-wins consolidation], [Do the proposed "free wins" (Snake activations, BlurPool anti-aliasing, VICReg auxiliary regulariser) survive a strict ablation when stacked together with the prior winners?], [1.5],
+  [12], [Quick-wins consolidation], [Do the proposed "free wins" (BlurPool anti-aliasing, VICReg auxiliary regulariser) survive a strict ablation when stacked together with the prior winners? (Snake activations dropped 2026-05-03.)], [1.5],
   [13], [Adversarial dataset probe], [Does adding an explicit gradient-reversal head that penalises the encoder for being able to predict the source dataset reduce rig fingerprinting?], [1.5],
-  [14], [Context-length scaling], [Does the long-context capability that justifies Mamba-2 over a Transformer translate into better representations? At what window length?], [3],
+  [14], [Context-length scaling], [Does the long-context capability that justifies Mamba-2 over a Transformer translate into better representations? At what window length? (Now using the Evo 2-stage context-extension recipe.)], [3],
   [15], [Loss weights and curriculum], [Are the proposed loss-weight values robust to small perturbations, and does the three-stage training curriculum genuinely help?], [3],
   [16], [Neurodynamics statistics prediction], [Does adding a small head that predicts macroscopic dynamical statistics (band power, cross-frequency coupling, sample entropy) directly from the encoder representation improve frozen-probing performance? (DeeperBrain-style.)], [1.5],
+  [17], [Generative paradigm for Mamba *(NEW 2026-05-03)*], [Given our default bidirectional Mamba-2 backbone, does the vanilla MAE objective beat scan-aligned causal autoregression (AR) or bidirectional masked AR with a diffusion head (MAR) — the configurations that MAP CVPR 2025 reports are the right pairing for Mamba?], [1],
+  [18], [Reconstruction target *(NEW 2026-05-03)*], [What does the model predict at masked positions: raw signal (the default), per-token-normalised raw, latent representations from an EMA-target encoder (I-JEPA-style), discrete codec-RVQ tokens from BioCodec (pretrained on TUH-EEG), HuBERT-style iterative-k-means cluster IDs, or a sparsity-regularised raw target?], [1.5],
+  [19], [Decoder design *(NEW 2026-05-03)*], [What decoder depth × type combination gives the best frozen-probe representation? Vision MAE found 1-layer ≈ 8-layer for fine-tuning but a 7.9 pp gap for linear probe; VideoMAE inverts the finding for high-redundancy data; bioFAME (biosignals) inverts again. The right answer for HBN-EEG is unknown.], [1.5],
+  [20], [Position embedding *(NEW 2026-05-03)*], [For our (likely position-implicit) bidirectional Mamba-2 backbone, which positional encoding scheme — none, sinusoidal absolute, learned absolute, RoPE, or REVE-style 4D Fourier — gives the best representation?], [0.7],
 )
 
 #v(0.5em)
 
 The first twelve are the *core stack*, working through the four design
 axes plus the loss heads, multi-rate handling, masking, and target
-choice. The next three (13–15) are *hardening experiments* added on
-the basis of the cortico-ssl-hypothesis: each of them tests a specific
-claim that is made in the hypothesis but not directly checked by
-experiments 01–12. The sixteenth was added on the basis of the
-DeeperBrain paper (arXiv 2601.06134, Dec 2025), which demonstrates
-that a "predict-the-statistic" auxiliary head produces dramatically
-better frozen-probing representations on the same backbone — see
-§6.16 below for what this means and §7 for the related shift in how
-we evaluate every experiment.
+choice. Experiments 13–15 are *first-wave hardening* added on the basis
+of the cortico-ssl-hypothesis: each tests a specific claim that is made
+in the hypothesis but not directly checked by experiments 01–12.
+Experiment 16 was added on the basis of the DeeperBrain paper (arXiv
+2601.06134, Dec 2025), which demonstrates that a
+"predict-the-statistic" auxiliary head produces dramatically better
+frozen-probing representations on the same backbone. Experiments 17–20
+are the *2026-05-03 second-wave hardening*, added after a deep-research
+review of five adjacent fields (Speech SSL, Vision MAE/JEPA, Time-series
++ Mamba SSL, Classical signal-processing priors, and Diffusion / AR /
+codec SSL alternatives) surfaced four open architectural questions that
+the original sixteen experiments were silently anchored on. The most
+consequential is experiment 17: MAP (CVPR 2025) reports that the
+combination of *vanilla MAE objective + Mamba backbone* — which is
+exactly our §4.2 default — is structurally mispaired, with autoregressive
+or bidirectional-masked-autoregressive paradigms outperforming MAE for
+Mamba by a wide margin. *17 must run before 04*, because if MAE loses,
+every framework comparison in 04 must be re-anchored on the new winning
+paradigm. See §6.17–§6.20 below for the new experiments and §7 for
+the unchanged evaluation suite.
 
 == How the experiments depend on each other
 
@@ -471,33 +495,57 @@ we evaluate every experiment.
                                   │
               ┌───────────────────┼────────────────────┐
               ▼                   ▼                    ▼
-         02 frontend         03 backbone        04 SSL framework
+         02 frontend         03 backbone        17 generative paradigm
+       (incl. ★ SincNet,    (incl. Mamba-2,    (MAE vs AR vs MAR for
+        ★ complex-Gabor)     LRU, FGNO cell)    Mamba — the MAP test;
+                                                 NEW 2026-05-03)
               │                   │                    │
-              └───────┬───────────┘                    │
-                      ▼                                ▼
-                  05 multirate         ┌─────────┬─────────┬──────────┐
-                                       ▼         ▼         ▼          ▼
-                                 06 recon   08 denoised  10 mask  11 bottleneck
-                                    loss      target    strategy   FSQ vs cont
-                                       │         │
-                                       ▼         ▼
-                                 07 phase   09 multi-cond
-                                  handling     input
-                                       │
-                                       ▼
-                                  12 quick wins
-                                  (final stack)
-                                       │
-       ┌───────────────────────┬───────┴───────────┬──────────────────────────┐
-       ▼                       ▼                   ▼                          ▼
-14 context-length scaling  13 adversarial   16 NSP auxiliary head   15 loss weights + curriculum
-                              probe         (DeeperBrain-style)
+              └───────┬───────────┴────────────────────┘
+                      │
+                      ▼
+                 04 SSL framework        20 position embedding
+              (re-anchored on the 17    (sin / RoPE / NoPE /
+               winner generative         Fourier-4D; NEW 2026-05-03)
+               paradigm)
+                      │
+              ┌───────┴────────────┐
+              ▼                    ▼
+        05 multirate       18 reconstruction target
+        (incl. Phase B     (raw / latent / BioCodec / HuBERT /
+         aux-loss axis)     sparse; NEW 2026-05-03)
+              │                    │
+              ▼                    ▼
+   ┌──────────┴─────────┬──────────┴─────────┬──────────┬──────────┐
+   ▼                    ▼                    ▼          ▼          ▼
+06 recon  08 denoised   19 decoder design   10 mask×ratio  11 bottleneck
+  loss      target      (depth × type;        matrix       FSQ vs cont
+   │         │           NEW 2026-05-03)
+   ▼         ▼
+07 phase  09 multi-cond
+ handling   input
+              │
+              ▼
+       12 quick wins
+       (final stack — Snake DROPPED 2026-05-03; BlurPool flagged)
+              │
+   ┌──────────────┬───────┴──────────────┬──────────────────────────┐
+   ▼              ▼                      ▼                          ▼
+14 context-length 13 adversarial  16 NSP auxiliary head   15 loss weights + curriculum
+  scaling           probe         (DeeperBrain-style)
+(now using Evo
+ 2-stage recipe)
 ```
 
 The graph is advisory rather than strict. Pairs of experiments that do
 not depend on each other can run in parallel on a multi-GPU node;
-01, however, must finish before any other experiment starts, because
-all later experiments inherit the eval pipeline that 01 validates.
+01 must finish before any other experiment starts, because all later
+experiments inherit the eval pipeline that 01 validates. *Experiment 17
+is the most important new gate added in the 2026-05-03 refresh*: it
+must complete before 04, because if vanilla MAE loses to AR or MAR for
+the Mamba backbone, every cell of 04 must be re-anchored on the new
+winning generative paradigm before being measured. 17 can run in
+parallel with 02 and 03 by holding the other axes at the §4.2
+defaults.
 
 #pagebreak()
 
@@ -505,7 +553,7 @@ all later experiments inherit the eval pipeline that 01 validates.
 // 6. THE EXPERIMENTS, IN DETAIL
 // ============================================================
 
-= The sixteen experiments, in detail
+= The twenty experiments, in detail
 
 For each experiment we give:
 
@@ -1237,6 +1285,311 @@ couplings. DeeperBrain reports alpha power $r approx 0.82$, sample
 entropy $r approx 0.75$, and cross-frequency coupling near zero (the
 latter is informative — it suggests the model is correctly refusing to
 overfit a high-noise statistic). We expect a similar pattern.
+
+#pagebreak()
+
+// ============================================================
+// 6.17–6.20 — 2026-05-03 deep-research design refresh
+// ============================================================
+
+== 17 — Generative paradigm for the Mamba backbone
+
+#block(width: 100%, inset: 8pt, fill: rgb("#fafafa"), stroke: 0.4pt + rgb("#aaa"), radius: 2pt)[
+  *Question.* Given that our default backbone is bidirectional Mamba-2,
+  does the vanilla *masked autoencoder* objective — the recipe used by
+  every cell in experiments 04–11 — actually beat *scan-aligned causal
+  autoregression* (predict the next token, no masking) or *bidirectional
+  masked autoregression with a diffusion head* (the MAR design — random
+  masking, but predict masked positions via a small denoising-diffusion
+  loss head rather than via a reconstruction decoder)?
+]
+
+*Why it matters.* This is the most consequential addition from the
+2026-05-03 design refresh, because it directly challenges the *single
+anchor point* on which every other experiment in this folder has been
+built. The Mamba family of state-space models is fundamentally
+left-to-right in its computation: information flows along a sequential
+scan, not in parallel as in a Transformer. The masked-autoencoder
+objective, by contrast, was designed for vision Transformers, where
+attention is a fully bidirectional and parallel operation. Three
+independent 2024–2025 results, from three different research groups,
+all report the same conclusion: *masked autoencoding is structurally
+mispaired with Mamba-class backbones*.
+
+The most direct evidence comes from MAP (Liu \& Yi, CVPR 2025): in a
+controlled vision ablation they report that vanilla MAE pretraining of a
+pure Mamba network is essentially worthless — it gains less than half a
+percentage point of ImageNet accuracy over random initialisation —
+while pure autoregressive pretraining gains over 1.4 percentage
+points and a hybrid local-MAE-plus-global-AR scheme called *MAP*
+outperforms both. A second paper, "Autoregressive Pretraining with
+Mamba in Vision" (arXiv 2406.07537), confirms that pure causal AR
+pretraining of a Vim backbone reaches a state-of-the-art 83.2 % on
+ImageNet without any MAE component at all. A third paper, MAR
+(Li et al., NeurIPS 2024 spotlight), introduces the bidirectional-
+masked-AR-plus-diffusion-head design and beats MAE on both image
+generation and linear-probe representation quality, again on
+Transformer backbones, suggesting the technique would only get
+stronger when paired with a native scan-based backbone like Mamba.
+
+These are vision results. The mechanism — alignment between the
+pretraining order and the backbone's intrinsic computation order — is
+architectural, not modality-specific, so it should transfer to 1D EEG.
+But the transfer has never been tested. Since experiments 04–11 are
+*all* anchored on the assumption that vanilla MAE is the right
+generative paradigm, a confirmation that it is not would force a
+re-anchoring of the entire ablation chain. We therefore treat 17 as a
+*gate experiment* that must complete before 04 begins.
+
+*What we will try.* Three variants of the generative paradigm, all
+holding the §4.2 default architecture (frontend, backbone, decoder
+where applicable) fixed.
+
+#table(
+  columns: (auto, 1fr, 2fr),
+  inset: 5pt,
+  align: (left, left, left),
+  stroke: 0.4pt + rgb("#aaa"),
+  table.header([*Code*], [*Variant*], [*Mechanism*]),
+  [G0], [MAE-bidirectional (the §4.2 default)], [Random 50 % mask; encoder sees only visible patches; lightweight decoder reconstructs raw signal at masked positions; loss = L1 + 0.3·MR-STFT.],
+  [G1], [AR-causal-aligned], [No masking. Encoder is *unidirectional* (forward Mamba only — backward stream removed since AR aligns with one scan direction). At each token, predict the next token's raw-signal patch from the contextual representation. Loss is per-position L1 + 0.3·MR-STFT.],
+  [G2], [MAR — bidirectional masked + diffusion head], [Random 50 % mask; encoder is bidirectional (the §4.2 default); replaces the decoder with a small 3-layer MLP diffusion head that predicts the noise component added to the raw signal at masked positions, sampling the noise level from a log-normal schedule. The encoder's representation is the deliverable; the diffusion head is discarded after pretraining.],
+)
+
+*How we pick a winner.* The standard frozen-probing decision rule from
+§7. A strict win requires a 2 percentage-point HBN 6-task BAC
+improvement over the §4.2 MAE baseline, with the matched-noise twin
+flat. Three additional paradigm-specific guards: (1) the chosen
+paradigm must complete all five seeds without divergence; (2) it must
+maintain at least half the baseline's training-token throughput per
+H100 (a paradigm that wins by 1 pp at 5× compute is not the right
+choice for the Phase-4 headline run); (3) end-of-training encoder
+feature covariance rank must remain above 0.5×feature_dim, to catch
+the dimensional collapse that AR and MAR can in principle suffer but
+that vanilla MAE is immune to. If any non-MAE paradigm strict-wins,
+experiment 04 is re-anchored on the new winner before its framework
+comparison runs; experiments 06–10 are similarly re-checked for any
+implicit MAE assumptions.
+
+== 18 — Reconstruction target
+
+#block(width: 100%, inset: 8pt, fill: rgb("#fafafa"), stroke: 0.4pt + rgb("#aaa"), radius: 2pt)[
+  *Question.* Holding the architecture and the experiment-17 winning
+  generative paradigm fixed, *what does the model predict at masked
+  positions* (or at next-token positions, if 17 picks AR)? Six candidate
+  representation spaces for the prediction target: raw signal, per-token-
+  normalised raw, latent representations from a momentum-updated copy of
+  the encoder (the I-JEPA / EEG2Rep design), discrete codec tokens from
+  BioCodec (an open-source RVQ codec already pretrained on TUH-EEG),
+  HuBERT-style iterative-k-means cluster IDs, or raw signal augmented
+  with a sparsity penalty on the encoder's output activations.
+]
+
+*Why it matters.* Across speech (HuBERT outperformed wav2vec 2.0 by
+moving from continuous to discrete cluster targets), vision (I-JEPA
+outperformed MAE by 7.9 percentage points on ImageNet linear probe by
+moving from pixel targets to latent targets; MAGE outperformed MAE by
+6.7 percentage points by moving to semantic-token targets), and
+EEG-specific work (EEG2Rep outperformed the prior EEG-MAE by ~5 % using
+the same I-JEPA-style latent targets; LaBraM outperformed BENDR using
+codebook-prediction targets), *the target representation space is the
+single biggest lever for downstream representation quality*. It is
+bigger than the encoder architecture (the question of 02 / 03), bigger
+than the masking strategy (10), bigger than the loss function (06).
+
+The mechanism is mechanical: the encoder's job during pretraining is
+to produce features from which the *target* can be recovered. If the
+target lives in a noise-dominated raw-signal space, the encoder is
+rewarded for modelling noise. If the target lives in a denoised,
+quantised, or latent space, the encoder is rewarded for modelling
+structure. EEG's low signal-to-noise ratio makes this distinction
+especially load-bearing — much more so than for images (where pixels
+are essentially noise-free) or speech (where the noise floor is well
+characterised).
+
+This experiment is *orthogonal to experiment 08 (denoising target)*:
+experiment 08 asks "what *signal* do we treat as the ground truth"
+(raw vs bandpass-filtered vs ICA-cleaned, etc.) — all variants live
+in raw-signal space and what changes is which preprocessing produces
+the target. Experiment 18 asks "what *representation space* does the
+target live in" (raw signal vs latent representations vs codec tokens
+vs cluster IDs) — the signal source is held fixed and what changes is
+how the signal is encoded into the prediction target.
+
+*What we will try.* Six target representation spaces.
+
+#table(
+  columns: (auto, 1fr, 2fr),
+  inset: 5pt,
+  align: (left, left, left),
+  stroke: 0.4pt + rgb("#aaa"),
+  table.header([*Code*], [*Variant*], [*What the model predicts*]),
+  [TR0], [Raw signal (the §4.2 default)], [The raw 16 ms-token waveform at masked positions.],
+  [TR1], [Per-token-normalised raw], [The same raw waveform, but with the per-token mean and standard deviation removed; the normalisation parameters are predicted alongside by a small auxiliary head, so they remain recoverable. Replicates He 2022 MAE Table 1d's "normalised pixels" finding (+1.6 pp linear probe over raw pixels).],
+  [TR2], [Latent (EMA-target encoder)], [The output of a momentum-updated copy of the encoder applied to the *unmasked full input* at the masked positions. No decoder, only a small 3-layer MLP predictor head; loss in latent space. The I-JEPA / EEG2Rep design.],
+  [TR3], [BioCodec RVQ tokens], [Discrete RVQ codebook IDs from the BioCodec encoder applied to the input. BioCodec is pretrained on TUH-EEG and open-source, so we use it as a fixed feature extractor without any new tokeniser training. Cross-entropy loss over the 1024-entry vocabulary.],
+  [TR4], [HuBERT-style iterative k-means], [The cluster ID (k=500) at each masked position, where clusters are computed from the encoder's intermediate-layer features and refreshed every 100 000 steps. Cross-entropy loss over the 500-cluster vocabulary.],
+  [TR5], [Raw + sparsity regularisation], [Same target as TR0 but with an L1 sparsity penalty (weight 0.01) on the encoder's output activations, enforcing the Olshausen \& Field 1996 prior that produced V1-like simple-cell receptive fields from natural images. Tests whether an analogous "EEG simple-cell" structure emerges.],
+)
+
+*How we pick a winner.* The standard rule, with three target-specific
+guards: (1) TR2's EMA-target latent space can collapse to a single
+point (encoder always outputs the same latent → loss → 0); the encoder
+feature covariance rank must remain above 0.5×feature_dim. (2) TR3's
+BioCodec-RVQ codebook has 4 096 codes total; the model's prediction
+distribution must cover at least 25 % of the codebook by end of
+training, otherwise the model has collapsed to a small subset.
+(3) TR4's k-means re-clustering must produce stable centroids — at
+least 0.7 cosine similarity between consecutive iterations on average,
+otherwise the targets are drifting too fast for the model to chase.
+
+== 19 — Decoder design
+
+#block(width: 100%, inset: 8pt, fill: rgb("#fafafa"), stroke: 0.4pt + rgb("#aaa"), radius: 2pt)[
+  *Question.* Holding everything else at the experiment 02 / 03 / 17 / 18
+  winners, what decoder *depth* (1, 2, 4, or 8 blocks) crossed with
+  what decoder *type* (Mamba-2 to match the encoder family, Transformer
+  with RoPE and FlashAttention, or a SAMBA-style U-Net with parameter-
+  free linear interpolation upsampling) gives the best frozen-probing
+  performance?
+]
+
+*Why it matters.* Vision SSL has a clear and decisive answer for
+*its* setting: the original MAE paper (He et al. 2022) reports that
+moving from a 1-block decoder to an 8-block decoder improves ImageNet
+linear-probe accuracy from 65.5 % to 73.5 % — an 8-percentage-point gap
+— while end-to-end fine-tuning quality stays flat at 84.8–84.9 %. The
+mechanistic explanation is that a deeper decoder *absorbs reconstruction
+specialisation*, leaving the encoder's representations more abstract and
+linearly readable. For frozen-probing-as-primary-eval (which is exactly
+our setting), the choice of decoder depth is therefore the largest
+single architectural lever in the MAE paper.
+
+But this answer does *not* transfer cleanly to other modalities.
+VideoMAE inverts the finding: a 1-block decoder degrades even
+fine-tuning, because the higher temporal redundancy and block-style
+masking make the decoder's job harder so it needs more capacity. The
+biosignal MAE paper bioFAME inverts again, showing that for biosignal
+classification, *shallower* encoders (3–4 layers) outperform deeper
+ones (5–6 layers) — the opposite of what scaling laws predict. The
+SAMBA paper uses a U-Net-shaped decoder with parameter-free linear
+interpolation and reports the best EEG-specific decoder design as of
+late 2025. And if experiment 17 picks a paradigm without a traditional
+decoder (AR has none; MAR uses a small MLP head), the question
+restructures to "what is the right size for the prediction head".
+
+The right answer for our recipe — bidirectional Mamba-2 backbone,
+single-channel iid EEG, frozen-probing as the primary metric — is
+unknown. The literature provides four plausible defaults that all
+disagree.
+
+*What we will try.* A 4 × 3 grid of depth × type, with a screening-
+plus-confirmation protocol to keep the cell count bounded.
+
+#table(
+  columns: (1.4fr, 1fr, 1fr, 1fr),
+  inset: 5pt,
+  align: (left, left, left, left),
+  stroke: 0.4pt + rgb("#aaa"),
+  table.header([], [*TY-MA Mamba-2*], [*TY-TR Transformer*], [*TY-UN U-Net*]),
+  [*D1*: 1 layer (minimum)], [D1-MA], [D1-TR], [D1-UN],
+  [*D2*: 2 layers (the §4.2 default)], [D2-MA], [D2-TR], [D2-UN],
+  [*D4*: 4 layers (half of encoder)], [D4-MA], [D4-TR], [D4-UN],
+  [*D8*: 8 layers (matched to encoder full depth)], [D8-MA], [D8-TR], [D8-UN],
+)
+
+The 12 cells run at 1 seed each as a *screening sweep* (~6 hours
+wall-clock total on a single H100); the top 3 cells by HBN 6-task BAC
+are then promoted to *confirmation* with 5 seeds × matched-noise twin.
+
+*How we pick a winner.* The standard rule on the confirmation cells.
+Two additional guards: (1) the chosen decoder must reduce
+end-of-training reconstruction loss by at least 30 % over the D1-MA
+baseline; otherwise the extra decoder capacity is dead weight. (2) The
+chosen decoder must remain at most 50 % of the encoder's parameter count
+— a decoder larger than half the encoder violates the asymmetric-MAE
+design principle articulated in He et al. 2022 §3.1. If experiment 17
+chose a paradigm without a decoder (AR), the experiment runs a reduced
+4 × 2 grid testing only the AR next-token prediction head's size and
+type; if 17 chose MAR (small MLP head), the experiment tests the head's
+hidden width and depth.
+
+== 20 — Position embedding
+
+#block(width: 100%, inset: 8pt, fill: rgb("#fafafa"), stroke: 0.4pt + rgb("#aaa"), radius: 2pt)[
+  *Question.* For our chosen frontend and backbone — likely the §4.2
+  default of bidirectional Mamba-2, which is *technically position-
+  implicit* through its scan-based recurrence — which positional
+  encoding scheme works best: none at all (NoPE), sinusoidal absolute
+  (the original Transformer 2017 design), learned absolute embeddings,
+  RoPE (the rotary position embedding now standard in modern large
+  language models), or REVE-style 4D Fourier (the 2025 EEG-FM
+  state-of-the-art positional encoding)?
+]
+
+*Why it matters.* Position embedding is the most "obviously settled"
+architectural choice in the §4.2 default that *isn't actually settled*.
+There are three independent reasons it deserves a dedicated mini-
+experiment:
+
+First, *Mamba-2 is technically position-implicit*. Its selective scan
+mechanism encodes order through the recurrence itself, not through an
+explicit positional vector. Pure state-space models like S4 and S4D
+are typically run *without* any positional embedding. Yet every
+published EEG-Mamba paper (FEMBA, BioMamba, EEGMamba) adds a learned
+positional embedding anyway, with the lone exception of EEGMamba.
+Whether the embedding helps or hurts is empirically unsettled for
+biosignals.
+
+Second, *REVE (NeurIPS 2025) provides the strongest published
+EEG-specific evidence for any positional scheme*. Their 4D Fourier
+positional encoding — sinusoidal projection of the 3D electrode
+coordinates plus the timestep, with a small learned linear adaptation
+layer — outperforms both fixed-learnable and pure-MLP-based positional
+encodings in their ablation. REVE was pretrained on 60 000 hours of
+EEG from 25 000 subjects, so its conclusions carry weight. We have not
+tested this in our recipe.
+
+Third, *RoPE is the dominant choice in modern large language models*
+(LLaMA, Mistral, Qwen, GPT-NeoX, Falcon) and offers good length-
+extrapolation properties — up to twice the training context with NTK
+scaling, four to thirty-two times with YaRN. Our experiment 14
+(context-length scaling) tests training windows from 4 seconds up to
+30 seconds; RoPE's length-extrapolation property may make a
+measurable difference for the long-context regime, an interaction
+that has never been tested in biosignal SSL.
+
+*What we will try.* Five positional encoding schemes.
+
+#table(
+  columns: (auto, 1fr, 2fr),
+  inset: 5pt,
+  align: (left, left, left),
+  stroke: 0.4pt + rgb("#aaa"),
+  table.header([*Code*], [*Variant*], [*Mechanism*]),
+  [P0], [None (NoPE)], [No positional information added at all. Mamba-2's selective scan is left to encode order on its own.],
+  [P1], [Sinusoidal absolute (the §4.2 proposal)], [Fixed sinusoidal vectors added to the frontend output before the backbone.],
+  [P2], [Learned absolute], [A learned embedding table of shape (T_max, d) added to the frontend output.],
+  [P3], [RoPE], [Rotary position embedding applied to the Q-like and K-like projections inside each Mamba-2 block.],
+  [P4], [REVE-style 4D Fourier], [Fourier features computed from (electrode_x, electrode_y, electrode_z, time_t) — for our iid single-channel setup the spatial coordinates are constant per recording-channel pair, so this reduces to 1D Fourier of time plus a 3-coordinate spatial embedding. A small linear-GeLU-LayerNorm adaptation layer projects to the backbone width.],
+)
+
+*How we pick a winner.* The standard rule, with one position-embedding-
+specific criterion: each variant is evaluated at *both* the pretraining
+window (4 seconds at 500 Hz, our default) and a 2× extrapolated
+window (8 seconds, constructed by concatenating consecutive
+pretraining windows from the same recording). The chosen variant must
+lose no more than 5 percentage points on HBN 6-task BAC at the 2×
+window — a length-extrapolation sanity check that gates whether the
+chosen scheme is suitable for experiment 14's long-context cells. The
+honest expected outcome is that *NoPE and REVE 4D Fourier are
+essentially tied* on the headline metric, with REVE 4D Fourier having a
+slight edge under length extrapolation; *RoPE is the right choice if
+experiment 14 conclusively shows that long-context generalisation is
+needed* (because RoPE is the most studied scheme for length
+extrapolation in modern LLMs); *sinusoidal absolute*, the §4.2
+proposal, is probably the third-best option behind NoPE and REVE 4D
+Fourier and is in the spec only as a placeholder.
 
 #pagebreak()
 

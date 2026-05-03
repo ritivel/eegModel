@@ -36,15 +36,29 @@ exp12 is also the first cell where we pay full attention to the **two**
 "free win" candidates that were never directly tested in the other
 experiments:
 
-- **Snake activations**: replacing GeLU/ReLU in the convolutional frontend
-  with `Snake_α(x) = x + (1/α)·sin²(αx)` ([BigVGAN, arXiv:2206.04658](https://arxiv.org/abs/2206.04658)).
-  Periodic inductive bias matched to oscillatory signals. Zero parameter
-  overhead, one extra `α` per channel. Tested in exp02 only as part of
-  variant F1, where the comparison was confounded with BlurPool. exp12
-  isolates Snake.
+- ~~**Snake activations**~~ **DROPPED 2026-05-03 from the deep-research
+  refresh.** The Signal-Processing subagent's finding: the BigVGAN
+  Snake-activation paper's published periodic-extrapolation property
+  *does not hold in practice* — the 2022 follow-up study and subsequent
+  empirical analyses show that Snake networks default to near-linear
+  behaviour during training, with the periodic structure rarely
+  materialising. The recommendation, when periodic inductive bias is
+  desired, is to use **SIREN-style sine activations** or the **DONN
+  oscillatory RNN architecture** instead. For exp12, Snake is removed
+  entirely from the candidate "free wins" list; the alternative
+  (SIREN / DONN) is too architecturally invasive for a quick-wins
+  ablation and is deferred to a hypothetical future "periodic-bias
+  architecture" mini-experiment.
 - **BlurPool**: replacing strided conv with conv + low-pass + subsample
   per [Zhang ICML 2019](https://arxiv.org/abs/1904.11486). Anti-aliasing
-  the encoder's downsampling. Same exp02 confound; isolate here.
+  the encoder's downsampling. **2026-05-03 caveat from the Signal-
+  Processing subagent**: BlurPool's binomial-5 low-pass kernel can
+  attenuate genuine high-γ neural content (gamma > 30 Hz, which is
+  cognitively meaningful and where inner-speech / motor-imagery content
+  lives). For images this doesn't matter (no analogous "gamma" content
+  to lose); for EEG the cost-benefit of anti-aliasing vs high-γ
+  attenuation must be checked. The W2 cell now includes a
+  high-γ-attenuation diagnostic (see Decision rule below).
 - **VICReg auxiliary**: variance + invariance + covariance regulariser on
   the encoder's mean-pooled output across two augmented views. Tested as
   a *standalone* SSL framework in exp04 S2 (where it was likely a weak
@@ -61,7 +75,7 @@ The experiment runs in two phases.
 | Code | Variant | Modification |
 | ---- | ------- | ------------ |
 | W0 | exp02–exp11 winners (the "current best" baseline at this point in the sequence) | none added |
-| W1 | W0 + Snake activations in the conv frontend | replace GeLU/ReLU; one α per channel |
+| ~~W1~~ | ~~W0 + Snake activations in the conv frontend~~ | **DROPPED 2026-05-03** — see "Why it matters" |
 | W2 | W0 + BlurPool before every stride in the conv frontend | replace `Conv1d(stride=s)` with `Conv1d(stride=1) → BlurPool(stride=s)` |
 | W3 | W0 + VICReg auxiliary loss with weight 0.1 | sample two augmented views per batch, compute VICReg on encoder pooled output, add to total loss |
 
@@ -70,15 +84,16 @@ BAC with non-overlapping CIs) to be considered for stacking.
 
 ### Phase B — stacked combination (only includes the Phase A winners)
 
-If all three Phase A variants strict-win:
+If both remaining Phase A variants strict-win:
 
 | Code | Variant | Modification |
 | ---- | ------- | ------------ |
-| W4 | W0 + Snake + BlurPool + VICReg auxiliary | all three together |
+| W4 | W0 + BlurPool + VICReg auxiliary | both together |
 
-The honest expected outcome: maybe one or two of W1 / W2 / W3 strict-win;
-W4 marginally improves over the best-individual but with diminishing
-returns; the cost-benefit of stacking is the deciding factor.
+The honest expected outcome (revised 2026-05-03): one or both of W2 / W3
+strict-win; W4 marginally improves over the best-individual but with
+diminishing returns; the cost-benefit of stacking is the deciding
+factor.
 
 ## Controls
 
@@ -87,15 +102,14 @@ For Phase A:
 |                                | EEG signal | matched-noise twin |
 | ------------------------------ | ---------- | ------------------ |
 | W0 baseline (exp02–exp11)      | ✓          | ✓                  |
-| W1 + Snake                     | ✓          | ✓                  |
 | W2 + BlurPool                  | ✓          | ✓                  |
 | W3 + VICReg auxiliary          | ✓          | ✓                  |
 
-For Phase B (run only if Phase A passes for all three):
+For Phase B (run only if both remaining Phase A cells strict-win):
 
 |                                | EEG signal | matched-noise twin |
 | ------------------------------ | ---------- | ------------------ |
-| W4 stacked all three           | ✓          | ✓                  |
+| W4 stacked (BlurPool + VICReg) | ✓          | ✓                  |
 
 The matched-noise twin for W3 (VICReg auxiliary) is informative: a
 collapse-prevention regulariser that "improves" on Gaussian noise is
@@ -129,7 +143,7 @@ Same as prior experiments:
   stacked combination.
 - Weak win = ≥ 0.25 pp with paired permutation p < 0.05.
 - Tie = TOST equivalence within ε = 0.5 pp.
-- For W4 only: must strict-win against the *best* of W0 / W1 / W2 / W3,
+- For W4 only: must strict-win against the *best* of W0 / W2 / W3,
   not just against W0. This protects against false additivity claims.
 
 Anti-shortcut criterion: VICReg auxiliary is specifically expected to
@@ -137,15 +151,26 @@ Anti-shortcut criterion: VICReg auxiliary is specifically expected to
 probe accuracy goes *up* under W3, the auxiliary loss is being
 counterproductive and W3 is disqualified regardless of HBN 6-task gains.
 
+**High-γ-content preservation (W2 / BlurPool only, added 2026-05-03)**:
+the BlurPool low-pass kernel attenuates content above its cutoff. For
+EEG, this includes the high-γ band (30–100 Hz) where cognitively
+meaningful neural content lives (motor imagery beta-rebound, gamma-band
+attention modulation). W2 must show ≥ 90 % retention of in-band spectral
+power in the 30–80 Hz band on a held-out 1000-window sample measured via
+Welch periodogram. If retention drops below 90 %, W2 is disqualified
+despite any HBN 6-task BAC gain — the gain is then known to be from
+removing aliased content rather than from preserving the signal we care
+about, and the cost (high-γ loss) outweighs the benefit (anti-aliasing)
+for our headline run target.
+
 ## Pre-registered predictions
 
-| Variant | Prediction HBN 6-task BAC | Source-probe trajectory |
-| ------- | ------------------- | ------------------------ |
-| W0 baseline | reference | already trending down per exp02–exp11 monitoring |
-| W1 + Snake | weak win, ~+0.3 pp | unchanged |
-| W2 + BlurPool | tied or weak win, ~+0.5 pp; effect mostly visible in multi-rate eval | unchanged |
-| W3 + VICReg aux | weak win, ~+0.5 pp; significant improvement on cross-subject LOSO | source probe drops faster than W0 |
-| W4 stacked | strict win, ~+0.7–1.0 pp over W0; weak win over best individual | source probe drops fastest |
+| Variant | Prediction HBN 6-task BAC | Source-probe trajectory | High-γ retention |
+| ------- | ------------------- | ------------------------ | ---------------- |
+| W0 baseline | reference | already trending down per exp02–exp11 monitoring | reference |
+| W2 + BlurPool | tied or weak win, ~+0.5 pp; effect mostly visible in multi-rate eval | unchanged | **risk** of < 90 % retention; must check |
+| W3 + VICReg aux | weak win, ~+0.5 pp; significant improvement on cross-subject LOSO | source probe drops faster than W0 | unchanged |
+| W4 stacked | strict win, ~+0.5–0.8 pp over W0; weak win over best individual | source probe drops fastest | inherits W2's risk |
 
 If Phase A reveals that one or more "free wins" actually *hurt* (a real
 possibility for VICReg auxiliary if its loss weight is wrong), they are
@@ -154,11 +179,12 @@ win as the chosen configuration.
 
 ## Implementation pointers
 
-- Snake activations:
-  [`EdwardDixon/snake`](https://github.com/EdwardDixon/snake) reference;
-  one learnable `α` per output channel of each conv layer; init `α = 1.0`.
+- ~~Snake activations~~: **DROPPED** — see "Why it matters".
 - BlurPool: 1-D variant with binomial kernel `[1, 4, 6, 4, 1] / 16` (size 5).
   Reference: [`adobe/antialiased-cnns`](https://github.com/adobe/antialiased-cnns).
+  After applying, run a Welch periodogram on a held-out 1000-window
+  sample to verify ≥ 90 % retention of 30–80 Hz spectral power
+  (high-γ-attenuation diagnostic, added 2026-05-03).
 - VICReg auxiliary: SelfEEG implementation as the reference. Use the
   pooled output of the chosen backbone (mean over time) as the embedding;
   augmentations are temporal crop + amplitude scaling (already used in

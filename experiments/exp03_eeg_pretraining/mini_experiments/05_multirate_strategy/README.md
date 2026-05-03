@@ -20,6 +20,25 @@ SincNet's Hz-parameterised filters — which one minimises performance
 degradation when the encoder must operate on rates it did not see during
 pretraining?
 
+> **2026-05-03 scope clarification from the Speech-SSL deep-research
+> subagent.** A re-analysis of the MR-HuBERT ablations
+> ([arXiv 2310.16539](https://arxiv.org/abs/2310.16539)) found that the
+> performance gain attributed to "multi-resolution branches" actually
+> comes from the **auxiliary multi-scale loss** (predicting masked
+> targets at multiple intermediate encoder layers, each with its own
+> head), *not* from the architectural choice of multiple input-rate
+> branches. This means the original exp05 risks testing the wrong
+> variable: M2 (MSR-HuBERT branches) bundles two distinct mechanisms
+> together, and a strict win or loss can't be cleanly attributed.
+>
+> The fix added below: **a Phase B sub-experiment** that decouples the
+> two mechanisms — auxiliary multi-scale loss vs multi-rate frontend
+> branches — by adding two cells (M5 = M0 + auxiliary multi-scale
+> loss; M6 = M2 without auxiliary multi-scale loss). The 4×5×3-seed
+> Phase A matrix is unchanged from the original design; Phase B adds
+> ~6 H100-hours of disambiguation and is critical for interpreting
+> any M2 result.
+
 ## Why it matters
 
 EEG corpora span an order of magnitude in sampling rate (100 Hz Sleep-EDF,
@@ -59,12 +78,28 @@ The four alternatives are real but each has unproven scaling for EEG:
 
 ## Variants
 
+### Phase A — frontend strategies (the original exp05 matrix)
+
 | Code | Variant | How multi-rate is handled | Information loss above 100 Hz Nyquist? |
 | ---- | ------- | ------------------------- | ---------------------------------------- |
 | M0 | Uniform resample to 250 Hz (the field default) | All inputs `scipy.signal.resample_poly` to 250 Hz before frontend | Yes: anything above 125 Hz Nyquist is gone |
 | M1 | Mamba-Δ rate scaling | Frontend operates at native rate; Mamba's Δ parameter is set to `1/fs` per-batch | No (in theory) |
 | M2 | MSR-HuBERT rate-specific CNN branches | One CNN branch per `fs ∈ {200, 256, 500, 1000, 2000}`; shared LayerNorm; shared backbone | No |
 | M3 | SincNet Hz-parameterised + frozen scattering | SincNet cutoffs in Hz; Kymatio scattering with adaptive J,Q per rate | No |
+
+### Phase B — auxiliary-loss disambiguation (added 2026-05-03)
+
+| Code | Variant | What's added on top of M0 / M2 | Purpose |
+| ---- | ------- | ------------------------------- | ------- |
+| M5 | M0 + auxiliary multi-scale loss | M0 (uniform resample baseline) + auxiliary mask-prediction heads at encoder layers 2 and 4 (each with its own decoder head) | Tests whether the multi-scale auxiliary loss *alone* gives the gain attributed to M2 |
+| M6 | M2 without auxiliary multi-scale loss | M2 (rate-specific branches) but with only the final-layer mask-prediction head, no auxiliary heads at intermediate layers | Tests whether the rate-specific branches *alone*, without the auxiliary loss, still give M2's gain |
+
+The interpretation matrix:
+
+|         | gain from rate-specific branches  | no gain from rate-specific branches |
+| ------- | --------------------------------- | ----------------------------------- |
+| **gain from auxiliary loss** | M2 wins because of *both*         | M2's gain is *entirely* from auxiliary loss; recommendation = use M5 |
+| **no gain from auxiliary loss** | M2's gain is *entirely* from branches; recommendation = use M2 (or M6) | M2 doesn't actually win; the speech-side finding doesn't transfer |
 
 Each variant is evaluated on the same downstream tasks but with input
 sampling rate varied at evaluation time, including rates not seen at

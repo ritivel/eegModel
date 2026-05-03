@@ -63,13 +63,25 @@ contextualised (B, T', D=256) sequence.
 | ---- | ------- | ------ | ------ | ---------- | ------- |
 | B0 | Bidirectional vanilla Transformer with RoPE, FlashAttention-2 | 6 | ≈ 8 M | O(N²) | `torch.nn.functional.scaled_dot_product_attention` |
 | B1 | Bidirectional Mamba-2 (state N=64) | 6 | ≈ 8 M | O(N) | `state-spaces/mamba` (official Triton kernel mandatory) |
-| B2 | Bidirectional LRU (complex eigenvalues, θ initialised to EEG bands δ/θ/α/β/γ) | 6 | ≈ 8 M | O(N) via parallel scan | `[lru-pytorch](https://github.com/Gothos/LRU-pytorch)` or hand-port |
+| B2 | Bidirectional LRU (complex eigenvalues, θ initialised to EEG bands δ/θ/α/β/γ) | 6 | ≈ 8 M | O(N) via parallel scan | [`lru-pytorch`](https://github.com/Gothos/LRU-pytorch) or hand-port |
 | B3 | Hybrid: 5 × Mamba-2 + 1 × local-window attention (window=512), Zamba-2 ratio 5:1 | 6 | ≈ 8 M | O(N) + O(N · w) | composed from B0 + B1 |
+| B4 | **★ FGNO** (Fourier-space Graph Neural Operator) — 6 frequency-domain operator blocks; per-block Fourier transform → low-rank multiplicative update in frequency space → inverse Fourier transform; no attention or recurrence at all | 6 | ≈ 8 M | O(N log N) per block via FFT | hand-port from [Li et al. 2020 (FNO)](https://arxiv.org/abs/2010.08895) + [FGNO 2025 (arXiv 2602.12267)](https://arxiv.org/abs/2602.12267) |
 
 LRU's θ initialisation: 64 state dimensions split as
 `[δ:14, θ:14, α:12, β:12, γ:12]` with frequencies log-spaced inside each
 band, replicating the BrainWave-Scattering Net trick of seeding wavelets at
 physiologically meaningful scales.
+
+**B4 FGNO added 2026-05-03** from the Signal-Processing subagent's finding:
+the only published *neural-operator* SSL for biosignals at scale is
+[FGNO (NeurIPS 2025 workshop, arXiv 2602.12267)](https://arxiv.org/abs/2602.12267),
+which reports **+20 % AUROC vs MAE on neural-decoding tasks**. The
+mechanism — operating in Fourier space, where the EEG 1/f spectral prior
+is a natural inductive bias and where convolution becomes pointwise
+multiplication — is fundamentally different from any attention or
+recurrence model, and has never been used as the *backbone* (as opposed
+to a frontend) in EEG-FM literature. Worth a single cell to test
+whether the +20 % AUROC result transfers to scratch SSL on HBN.
 
 ## Controls
 
@@ -79,6 +91,7 @@ physiologically meaningful scales.
 | B1 Mamba-2       | ✓          | ✓                  |
 | B2 LRU           | ✓          | ✓                  |
 | B3 Hybrid        | ✓          | ✓                  |
+| B4 FGNO          | ✓          | ✓                  |
 
 The matched-noise twin doubles as a check that long-range modelling capacity
 isn't being credited where it shouldn't: if a backbone improves on EEG and
@@ -133,10 +146,21 @@ Two additional backbone-specific criteria:
 | B1 Mamba-2 | Strict win on long-sequence sanity; tied or weak win on HBN 6-task BAC at 1k | EEGM2 result (better at long seq); selectivity helps low-SNR. |
 | B2 LRU | Best on phase-locking-value eval (the structural advantage); weak loss on HBN 6-task BAC | Phase tracking comes at the cost of no input selectivity for noise gating. |
 | B3 Hybrid | Marginal weak win over B1 on HBN 6-task BAC; same long-sequence performance as B1 | Local attention adds short-range precision; cost is implementation complexity. |
+| B4 FGNO | **strict win on neural-decoding tasks (THINGS-EEG2 image-class top-1, Sleep-EDF 5-class)**; tied or weak loss on HBN 6-task BAC; best on noise-robustness | Frequency-space operators carry the 1/f spectral inductive bias for free; FGNO's published +20 % AUROC vs MAE on neural decoding is the strongest evidence for this whole experiment. May lose on HBN 6-task because the task labels are coarse-grained (which task you're doing) rather than fine spectral content. |
 
-The honest expected outcome: **B1 Mamba-2 wins**, with B2 LRU being
-explicitly preserved as an alternative if exp07 (phase handling) reveals
-that explicit phase loss can't compensate for B1's real-valued state.
+The honest expected outcome: **B1 Mamba-2 wins on HBN 6-task BAC**, with
+B2 LRU being explicitly preserved as an alternative if exp07 (phase
+handling) reveals that explicit phase loss can't compensate for B1's
+real-valued state, and **B4 FGNO winning on neural-decoding-style
+benchmarks** (THINGS-EEG2 retrieval, Sleep-EDF). The decision then
+depends on whether the headline run targets the HBN-6-task-style
+deployments or the neural-decoding-style deployments. **If B4 strict-
+wins on HBN 6-task too** (the contrarian-but-not-implausible outcome
+given the +20 % AUROC published number), the entire backbone choice for
+the headline run shifts to FGNO and exp14 (context length) is re-run
+with FGNO instead of Mamba-2 (FFT-based operators have different
+length-scaling properties — O(N log N) instead of O(N), with no state
+to manage).
 
 ## Implementation pointers
 
@@ -155,7 +179,17 @@ that explicit phase loss can't compensate for B1's real-valued state.
   to log-spaced EEG bands as described above.
 - B3 Hybrid: stack 5 × B1 blocks then 1 × B0 block with local windowed
   attention (window=512). Zamba-2 paper has the exact recipe.
-- ScaledAdam: implementation in `[lhotse-speech/icefall](https://github.com/lhotse-speech/icefall)` —
+- B4 FGNO (added 2026-05-03): each block is `IFFT( W ⊙ FFT(x) ) + bias`
+  where `W` is a learned low-rank multiplicative kernel in frequency
+  space (rank `k=32` per the FGNO paper §3). For our single-channel iid
+  setup, the FFT is 1D over the time dimension; for the 250-token
+  pretraining window, the FFT is small and fast. Frequency-cutoff
+  hyperparameter (the "modes" parameter): keep the first 32 frequencies
+  per the FNO default; ablate {16, 32, 64} in a separate sub-sweep if
+  B4 strict-wins. References:
+  [FNO (Li et al. ICLR 2021, arXiv 2010.08895)](https://arxiv.org/abs/2010.08895),
+  [FGNO (NeurIPS 2025 workshop, arXiv 2602.12267)](https://arxiv.org/abs/2602.12267).
+- ScaledAdam: implementation in [`lhotse-speech/icefall`](https://github.com/lhotse-speech/icefall) —
   port the optimizer file. Marginal but free win.
 
 ## Output

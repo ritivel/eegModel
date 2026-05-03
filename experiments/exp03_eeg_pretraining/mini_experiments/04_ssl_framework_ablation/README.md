@@ -1,17 +1,42 @@
 # exp03 / mini-experiment 04 — SSL framework ablation
 
-> **Status:** planned
+> **Status:** planned (clarified 2026-05-03 — see scope-vs-exp17 note below)
 >
 > **Cross-reference:** [`methodology.md` §6.4](../../methodology.md#64-pretraining-objectives--what-works-and-what-doesnt),
 > [`brain/eeg-research.md` §6.4](../../../../../brain/eeg-research.md#64-pretraining-objectives--what-works-and-what-doesnt),
 > [DeeperBrain (Wang et al., arXiv 2601.06134)](https://arxiv.org/abs/2601.06134)
-> §III-G + Table IV; the dedicated NSP ablation is [exp16](../16_nsp_auxiliary_head/).
+> §III-G + Table IV; the dedicated NSP ablation is [exp16](../16_nsp_auxiliary_head/);
+> the **prerequisite generative-paradigm gate is [exp17](../17_generative_paradigm/)**.
 >
 > **Compute budget:** 30 H100-hours (5 framework variants + 1 added MER+NSP
 > variant × 2 control columns × 3 seeds = 30 cells × 60 min average —
 > frameworks differ substantially in per-step cost; diffusion is most expensive)
 >
 > **Gates:** experiments 06, 07, 08, 09, 10, 11, 12, 16
+
+> **2026-05-03 scope clarification — relationship to exp17.** Before this
+> design refresh, exp04 implicitly assumed that **MAE is the right
+> generative paradigm** for our Mamba-2 backbone, and proceeded to ablate
+> *which flavour of MAE-or-related-objective* (denoised MAE, VICReg
+> joint-embedding, TF-C, EEGDM diffusion, MER+NSP) is best. The deep-
+> research refresh introduced [exp17 generative paradigm](../17_generative_paradigm/),
+> which directly tests whether MAE itself is the right paradigm at all
+> against scan-aligned causal AR and bidirectional masked AR with a
+> diffusion head (the MAR design). **exp17 is now a hard gate before
+> exp04**: if exp17 chooses anything other than MAE, every cell of
+> exp04 must be re-anchored to the new paradigm. Specifically:
+>
+> - If exp17 picks **G1 AR-causal**, then S0 (raw target) becomes "AR with
+>   raw next-token target", S1 (denoised target) becomes "AR with
+>   denoised next-token target", S2 (VICReg) becomes "joint-embedding
+>   head added to AR encoder", S4 (EEGDM) becomes "AR + diffusion head"
+>   (which collapses into G2 from exp17), and S5 (MER+NSP) becomes "AR
+>   + NSP auxiliary head".
+> - If exp17 picks **G2 MAR**, the MAR diffusion head replaces the MAE
+>   reconstruction decoder in S0/S1, and the rest of the framework
+>   alternatives are tested as additions on top of that backbone.
+> - If exp17 picks **G0 MAE**, exp04 runs as originally designed, and
+>   the design refresh has only confirmed the §4.2 default.
 
 ## Question
 

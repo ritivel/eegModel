@@ -170,11 +170,19 @@ mini-experiment's "is my eval delta vs the floor real" question.
 
 - The trustworthy training + eval pipeline.
 - The random-init linear-probe floor numbers.
-- The fixed feature-extraction layer (last encoder layer, mean-pooled over
-time, with no projection head) used for downstream linear probe in every
-later experiment.
+- The fixed feature-extraction layer (last encoder layer, **mean-pooled
+  over time, with no projection head**) used for downstream linear probe
+  in every later experiment. **Reaffirmed 2026-05-03 from the Vision-MAE
+  deep-research subagent**: the audio-SSL probing study
+  ([arXiv 2509.24901](https://arxiv.org/abs/2509.24901)) shows that
+  CLS-token probing severely underestimates representation quality for
+  tasks with localized events — by up to 63 % of the fine-tune gap.
+  HBN's CBCL-factor regression (A.1a/b/c) and 6-task classification
+  involve diffuse multi-region temporal content; mean-pool is the
+  correct default. **Do not switch to CLS-token probing** even if a
+  later experiment proposes it.
 - A small library of "known-good" sanity checks that re-run on every
-pipeline change (added to CI).
+  pipeline change (added to CI).
 
 ## Risks and mitigations
 

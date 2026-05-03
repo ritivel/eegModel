@@ -186,6 +186,20 @@ windows, C0 / C1 may be sufficient.
   not reimplement segsum. Set `chunk_size=2048` for sequences > 16 k
   samples (per the
   [Mamba-2 reference issue 256](https://github.com/state-spaces/mamba/issues/256)).
+- **2-stage context-extension recipe (added 2026-05-03 from the
+  TS-+-Mamba research subagent)**: per [Evo (Nguyen et al. 2024)](https://www.science.org/doi/10.1126/science.ado9336)
+  — the open-source genomic Mamba-FM that achieves 1M-token context —
+  the cleanest recipe for extending pretrained context length is a
+  *two-stage* schedule rather than a single training run. Stage 1:
+  pretrain at the short window (4 s) for 80 % of the total token
+  budget. Stage 2: continue pretraining at the long window (8 s, 16 s,
+  or 30 s, depending on the cell) for the remaining 20 %, with
+  reduced LR (0.5× the Stage-1 final LR) and warmup over the first 5 %
+  of Stage 2. This avoids the *long-context catastrophic forgetting*
+  that single-stage long-context training is prone to (Evo §S5;
+  consistent with the Llama 3 long-context schedule). The two-stage
+  recipe is applied to all C1/C2/C3 cells; C0 (4 s) trains in a single
+  stage as before.
 - Transformer long-context: use FlashAttention-2 via
   `torch.nn.functional.scaled_dot_product_attention`. Expect OOM at C3
   with batch ≥ 4 on a single H100; this is the cliff the experiment is

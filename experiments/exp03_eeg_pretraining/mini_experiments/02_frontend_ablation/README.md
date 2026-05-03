@@ -53,14 +53,30 @@ Each variant is a function `R^T → R^{T' × D}` where `T` is the raw
 sample count, `T'` is the token count, and `D = 256` is fixed (the
 backbone's expected input width).
 
-| Code | Variant | Parameters | Phase preserving | Multi-rate native | Noise-robust theorem |
-| ---- | ------- | ---------- | ---------------- | ----------------- | -------------------- |
-| F0 | Vanilla strided conv (3-layer, kernels (7,7,7), strides (2,2,2), GeLU, no BlurPool) | ~50k | ✗ | ✗ | none |
-| F0-prep | F0 fed *preprocessed* input (60 Hz notch + 0.5–100 Hz Butterworth bandpass + 500→250 Hz polyphase resample applied per recording before iid expansion). **Literature-comparability cell only**, NOT a winner-picker candidate. | ~50k | ✗ | ✗ | none |
-| F1 | F0 + Snake activations + BlurPool before every stride | ~50k | partial | ✗ | shift-invariant via BlurPool |
-| F2 | SincNet (80 filters, Hz-parameterised cutoffs) → linear projection to D | ~160 + small projection | partial (real sinc) | ✓ (cutoffs in Hz) | 1-Lipschitz (bandpass is bounded) |
-| F3 | Frozen Kymatio Scattering1D (J=6, Q=8) → linear projection to D | 0 + small projection | partial (modulus) | ✓ (wavelets are scale-natural) | provably 1-Lipschitz to deformations |
-| F4 | Complex Gabor filterbank (40 filters, log-spaced 0.5–80 Hz) → real+imag concat → linear projection | ~80 + small projection | ✓ (complex-valued) | ✓ (Hz-spaced) | bandpass + small spectrum |
+> **2026-05-03 priority update from the deep-research design refresh.**
+> The Speech and Signal-Processing subagents independently surfaced 5+
+> EEG-specific papers each providing strong empirical evidence for **F2
+> SincNet** (BCIC-IV-2a, Sleep-EDF, motor imagery, deep-EEG-decoding
+> survey, NIPS-MI 2024) and for **F4 LEAF/GREEN-style learnable
+> filterbanks** (LEAF Zeghidour 2018, GREEN Spicher 2025, complex Gabor
+> for biosignal classification). Both should be considered **high-
+> priority cells** rather than coequal alternatives to F0/F1 — if any
+> single non-baseline variant strict-wins, F2 and F4 are the likely
+> candidates. F1 has been **revised** for this refresh: the original F1
+> was "F0 + Snake + BlurPool", but the Signal-Processing subagent's
+> finding that Snake activations empirically default to near-linear
+> (and the corresponding decision in exp12 to drop Snake) leaves F1 as
+> "F0 + BlurPool only". The BlurPool component itself carries a
+> high-γ-attenuation caveat — see exp12 for the flag.
+
+| Code | Variant | Parameters | Phase preserving | Multi-rate native | Noise-robust theorem | EEG-specific evidence |
+| ---- | ------- | ---------- | ---------------- | ----------------- | -------------------- | ---------------------- |
+| F0 | Vanilla strided conv (3-layer, kernels (7,7,7), strides (2,2,2), GeLU, no BlurPool) | ~50k | ✗ | ✗ | none | the field default |
+| F0-prep | F0 fed *preprocessed* input (60 Hz notch + 0.5–100 Hz Butterworth bandpass + 500→250 Hz polyphase resample applied per recording before iid expansion). **Literature-comparability cell only**, NOT a winner-picker candidate. | ~50k | ✗ | ✗ | none | how BENDR/LaBraM/CBraMod measured their numbers |
+| F1 | F0 + BlurPool before every stride **(Snake activations removed 2026-05-03 — see exp12)** | ~50k | ✗ | ✗ | shift-invariant via BlurPool | BlurPool: limited (Zhang ICML 2019 was vision); flag for high-γ attenuation |
+| F2 | **★** SincNet (80 filters, Hz-parameterised cutoffs) → linear projection to D | ~160 + small projection | partial (real sinc) | ✓ (cutoffs in Hz) | 1-Lipschitz (bandpass is bounded) | **strong** — 5+ EEG papers (Ravanelli 2018; SincNet-EEG 2020; sleep-staging Engemann 2024; motor-imagery Schirrmeister; deep-EEG-decoding survey 2025) |
+| F3 | Frozen Kymatio Scattering1D (J=6, Q=8) → linear projection to D | 0 + small projection | partial (modulus) | ✓ (wavelets are scale-natural) | provably 1-Lipschitz to deformations | moderate — Andén-Mallat 2014 audio; few direct EEG demos |
+| F4 | **★** Complex Gabor / LEAF-style learnable filterbank (40 filters, log-spaced 0.5–80 Hz) → real+imag concat → linear projection | ~80 + small projection | ✓ (complex-valued) | ✓ (Hz-spaced) | bandpass + small spectrum | **strong** — LEAF (Zeghidour 2018), GREEN (Spicher 2025), complex Gabor for biosignals 2024 |
 
 **Why F0-prep exists.** F0 (vanilla CNN) cannot learn to remove line noise
 or perform a bandpass — those are explicit operations that strided convs
@@ -135,15 +151,15 @@ phase-locking-value reconstruction test on a held-out segment) shows V is
 worse than F0 by > 10 %, V is disqualified from carrying forward unless we
 add a phase loss in exp07 that recovers it.
 
-## Pre-registered predictions
+## Pre-registered predictions (revised 2026-05-03)
 
 | Variant | Prediction | Reasoning |
 | ------- | ---------- | --------- |
 | F0 vanilla | The floor. HBN ADHD-binary AUROC ~70 %, HBN 6-task BAC ~30 % (random = 16.7 %). | Comparable to LaBraM-Base level on equivalent compute, normalised for the 6-task vs TUEV symmetry. |
-| F1 (+ Snake + BlurPool) | Weak win on both, ~+1 pp on HBN 6-task BAC | Snake adds a periodic prior matching EEG oscillations; BlurPool prevents aliasing. Both should be free wins. |
-| F2 (SincNet) | Strict win on HBN 6-task BAC, ~+2–3 pp; tied on HBN ADHD-binary | Bandpass priors should help on the multi-class 6-task more than the binary diagnosis label. |
+| F1 (+ BlurPool only, Snake removed) | Tied or weak win, ~+0.3 pp on HBN 6-task BAC; **possible weak loss on high-γ-sensitive eval** | BlurPool prevents aliasing — a free win in vision but the EEG-specific flag is that the low-pass kernel can attenuate genuine high-γ neural content. Without Snake, F1 is essentially a weaker version of F0. |
+| F2 (★ SincNet) | **Strict win on HBN 6-task BAC, ~+2–3 pp; tied on HBN attention regression** | Bandpass priors should help on the multi-class 6-task more than the continuous regression. EEG-specific evidence is strong (5+ papers). |
 | F3 (frozen scattering) | Strict win on noise robustness (the matched-noise twin shows no improvement), ~+1–2 pp on HBN 6-task BAC | Lipschitz stability bounds the gradient contribution of artifacts. |
-| F4 (complex Gabor) | Best on the phase-locking-value eval; competitive but not top on HBN 6-task BAC | Phase preservation comes at the cost of doubling the channel count (real+imag). |
+| F4 (★ Complex Gabor / LEAF) | **Best on the phase-locking-value eval; strict win on HBN 6-task BAC, ~+2 pp** (revised upward from original "competitive but not top" given LEAF/GREEN evidence) | Phase preservation comes at the cost of doubling the channel count (real+imag), but complex-valued representations carry phase explicitly — increasingly load-bearing as exp07's phase-handling work confirms phase content matters. |
 
 If F2 and F3 both strict-win independently, exp02 carries forward
 **F2 + F3 hybrid** (SincNet → frozen scattering on top → linear projection)

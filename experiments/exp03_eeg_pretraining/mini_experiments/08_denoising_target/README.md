@@ -74,9 +74,21 @@ reconstruction to the denoised target.
 | T3 | PCA top-8 projection per 4-second window | retain top-8 PCs by variance, project back | moderate — keeps the dominant temporal patterns, drops low-variance noise | yes (PCA over time windows within a single channel) |
 | T4 | Wavelet denoising (Daubechies-4, SURE-shrink, soft threshold) | per-channel wavelet | moderate — removes high-frequency noise spikes | yes |
 | T5 | IC-U-Net cleaning (the EEG-X recipe) | pretrained IC-U-Net from [SCCN](https://github.com/sccn/IC-U-Net) | high — neural denoiser trained for EEG | requires multi-channel input to IC-U-Net |
+| T6 | **Wiener filter** (added 2026-05-03) — classical MMSE-optimal linear filter; estimate noise PSD from the signal's high-frequency tail (>100 Hz, where neural content is minimal), construct Wiener gain `G(f) = S(f) / (S(f) + N(f))`, apply per-channel | optimal linear MMSE estimator (Wiener 1949) | moderate — adapts per-recording without learned components | yes |
 
 T0 (raw target) is the explicit failure baseline — it's the same as exp04
 S0 and is included so the magnitude of the gain over T0 can be measured.
+
+**T6 added 2026-05-03 from the Signal-Processing subagent's finding.**
+The Wiener filter is the **provably optimal linear MMSE estimator** for
+recovering signal from additive noise — a foundational result from 1949
+that remains the strongest classical guarantee. Its application as a
+denoised target was **never tested in EEG SSL literature** despite
+being theoretically clean; the [NeurIPS 2025 "Ditch the Denoiser" paper](https://arxiv.org/abs/2509.06414)
+provides empirical validation that learned denoisers often fail to
+beat well-configured Wiener filters on biomedical signals. T6 is the
+"EEG-specific MMSE-optimal" cell that bridges classical signal
+processing and ML denoising.
 
 ## Controls
 
@@ -88,6 +100,7 @@ S0 and is included so the magnitude of the gain over T0 can be measured.
 | T3 PCA top-8                   | ✓          | ✓                  |
 | T4 wavelet denoising           | ✓          | ✓                  |
 | T5 IC-U-Net cleaning           | ✓          | ✓                  |
+| T6 Wiener filter               | ✓          | ✓                  |
 
 The matched-noise twin sanity here is unusual: you have to define what
 "denoising Gaussian noise" means. The convention: apply the same denoising
@@ -144,6 +157,7 @@ Two target-specific criteria:
 | T3 PCA top-8 | weak win, ~+0.5–1 pp; the cheapest single-channel-friendly method |
 | T4 wavelet denoising | weak win, ~+1 pp; comparable to bandpass |
 | T5 IC-U-Net cleaning | strict win, ~+2–4 pp on HBN 6-task BAC; but adds external dependency on a pretrained model (which the user said no two-stage — so this is a soft violation) |
+| T6 Wiener filter | **strict win, ~+1.5–3 pp on HBN 6-task BAC**; especially strong on noise-twin (Wiener is provably MMSE-optimal so the noise-twin should be tightest here) | The MMSE-optimality argument plus the [NeurIPS 2025 "Ditch the Denoiser"](https://arxiv.org/abs/2509.06414) finding that learned denoisers often fail to beat well-configured Wiener filters on biomedical signals. Costs nothing (per-channel filter, no learned model, deterministic). |
 
 The honest expected outcome: **T2 ICA cleaning wins on absolute metric, T1
 bandpass wins on practicality** (no per-recording configuration, no
@@ -176,6 +190,14 @@ which simplifies the headline run.
 - IC-U-Net: pretrained weights from
   [`sccn/IC-U-Net`](https://github.com/sccn/IC-U-Net) repo. Apply per
   recording on multi-channel data, then iid-expand.
+- Wiener filter (T6): per-channel, per-recording. Estimate noise PSD
+  from the high-frequency tail of the signal (`f > 100 Hz`, where
+  cortical content drops to baseline electrode noise). Construct
+  Wiener gain `G(f) = S(f) / (S(f) + N(f))` over the full spectrum.
+  Apply via FFT → multiply → IFFT. One-time per recording; cache the
+  result. Reference: classical signal processing texts (Oppenheim &
+  Schafer); empirical validation of "Wiener beats learned denoisers
+  on biomedical signals" in [arXiv 2509.06414 (NeurIPS 2025)](https://arxiv.org/abs/2509.06414).
 
 All cleaning is done **once**, offline, and the cleaned signals stored as
 side-streams in the dataset. This adds a few hours of CPU time upfront

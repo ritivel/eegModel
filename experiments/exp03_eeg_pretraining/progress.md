@@ -3,7 +3,145 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-03 ~09:34 IST / 04:04 UTC
+> **Last refreshed:** 2026-05-03 ~17:30 IST / 12:00 UTC
+
+---
+
+## 2026-05-03T12:00 UTC (17:30 IST) — Deep-research design refresh: 4 new mini-experiments, 8 modified
+
+**TL;DR.** Spawned 5 parallel web-research subagents (Speech SSL, Vision MAE/JEPA,
+Time-series + Mamba SSL, Classical signal-processing priors, Diffusion/AR/codec
+SSL) using Exa + Parallel AI + Composio Scholar (Consensus substitute) MCPs.
+Each subagent ran 8+ queries across the three providers and produced a markdown
+report with proposed mini-experiments and modifications. Synthesized into:
+
+- **4 new mini-experiments**:
+  - **exp17 — Generative paradigm for the Mamba backbone** (MAE vs scan-aligned
+    causal AR vs MAR with diffusion head). Triggered by MAP CVPR 2025 finding
+    that MAE is structurally suboptimal for Mamba; **gates everything downstream
+    of exp03** because our §4.2 default is exactly Mamba+MAE.
+  - **exp18 — Reconstruction target** (raw / per-token-normalised raw / latent
+    EMA-target / BioCodec RVQ tokens / HuBERT-iterative-k-means / sparsity-
+    regularised raw). The single biggest lever per cross-modal SSL evidence;
+    BioCodec is open-source and pretrained on TUH-EEG so its RVQ tokens are
+    usable as targets without training a new codec.
+  - **exp19 — Decoder design** (depth {1, 2, 4, 8} × type {Mamba-2, Transformer,
+    U-Net SAMBA-style}). MAE 2022 found 1≈8 layers for vision linear probe;
+    VideoMAE inverts; bioFAME inverts again — biosignal-specific verdict
+    unknown.
+  - **exp20 — Position embedding** (none / sinusoidal / learned absolute /
+    RoPE / REVE-style 4D Fourier). REVE NeurIPS 2025 reports their Fourier-4D
+    dominates learned/MLP alternatives on 10 EEG benchmarks; never tested in
+    other EEG-FMs.
+
+- **8 existing mini-experiments modified**:
+  - **exp01**: reaffirmed mean-pool (vs CLS) as the default linear-probe
+    representation, citing the audio-SSL probing study finding.
+  - **exp02**: bumped F2 SincNet and F4 LEAF/GREEN (complex Gabor) to
+    ★ high-priority cells based on 5+ EEG-specific papers each. F1 revised
+    to "F0 + BlurPool only" (Snake activations removed; see exp12).
+  - **exp03**: added **B4 FGNO** (Fourier-space Graph Neural Operator) cell
+    based on NeurIPS 2025 +20 % AUROC vs MAE on neural decoding result.
+  - **exp04**: clarified scope vs new exp17 — the framework comparison must
+    be re-anchored to the exp17-winner generative paradigm (G0 MAE / G1 AR /
+    G2 MAR), not assumed to be MAE-baseline.
+  - **exp05**: added Phase B disambiguation (M5, M6) to separate the
+    "auxiliary multi-scale loss" axis from the "multi-rate frontend
+    branches" axis — the MR-HuBERT re-analysis suggests the gain is from
+    auxiliary loss, not multi-rate.
+  - **exp08**: added T6 (Wiener filter MMSE-optimal cell) based on classical
+    signal processing + NeurIPS 2025 "Ditch the Denoiser" empirical finding.
+  - **exp10**: rewritten as a 4 × 4 strategy × ratio matrix (16 cells with
+    screening + confirmation protocol). Adds wav2vec span masking, drops
+    SSP (redundant with multi-block), tests mask ratios 50/65/75/85%.
+  - **exp12**: dropped W1 Snake activations (empirically defaults to linear
+    per 2022 follow-up). Added high-γ-attenuation diagnostic to W2 BlurPool.
+  - **exp14**: added Evo-style 2-stage context-extension recipe (80 % at
+    short window, 20 % at long window with reduced LR + warmup).
+
+- **Master spec `mini_experiments.md` updated**: §2 list expanded from 16 to
+  20 rows, §3 dependency graph redrawn with new gates and parallels, headline
+  block updated with the design-refresh notes. Total compute budget rose from
+  ~264 H100-hours to ~314 H100-hours (~19 % increase).
+
+**Why this matters.** The single most consequential finding from the research
+is **MAP (Liu & Yi, CVPR 2025, arXiv 2410.00871)**: MAE is the wrong
+generative paradigm for a Mamba backbone. Their Table 2 ablation shows
+AR for Mamba gets +1.4 pp over scratch supervised; MAE for Mamba gets +0.2 pp.
+The §4.2 default — bidirectional Mamba-2 + MAE — is structurally mispaired.
+**Every mini-experiment in this folder anchored on the MAE baseline could be
+running on a baseline that the literature predicts is the wrong baseline.**
+exp17 must complete before exp04 — and possibly before any other experiment —
+so the mini-experiment chain re-anchors on the correct paradigm before
+spending 250+ H100-hours on ablations measured against the wrong baseline.
+
+**Other notable findings:**
+
+- **Mask ratio is contested at 50 % vs 60 % vs 75 % vs 85 %** in EEG-FM
+  literature; ST-EEGFormer (2025 NeurIPS EEG Challenge winner) used 75 %,
+  consistent with the high-redundancy prediction from VideoMAE that 85–90 %
+  may be optimal for EEG at 500 Hz.
+- **Span / multi-block masking universally beats random patch** for
+  correlated 1D signals (speech wav2vec finding, vision I-JEPA finding,
+  TS SAMBA finding all converge).
+- **Latent-space targets (I-JEPA, EEG2Rep) and codec-token targets (LaBraM,
+  BioCodec) outperform raw-signal targets** by 5–10 pp linear-probe across
+  modalities. exp18 directly tests this.
+- **Snake activations empirically default to near-linear** per the 2022
+  follow-up; dropped from exp12. If we want periodic inductive bias,
+  SIREN-style sine activations or DONN are the right alternatives —
+  deferred to a future architecture-only mini-experiment.
+- **BlurPool may attenuate high-γ neural content** (30–100 Hz, where motor
+  imagery and gamma-attention modulation live); exp12 W2 now has a
+  high-γ-retention diagnostic that disqualifies the cell if retention drops
+  below 90 %.
+
+**No code or compute was spent on this refresh** — pure design-doc work using
+~30 minutes of subagent web research. The 50 H100-hour added compute budget
+gets spent only when the affected mini-experiments actually run; if exp17 picks
+G0 MAE, the entire exp04 / exp10 / exp18 / exp19 chain runs roughly as
+originally specified and the design refresh has only added 4 new experiments
++ surfaced findings rather than invalidating prior work.
+
+**Files changed:**
+
+```
+experiments/exp03_eeg_pretraining/
+├── mini_experiments.md                           ← updated §2 list, §3 dep graph
+├── progress.md                                   ← THIS ENTRY
+└── mini_experiments/
+    ├── 01_sanity_baselines/README.md             ← reaffirmed mean-pool default
+    ├── 02_frontend_ablation/README.md            ← ★ priority bumped: F2, F4
+    ├── 03_backbone_ablation/README.md            ← added B4 FGNO cell
+    ├── 04_ssl_framework_ablation/README.md       ← clarified scope vs exp17
+    ├── 05_multirate_strategy/README.md           ← added Phase B aux-loss axis
+    ├── 08_denoising_target/README.md             ← added T6 Wiener cell
+    ├── 10_masking_strategy/README.md             ← rewrote as 4×4 strategy×ratio
+    ├── 12_quick_wins_consolidation/README.md     ← dropped Snake (W1); BlurPool flag
+    ├── 14_context_length_scaling/README.md       ← added Evo 2-stage recipe
+    ├── 17_generative_paradigm/README.md          ← NEW (10 H100-h)
+    ├── 18_reconstruction_target/README.md        ← NEW (14 H100-h)
+    ├── 19_decoder_design/README.md               ← NEW (12 H100-h)
+    └── 20_position_embedding/README.md           ← NEW (6 H100-h)
+```
+
+**Next code-writing task** (unchanged from yesterday's plan but now informed
+by the design refresh): scaffold `src/exp03/{model,train,eval,sanity}.py`
+for mini-experiment 01. The exp17 finding does not change exp01's scope —
+mini-exp 01 is infrastructure validation, paradigm-agnostic. The G0 MAE
+default is fine for the sanity baselines; if exp17 later picks a different
+paradigm, mini-exp 01 doesn't need to be re-run (the trainer + eval pipeline
+is generic). If we want to be belt-and-braces, we can add a one-cell sanity
+check for the exp17 candidates (G1 AR overfit-one-batch, G2 MAR
+loss-at-init); rough cost +30 min, deferred decision.
+
+**Mini-experiment renderable explainer** (`mini_experiments_explainer.typ` →
+`mini_experiments_explainer.pdf`): the typst source has not been updated for
+the 2026-05-03 refresh — re-rendering would require touching the 80 KB typst
+file and re-running `typst compile`. **Deferred** until the broader human-
+readable narrative is rewritten in a follow-up session; the markdown sources
+(`mini_experiments.md` + per-experiment READMEs) are the canonical reference
+in the meantime.
 
 ---
 

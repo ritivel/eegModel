@@ -9,6 +9,31 @@
 > is the *why* (Phase 0–4 framework, eval discipline, monitoring); this file and
 > its child folders are the *what to actually run*.
 >
+> Last refreshed: **2026-05-03** — deep-research design refresh from five
+> parallel adjacent-field literature reviews (Speech SSL, Vision MAE/JEPA,
+> Time-series + Mamba SSL, Classical signal-processing priors, Diffusion/AR/codec
+> alternatives). Headline findings: (1) **MAP (CVPR 2025)** shows MAE is
+> structurally suboptimal for Mamba backbones — autoregressive or
+> bidirectional-masked-AR with diffusion head wins. Our §4.2 default is
+> Mamba-2 + MAE, exactly the failing combination. (2) **Span / block / multi-block
+> masking dominates random patch masking** for correlated 1D signals (speech,
+> vision, time-series all converge). (3) **Predicting in latent / codec-token
+> space outperforms raw-signal targets** by 5–10 pp linear-probe in vision and
+> EEG (I-JEPA, EEG2Rep, MAGE). (4) **HBN-EEG mask ratio is a contested axis** —
+> 50%, 60%, 75%, 85% are all defended by different papers. (5) **Snake
+> activations** empirically default to near-linear and are removed from exp12.
+> (6) **BioCodec** is open-source and pretrained on TUH-EEG — its RVQ tokens
+> are usable as prediction targets without training a new codec. Added
+> experiments **17 (generative paradigm: MAE / AR / MAR for Mamba)**,
+> **18 (reconstruction target: raw / latent / codec-RVQ / sparsity-regularised)**,
+> **19 (decoder design: depth × type)**, **20 (position embedding: sin / RoPE /
+> NoPE / Fourier-4D)**. Modified experiments **02 (bumped SincNet/LEAF
+> priority), 03 (added FGNO cell), 04 (clarified scope vs exp17), 05 (split
+> auxiliary-loss vs multi-rate-frontend axes), 08 (added Wiener-filtered cell),
+> 10 (rewrote as ratio × strategy matrix), 12 (dropped Snake; flagged BlurPool),
+> 14 (adopted Evo 2-stage context recipe)**. Total compute budget rose from
+> ~264 H100-hours to ~314 H100-hours (~19% increase, still under one node-week).
+>
 > Last refreshed: **2026-05-02** — switched the pretraining corpus from TUEG
 > to **HBN-EEG** (open access, on AWS public storage, larger iid yield from a
 > 128-ch montage), and the primary frozen-probing eval from TUAB+TUEV to
@@ -103,12 +128,18 @@ predecessors are complete (because its winners are inputs).
 | 14  | `[14_context_length_scaling/](./mini_experiments/14_context_length_scaling/)`             | Does the long-context capability that justifies Mamba-2 over Transformer translate into better representations? At which window length (4 s / 8 s / 16 s / 30 s)?    | needs 02 + 03 winners      | 24                   |
 | 15  | `[15_loss_weight_curriculum/](./mini_experiments/15_loss_weight_curriculum/)`             | Are the hypothesis loss weights robust to ± 2× perturbation, and does the proposed three-stage curriculum materially improve over training the full loss from step 0? | needs 06 + 07 + 11 + 13 winners | 24              |
 | 16  | `[16_nsp_auxiliary_head/](./mini_experiments/16_nsp_auxiliary_head/)`                     | Does adding a DeeperBrain-style Neurodynamics Statistics Prediction (NSP) auxiliary head — predicting spectral power, CFC, sample entropy directly from the encoder representation — materially improve frozen-probing performance beyond the existing reconstruction-based losses? | needs 12 winner            | 12                   |
+| 17  | `[17_generative_paradigm/](./mini_experiments/17_generative_paradigm/)`                   | Given the §4.2 default of a Mamba-2 backbone, does the bidirectional MAE objective (vanilla pixel reconstruction at masked positions) actually beat scan-aligned causal autoregression (AR) or bidirectional-masked autoregression with a diffusion head (MAR) — the configurations that MAP CVPR 2025 reports are the right pairing for Mamba? **This must run before exp04**: if MAE loses to AR/MAR, then exp04 (SSL framework comparison) must be re-anchored. | gate for everything downstream of exp03 | 10                |
+| 18  | `[18_reconstruction_target/](./mini_experiments/18_reconstruction_target/)`               | Holding the generative paradigm and architecture fixed, what does the model predict at masked positions: raw signal (the §4.2 default), per-token-normalised raw (MAE-style), latent representations from an EMA-target encoder (I-JEPA / EEG2Rep), discrete codec-RVQ tokens from BioCodec (pretrained on TUH-EEG), HuBERT-style iterative-k-means cluster IDs, or a sparsity-regularised raw target? | needs 17 winner            | 14                   |
+| 19  | `[19_decoder_design/](./mini_experiments/19_decoder_design/)`                             | What decoder depth × type gives the best frozen-probe representation in our recipe? Vision MAE found 1-layer ≈ 8-layer for fine-tuning but a 7.9 pp gap for linear probe; VideoMAE inverts the finding for high-redundancy data; bioFAME (biosignals) inverts again. The right answer for HBN-EEG is unknown. | needs 17 + 18 winners      | 12                   |
+| 20  | `[20_position_embedding/](./mini_experiments/20_position_embedding/)`                     | For the chosen backbone (likely bidirectional Mamba-2 — which is technically position-implicit through its scan), which positional encoding scheme — sinusoidal absolute, learned absolute, RoPE, NoPE (none at all), or REVE-style 4D Fourier — gives the best representation? REVE's Fourier-4D ablation reports it dominates learned and MLP-based alternatives on 10 EEG benchmarks. | needs 02 + 03 winners      | 6                    |
 
 
-**Total compute budget**: ≈ 264 H100-hours (12 added by experiment 16 plus
-6 added by the new MER+NSP variant in experiment 04), comfortably under
-~1.5 weeks on a single 8×H100 node. This is the ablation tier of the
-methodology's compute heuristic (`[methodology.md` §1](./methodology.md#1-the-mental-model-pretraining-is-capability-engineering-not-luck)):
+**Total compute budget**: ≈ 314 H100-hours (12 added by experiment 16, 6 by
+the MER+NSP variant in experiment 04, 10 + 14 + 12 + 6 = 42 added by the
+2026-05-03 deep-research refresh in experiments 17–20, ~10 absorbed by
+modifications to existing experiments 02/03/05/08/10/12/14). Comfortably
+under ~2 weeks on a single 8×H100 node. This is the ablation tier of the
+methodology's compute heuristic ([`methodology.md` §1](./methodology.md#1-the-mental-model-pretraining-is-capability-engineering-not-luck)):
 spend roughly the same amount of compute on derisking as on the headline run.
 
 ---
@@ -121,29 +152,45 @@ spend roughly the same amount of compute on derisking as on the headline run.
                                   │
               ┌───────────────────┼────────────────────┐
               ▼                   ▼                    ▼
-        02 frontend         03 backbone        04 SSL framework
+        02 frontend         03 backbone        17 generative paradigm
+        (incl. SincNet      (incl. Mamba-2,    (MAE vs AR vs MAR
+         LEAF priority)      LRU, FGNO cell)    for Mamba — MAP test)
               │                   │                    │
-              └───────┬───────────┘                    │
-                      ▼                                ▼
-                  05 multirate              ┌──────────┼──────────┬──────────┐
-                                            ▼          ▼          ▼          ▼
-                                      06 recon    08 denoised  10 mask  11 bottleneck
-                                         loss       target     strategy   FSQ vs cont
-                                            │          │
-                                            ▼          ▼
-                                      07 phase    09 multi-cond
-                                       handling     input
-                                            │
-                                            ▼
-                                       12 quick wins
-                                        (final stack)
-                                            │
-              ┌──────────────────┬──────────┴──────────────┬───────────────────────┐
-              ▼                  ▼                         ▼                       ▼
-   14 context-length      13 adversarial         16 NSP auxiliary head     15 loss weights + curriculum
-        scaling           dataset probe          (DeeperBrain-style)        (depends on 06+07+11+13)
-   (parallel with         (depends on 12)        (depends on 12)
-   02+03 winners only)
+              └───────┬───────────┴────────────────────┘
+                      │
+                      ▼
+                 04 SSL framework        20 position embedding
+              (denoised-MAE / VICReg /  (sin / RoPE / NoPE /
+               TF-C / EEGDM / NSP) +    Fourier-4D, depends on
+               re-evaluated under         02 + 03)
+               exp17 winner)
+                      │
+              ┌───────┴───────────────┐
+              ▼                       ▼
+        05 multirate          18 reconstruction target
+        (aux-loss vs          (raw / latent / codec-RVQ /
+         multi-rate axes)      HuBERT-cluster, needs 17)
+              │                       │
+              ▼                       ▼
+        ┌─────┼───────────┬──────────┼──────────┬──────────┐
+        ▼     ▼           ▼          ▼          ▼          ▼
+    06 recon  08 denoised  19 decoder  10 mask×ratio  11 bottleneck  09 multi-cond
+       loss     target      design       matrix         FSQ vs cont    input
+        │         │           │          │
+        ▼         ▼           │          │
+    07 phase  09 multi-cond   │          │
+     handling   input         │          │
+        │         │           │          │
+        └────┬────┴───────────┴──────────┘
+             ▼
+        12 quick wins
+        (final stack — Snake DROPPED, BlurPool flagged)
+             │
+   ┌──────────────┬──────────┴──────────────┬───────────────────────┐
+   ▼              ▼                         ▼                       ▼
+14 context    13 adversarial      16 NSP auxiliary       15 loss weights + curriculum
+ (Evo 2-stage   dataset probe       (DeeperBrain-style)    (depends on 06+07+11+13)
+  recipe)       (depends on 12)     (depends on 12)
 ```
 
 The graph is an *advisory* sequence, not a hard dependency. Pairs of
@@ -151,25 +198,40 @@ experiments that don't strictly depend on each other can and should run in
 parallel on a multi-GPU node. The honest hard gates are:
 
 - **01 must finish before any other experiment starts.** A miscalibrated
-trainer or eval suite contaminates every later result.
-- **02, 03, 04 can run in parallel** by holding the other two axes at a
-reasonable default (vanilla strided-conv frontend, Mamba-2 backbone,
-raw-target MAE framework).
-- **05–11 depend on the 02–04 winners** because they extend the chosen
-configuration in one direction at a time.
-- **12 is the final consolidation of the core stack** — it stacks the individual wins from
-every prior experiment and checks that the combination still works.
+  trainer or eval suite contaminates every later result.
+- **02, 03, 17 can run in parallel** by holding the other two axes at a
+  reasonable default (vanilla strided-conv frontend, Mamba-2 backbone,
+  MAE objective). **17 (generative paradigm) is new for the 2026-05-03
+  refresh and is a hard gate before exp04**: MAP (CVPR 2025) reports that
+  vanilla MAE is structurally mispaired with Mamba; if 17 confirms this on
+  EEG, then exp04's framework comparison must be re-anchored on the exp17
+  winner rather than on raw-target MAE.
+- **04 depends on 17** (the generative-paradigm winner becomes the
+  framework backbone for the four ablation cells). 04 + 20 (position
+  embedding) can run in parallel.
+- **05, 18, 19 all depend on 17** (and 04 for 18). **18 (reconstruction
+  target) is new** and must run after 17 because the target choice
+  partially determines whether MAE-style decoder reconstruction is even
+  required (a HuBERT-style cluster-prediction target removes the decoder
+  entirely; a JEPA latent target uses a predictor not a decoder). **19
+  (decoder design) is new** and must run after 17 and 18 because the
+  decoder's role is paradigm- and target-dependent.
+- **06–11 depend on the 02–04+17 winners** because they extend the chosen
+  configuration in one direction at a time.
+- **12 is the final consolidation of the core stack** — it stacks the
+  individual wins from every prior experiment and checks that the
+  combination still works.
 - **13–16 are post-12 hardening experiments**. 13 (adversarial probe)
-asks whether the cheapest defence against P6 from the cortico-ssl-hypothesis
-actually pays off; 14 (context-length) asks whether the long-context
-argument for Mamba-2 over Transformer is empirically supported; 15
-(loss weights + curriculum) asks whether the hypothesis recipe
-weights and the three-stage curriculum schedule are robust;
-16 (NSP auxiliary head, added on the basis of DeeperBrain) asks whether
-a "predict the dynamical statistic from the encoder representation"
-auxiliary head materially improves frozen-probing performance. 14 can
-run in parallel with 02+03+04+05 if a Mamba-2 baseline is already
-trusted; 13, 15, and 16 must wait for 12.
+  asks whether the cheapest defence against P6 from the cortico-ssl-hypothesis
+  actually pays off; 14 (context-length) asks whether the long-context
+  argument for Mamba-2 over Transformer is empirically supported; 15
+  (loss weights + curriculum) asks whether the hypothesis recipe
+  weights and the three-stage curriculum schedule are robust;
+  16 (NSP auxiliary head, added on the basis of DeeperBrain) asks whether
+  a "predict the dynamical statistic from the encoder representation"
+  auxiliary head materially improves frozen-probing performance. 14 can
+  run in parallel with 02+03+04+05+17+18 if a Mamba-2 baseline is already
+  trusted; 13, 15, and 16 must wait for 12.
 
 ---
 
