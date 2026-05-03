@@ -153,12 +153,19 @@ def extract_features(
         table_slice = table.slice(0, n_take)
 
         # Stack signals into (n_take, T) float32. The signal column is
-        # list<float16>; pyarrow exposes a flat backing buffer so we can
-        # bulk-convert in O(n_take * T) without per-row Python overhead.
+        # list<float16>; we bypass to_pylist (which Python-iterates and is
+        # ~50x slower than the underlying buffer access) and instead grab
+        # the flat backing buffer directly from the ListArray, then reshape.
         sig_col = table_slice.column("signal")
-        # Convert each list-element via to_numpy() with zero_copy_only=False.
-        sig_lists = sig_col.to_pylist()                  # 20 entries; small
-        signals = np.asarray(sig_lists, dtype=np.float32)  # (n_take, T)
+        ca = sig_col.combine_chunks() if hasattr(sig_col, "combine_chunks") else sig_col
+        # ca is a ListArray (or ChunkedArray with a single chunk after combine).
+        if hasattr(ca, "chunks"):
+            ca = ca.chunks[0]
+        flat = ca.values.to_numpy(zero_copy_only=False)   # (n_take * T,) fp16
+        if flat.size == 0:
+            continue
+        T_samples = flat.size // n_take
+        signals = flat.astype(np.float32).reshape(n_take, T_samples)
         if signals.ndim != 2:
             print(f"[extract_features] WARN: weird signal shape {signals.shape} "
                   f"in {entry.path.name}; skipping")
