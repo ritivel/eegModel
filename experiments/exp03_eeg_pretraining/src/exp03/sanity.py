@@ -809,9 +809,13 @@ def check_c(
 @app.command()
 def check_d(
     derived_root: Path = typer.Option(None, help="parquet derived root"),
+    max_subjects: int = typer.Option(50, help="cap subjects to extract from"),
+    max_windows_per_shard: int = typer.Option(20, help="cap iid windows per shard"),
 ):
     """Run only Check D (random-init linear-probe floor)."""
-    check_d_random_init_probe(derived_root=derived_root)
+    check_d_random_init_probe(derived_root=derived_root,
+                              max_subjects=max_subjects,
+                              max_windows_per_shard=max_windows_per_shard)
 
 
 @app.command()
