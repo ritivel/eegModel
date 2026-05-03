@@ -737,15 +737,34 @@ class EEGSSLModel(nn.Module):
     # ------------------------------------------------------------------
     # Full SSL forward: reconstructs and returns mask.
     # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        zero_token_content: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """Full MAE forward.
+
+        Args:
+            x: (B, T_samples) or (B, 1, T_samples) raw EEG input.
+            zero_token_content: When True, replace the post-frontend tokens
+                with zeros BEFORE the positional embedding is added. The
+                encoder then sees just the positional-embedding pattern with
+                no signal content; the target is still the original signal.
+                This is the operational definition of Check B's "input-
+                independent baseline" per `01_sanity_baselines/README.md`
+                and the risk-mitigation note: *"Use the same positional
+                embedding the real model uses, but zero out all token
+                content."* If the loss decreases meaningfully under this
+                mode, the positional embedding is leaking signal info
+                (a bug in the model, not the test).
 
         Returns a dict with keys:
             "reconstruction":  (B, T_samples) raw reconstructed signal
             "target":          (B, T_samples) the target to compare against (raw input)
-            "mask":             (B, T_samples) 1 at masked sample positions, 0 at visible
-            "encoder_features": (B, n_visible, D)  encoder output before decoder
-            "decoder_features": (B, T_tokens, D)   decoder output (pre-recon-head)
+            "mask":            (B, T_samples) 1 at masked sample positions, 0 at visible
+            "encoder_features": (B, n_visible, D) encoder output before decoder
+            "decoder_features": (B, T_tokens, D)  decoder output (pre-recon-head)
         """
         if x.dim() == 2:
             x = x.unsqueeze(1)
@@ -755,6 +774,10 @@ class EEGSSLModel(nn.Module):
 
         # --- frontend ---
         tokens = self.frontend(x)         # (B, T_tokens, D)
+        if zero_token_content:
+            # Erase the frontend output content; pos emb is added next so
+            # the encoder ends up seeing only the positional pattern.
+            tokens = torch.zeros_like(tokens)
         tokens = self.encoder_pos_emb(tokens)
         T_tokens = tokens.size(1)
         D = tokens.size(2)

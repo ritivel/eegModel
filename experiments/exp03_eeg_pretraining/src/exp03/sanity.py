@@ -324,15 +324,21 @@ def _training_step(
     x: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     use_bf16: bool = True,
+    zero_token_content: bool = False,
 ) -> dict[str, float]:
-    """One forward + backward + step. Returns a dict of {loss, *components}."""
+    """One forward + backward + step. Returns a dict of {loss, *components}.
+
+    `zero_token_content=True` engages the Check-B mode: encoder sees only
+    positional embeddings, no signal content; target is still the real
+    input. See `EEGSSLModel.forward` docstring for rationale.
+    """
     optimizer.zero_grad(set_to_none=True)
     if use_bf16:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model_(x)
+            out = model_(x, zero_token_content=zero_token_content)
             loss, comps = loss_fn(out)
     else:
-        out = model_(x)
+        out = model_(x, zero_token_content=zero_token_content)
         loss, comps = loss_fn(out)
     loss.backward()
     optimizer.step()
@@ -355,34 +361,60 @@ def check_b_input_independent(
     lr: float = 3e-4,
     log_every: int = 100,
     relative_improvement_threshold: float = 0.01,
+    loss_kind: str = "l1_plus_mrstft",
+    use_bf16: bool = False,
+    input_kind: str = "ar1",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     seed: int = 0,
 ) -> CheckResult:
-    """Train the model on constant zero input; loss must stay flat."""
+    """Input-independent baseline test (per spec risk-mitigation note).
+
+    Operational definition: pass *real-shaped* synthetic EEG (AR(1) at
+    ρ=0.95) into the model, but engage `zero_token_content=True` so the
+    encoder sees only the positional-embedding pattern. The target is
+    still the original (non-zero) signal, so the loss is well-defined and
+    NOT trivially zero. If the loss drops meaningfully (> 1% relative
+    improvement) under this regime, the positional embedding has somehow
+    learned to leak signal info — a bug in the encoder or pos emb code.
+
+    Per `01_sanity_baselines/README.md`'s explicit risk-mitigation note:
+    *"Use the same positional embedding the real model uses, but zero out
+    all token content."*  This is the post-frontend-pre-pos-emb zeroing
+    path implemented by `EEGSSLModel.forward(zero_token_content=True)`.
+
+    Note: a naive "input = all zeros, target = all zeros" version of this
+    test makes the trivial constant-zero output a global optimum, so the
+    loss CRASHES regardless of leak. That version is incorrect for MAE
+    where target = input. The spec's intent and our implementation match.
+    """
     cfg = cfg or ModelConfig()
-    print(f"\n{'='*70}\nCheck B — Input-independent baseline\n{'='*70}")
-    print(f"n_steps={n_steps} B={B} lr={lr} device={device}")
+    print(f"\n{'='*70}\nCheck B — Input-independent baseline (zero-token-content)\n{'='*70}")
+    print(f"n_steps={n_steps} B={B} lr={lr} loss={loss_kind} bf16={use_bf16} "
+          f"input={input_kind} device={device}")
 
     torch.manual_seed(seed)
     m = build_model(cfg).to(device)
-    loss_fn = losses.build_loss("l1_plus_mrstft").to(device)
+    loss_fn = losses.build_loss(loss_kind).to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.0)
 
-    use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
     history = []
     initial_losses = []
     for step in range(n_steps):
-        x = data.synthetic_batch(B=B, T=cfg.window_samples, kind="constant",
+        x = data.synthetic_batch(B=B, T=cfg.window_samples, kind=input_kind,
                                  seed=seed + step, device=device)
-        # Re-randomise mask each step automatically (RandomPatchMask uses
-        # rng without a fixed seed).
-        info = _training_step(m, loss_fn, x, opt, use_bf16=use_bf16)
+        info = _training_step(m, loss_fn, x, opt, use_bf16=use_bf16,
+                              zero_token_content=True)
         history.append({"step": step, **info})
         if step < 10:
             initial_losses.append(info["loss"])
         if step % log_every == 0 or step == n_steps - 1:
-            print(f"step {step:>5}  loss={info['loss']:.4f}  l1={info.get('l1_raw', float('nan')):.4f}"
-                  f"  mrstft={info.get('mrstft_logmag', float('nan')):.4f}")
+            extras = []
+            for key in ("l1_raw", "l2_raw", "mrstft_logmag"):
+                if key in info:
+                    extras.append(f"{key}={info[key]:.4f}")
+            extras_str = "  ".join(extras)
+            print(f"step {step:>5}  loss={info['loss']:.4f}  "
+                  + (extras_str if extras_str else ""))
 
     init_avg = float(np.mean(initial_losses))
     final_avg = float(np.mean([h["loss"] for h in history[-100:]]))
@@ -398,14 +430,16 @@ def check_b_input_independent(
         status=status,
         details={
             "n_steps": n_steps, "B": B, "lr": lr,
+            "loss_kind": loss_kind, "use_bf16": use_bf16, "input_kind": input_kind,
             "init_avg_loss": init_avg, "final_avg_loss": final_avg,
             "relative_improvement": rel_improvement,
             "threshold": relative_improvement_threshold,
-            "history": history[::max(1, n_steps // 200)],   # downsample to ~200 points
+            "history": history[::max(1, n_steps // 200)],
         },
-        notes=("loss must not decrease > 1% — improvement here means the model is "
-               "predicting target from something other than the input "
-               "(positional-leak / mask-shortcut / dataset-leak)") if status == "RED" else "",
+        notes=("relative loss improvement > 1% under zero-token-content — "
+               "positional embedding is leaking signal info "
+               "(check pos emb code, or check that frontend output is actually being zeroed)"
+               ) if status == "RED" else "",
     )
 
 
@@ -683,9 +717,18 @@ def check_a():
 
 
 @app.command()
-def check_b(n_steps: int = 5000):
+def check_b(
+    n_steps: int = 5000,
+    lr: float = 3e-4,
+    loss_kind: str = "l1_plus_mrstft",
+    use_bf16: bool = False,
+    input_kind: str = "ar1",
+):
     """Run only Check B (input-independent baseline)."""
-    check_b_input_independent(n_steps=n_steps)
+    check_b_input_independent(
+        n_steps=n_steps, lr=lr, loss_kind=loss_kind,
+        use_bf16=use_bf16, input_kind=input_kind,
+    )
 
 
 @app.command()
