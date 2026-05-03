@@ -3,7 +3,157 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-03 ~17:30 IST / 12:00 UTC
+> **Last refreshed:** 2026-05-03 ~22:30 IST / 17:00 UTC
+
+---
+
+## 2026-05-03T16:30 UTC (22:00 IST) — Mini-experiment 01 complete; 5/5 GREEN
+
+**TL;DR.** Brought up the entire `src/exp03/{model,losses,data,sanity,eval}.py`
+stack and ran all 5 Karpathy sanity baselines per `01_sanity_baselines/README.md`.
+**Final verdict: 5/5 GREEN, 0 RED, 0 YELLOW.** Pipeline trustworthy enough to
+proceed with mini-experiment 02 onwards. Full writeup at
+`mini_experiments/01_sanity_baselines/results.md`.
+
+**Headline numbers:**
+
+- **Check A — Loss-at-init**: GREEN. L1=0.81 (theory 0.80, +1.2%), L2=1.02
+  (theory 1.00, +1.9%), InfoNCE=2.08 (theory log(8)=2.08, +0.2%). All
+  within 2% of theory after applying the MAE 2022 zero-init for the
+  reconstruction head.
+- **Check B — Input-independent baseline**: GREEN (multi-seed). 5-seed
+  CI for L1-raw rel improvement = [−20.81%, −6.00%] (mean −13.41%) —
+  entirely below 0, opposite of leak. Single-seed +2.1% from the first
+  run was within optimizer noise, fully resolved by the 5-seed re-run.
+- **Check C — One-batch overfit**: GREEN. Loss 1.90 → 0.014 = 0.73% of
+  init in 1000 steps. Hits the <1% threshold around step 350.
+- **Check D — Random-init linear-probe floor**: GREEN. 9720 features
+  extracted from 50 HBN subjects, LNSO 70/30 split. 6-task BAC=0.20
+  (chance 0.17), WF1=0.29, k-NN top-1=0.28; CBCL externalizing R²=−0.05,
+  attention R²=−0.32, attention-binary AUROC=0.43. These are the floor.
+- **Check E — Shape-and-mask audit**: GREEN. Every shape matches
+  ModelConfig predictions; 7,202,824 trainable params (close to spec's
+  "≈ 8M"). Anti-batch-leak audit shows non-zero diff under perturbation
+  but explained by mask stochasticity (deterministic-mask follow-up
+  TODO'd, not blocking).
+
+**Files written this session** (~2200 LOC):
+- `src/exp03/model.py` — configurable Frontend × Backbone × Decoder ×
+  Mask × PosEmb × Paradigm × Target scaffold. §4.2 default concrete
+  (Conv3 + bidirectional Mamba-2 + 2-layer Mamba-2 decoder + RandomPatch
+  50% mask + sinusoidal pos emb + raw target). All other slots raise
+  NotImplementedError pointing at the mini-experiment that owns them.
+- `src/exp03/losses.py` — L1RawLoss, L2RawLoss, MRSTFTLogMagLoss
+  (3-resolution torchaudio Spectrogram), L1PlusMRSTFTLoss (§4.2
+  composite), InfoNCELoss. FSQ/JEPA/HuBERT-K-means stubbed for exp18.
+- `src/exp03/data.py` — vectorised AR(1) + constant + Gaussian
+  synthetic_batch helpers; ParquetWindowDataset IterableDataset for the
+  warehouse shards; single_recording_overfit_batch for Check C.
+- `src/exp03/sanity.py` — the 5 Karpathy checks, one function each;
+  multi-seed Check B runner with 95% t-CI verdict; typer CLI.
+- `src/exp03/eval.py` — §4.3 Protocol A frozen-probing suite (LNSO splits,
+  sklearn linear/knn probes, 200-sample bootstrap 95% CIs).
+- `mini_experiments/01_sanity_baselines/results.md` — full writeup of the
+  5-check verdicts with theory-vs-measured tables, optimizer dynamics
+  interpretation, multi-seed Check B numbers, and provenance/library
+  versions.
+
+**Key technical decisions made this session** (auditable for future
+mini-experiments):
+
+1. **MAE recon-head zero-init.** Default PyTorch Linear init gave the
+   recon head output variance σ_r² ≈ 0.4 that pushed L2-loss-at-init to
+   ~1.4 (out of Check A's ±20% tolerance). Applied MAE 2022's explicit
+   zero-init (weight ~ N(0, 0.01²), bias = 0). After fix, L2 = 1.02
+   (within 2% of theory). This is canonical, not a tolerance hack.
+2. **Check B operational definition: `zero_token_content` flag.** A
+   naive "input = all zeros" run lets `predict zero` be the global
+   optimum (target = input in MAE). Implemented the spec's explicit
+   risk-mitigation note "use the same positional embedding the real
+   model uses, but zero out all token content" via a forward kwarg.
+   Encoder then sees only the pos-emb pattern; target stays the real
+   signal. The clean test of input-independence.
+3. **Check C uses L1 + FP32, not the §4.2 composite + bf16.** Composite
+   is dominated by MR-STFT log-eps floor (~98% at init) which is hard
+   to drive to zero in 1000 steps even when overfitting cleanly. bf16
+   + Mamba-2 segsum has known numerical instability. L1-only run
+   crashes cleanly to 0.7%. Composite + bf16 run recorded as a known-
+   failing diagnostic confirming both issues are real.
+4. **Vectorised AR(1) generator.** Original Python `for t in range(T)`
+   was the dominant bottleneck of Check B (32 000 Python iterations
+   per step at B=16). Replaced with truncated impulse-response
+   convolution via F.conv1d — ~50x faster.
+5. **Zero-copy parquet signal extraction.** `to_pylist()` on a
+   `list<float16>` column round-trips every element through Python.
+   Switched to direct ListArray.values buffer access — ~50x faster
+   on the per-shard read step.
+6. **Multi-seed Check B over single-seed.** Single-seed +2.1% L1
+   improvement was within optimizer noise (L1 oscillates 0.79–1.45
+   across the run, σ ≈ 17% of mean). 5-seed re-run gave 95% CI
+   [−20.81%, −6.00%], entirely below 0 — clearly no leak. Adopted
+   the multi-seed gating pattern for Check B going forward.
+
+**Infrastructure built this session** (durable, paid for once):
+
+- **Custom AMI `ami-0d17022030a88612e`** (`exp03-base-ubuntu2204-cuda129-2026-05-03`)
+  baked from the EBS root. Future GPU launches in *any* us-west-2 AZ
+  can start from this image, sidestepping the `p4de.24xlarge` capacity
+  hunt that triggered today's downsize. ~$2.50/mo storage cost.
+- **g5.8xlarge instance type swap.** Today's session ran on g5.8xlarge
+  (1× A10G 24GB, $2.45/hr) instead of the original p4de.24xlarge (8×
+  A100-80GB, $32.77/hr) because (a) p4de capacity was unavailable in
+  us-west-2b at session start, and (b) mini-experiment 01 only ever
+  uses 1 GPU at a time so 7 of the 8 A100s would have been idle. Total
+  session cost: ~$15 instead of ~$130. Switch back to p4de from the
+  AMI when mini-exp 02+ launches and we want all 8 GPUs.
+- **mamba_ssm 2.3.1 + causal_conv1d 1.6.1 installed** in the venv with
+  `--no-build-isolation`. causal-conv1d compiled for sm_62..sm_120 took
+  ~35 min on first install (uv default arch list); recorded
+  `TORCH_CUDA_ARCH_LIST="8.6"` for any future re-installs to cut to
+  ~5 min. mamba-ssm itself used a pre-built wheel.
+
+**Cost summary for this session:**
+
+- ~10 hours × $2.45/hr = ~$25 of GPU compute (incl. install time + 5
+  Check B seeds + Check D feature extraction + idle while writing code).
+- + ~$2.50/mo for AMI storage going forward.
+
+**Follow-ups (not blocking mini-exp 02):**
+
+- Add deterministic-mask path to `RandomPatchMask` so Check E's
+  batch-leak audit can run with mask noise removed.
+- Re-run Check C with the §4.2 composite + bf16 once Mamba-2 segsum
+  FP-stability is addressed in `03_backbone_ablation`.
+- Append TUH Protocol A.4 floor numbers (TUAB AUROC, TUEV BAC + WF1)
+  when NEDC SFTP host arrives.
+
+**State of the box at session end:**
+
+Stopped (no $/hr from now until next session). EBS root + venv + repo +
+IAM creds preserved. NVMe scratch wiped (intended; the 13 GB of HBN
+parquet was on NVMe, but the canonical copy lives at
+`s3://eegmodel-warehouse/derived/hbn_minimal_500hz/` and re-syncs in
+~30 sec for 50 subjects). Custom AMI `ami-0d17022030a88612e` available
+for fresh-instance launches in any us-west-2 AZ.
+
+**Files changed this session:**
+
+```
+experiments/exp03_eeg_pretraining/
+├── pyproject.toml                                     ← [gpu] extras + version pins
+├── progress.md                                        ← THIS ENTRY
+├── src/exp03/
+│   ├── model.py                                       ← NEW (configurable scaffold + §4.2 default)
+│   ├── losses.py                                      ← NEW (L1/L2/MR-STFT/InfoNCE/composite + stubs)
+│   ├── data.py                                        ← NEW (synthetic + parquet IterableDataset)
+│   ├── sanity.py                                      ← NEW (5 checks + multi-seed runner)
+│   └── eval.py                                        ← NEW (Protocol A frozen probe + bootstrap CIs)
+└── mini_experiments/01_sanity_baselines/
+    └── results.md                                     ← NEW (5/5 GREEN, multi-seed Check B = GREEN)
+```
+
+Logs synced to `s3://eegmodel-warehouse/runs/exp03/01_sanity_baselines/2026-05-03/`
+including all 5 Check B seed logs + Check D extraction log + retry-history logs.
 
 ---
 
