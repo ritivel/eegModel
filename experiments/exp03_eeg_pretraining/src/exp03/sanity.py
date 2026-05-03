@@ -478,7 +478,7 @@ def check_b_input_independent(
         name="B_input_independent",
         status=status,
         details={
-            "n_steps": n_steps, "B": B, "lr": lr,
+            "n_steps": n_steps, "B": B, "lr": lr, "seed": seed,
             "loss_kind": loss_kind, "use_bf16": use_bf16, "input_kind": input_kind,
             "init_avg_loss": init_avg,
             "init_post_warmup_avg_loss": init_post_warmup_avg,
@@ -500,6 +500,142 @@ def check_b_input_independent(
         },
         notes=("L1-raw improvement > 1% under zero-token-content — "
                "positional embedding is leaking signal info") if status == "RED" else "",
+    )
+
+
+# =============================================================================
+# Check B multi-seed: aggregate verdict over independent seeds
+# =============================================================================
+#
+# A single Check B run gives us one number for L1 rel improvement. To
+# distinguish "real leak" from "optimizer wobble" we need the distribution.
+# This runner ties N independent runs together and reports a 95% CI on the
+# rel-improvement statistic; CI containing 0 → noise (GREEN).
+
+
+def run_check_b_multi(
+    cfg: ModelConfig | None = None,
+    *,
+    n_seeds: int = 5,
+    base_seed: int = 0,
+    n_steps: int = 5000,
+    lr: float = 3e-4,
+    loss_kind: str = "l1_plus_mrstft",
+    use_bf16: bool = False,
+    input_kind: str = "ar1",
+    threshold: float = 0.01,
+    device: str | None = None,
+) -> CheckResult:
+    """Run check_b N times with seeds [base_seed .. base_seed+N-1], aggregate."""
+    cfg = cfg or ModelConfig()
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'#'*70}\n# Check B multi-seed: {n_seeds} seeds × {n_steps} steps each\n{'#'*70}")
+
+    per_seed: list[CheckResult] = []
+    for s_offset in range(n_seeds):
+        seed = base_seed + s_offset
+        print(f"\n>>> seed {seed} ({s_offset + 1}/{n_seeds})")
+        result = check_b_input_independent(
+            cfg, n_steps=n_steps, lr=lr,
+            loss_kind=loss_kind, use_bf16=use_bf16,
+            input_kind=input_kind, seed=seed, device=device,
+        )
+        per_seed.append(result)
+
+    # Pull the per-seed L1-raw rel improvement stats (full run + post-warmup).
+    l1_rels_full = [
+        r.details["rel_improvement_l1_raw_full_GATING"] for r in per_seed
+    ]
+    l1_rels_post = [
+        r.details["components"].get("l1_raw", {}).get("rel_improvement_post_warmup", float("nan"))
+        for r in per_seed
+    ]
+    composite_rels_full = [r.details["rel_improvement_composite_full"] for r in per_seed]
+    composite_rels_post = [r.details["rel_improvement_composite_post_warmup"] for r in per_seed]
+
+    arr_full = np.asarray(l1_rels_full, dtype=np.float64)
+    arr_post = np.asarray(l1_rels_post, dtype=np.float64)
+
+    def _mean_ci(arr: np.ndarray) -> tuple[float, float, float, float]:
+        valid = arr[~np.isnan(arr)]
+        if valid.size < 2:
+            return (float(valid.mean()) if valid.size else float("nan"),
+                    float("nan"), float("nan"), float("nan"))
+        from scipy import stats as _stats
+        m = float(valid.mean())
+        s = float(valid.std(ddof=1))
+        sem = s / math.sqrt(valid.size)
+        # Two-sided 95% CI for the mean (t-distribution, dof = n-1)
+        t_crit = float(_stats.t.ppf(0.975, valid.size - 1))
+        return m, s, m - t_crit * sem, m + t_crit * sem
+
+    mean_full, std_full, ci_low_full, ci_high_full = _mean_ci(arr_full)
+    mean_post, std_post, ci_low_post, ci_high_post = _mean_ci(arr_post)
+
+    # Verdict based on the FULL rel-improvement (which is what the spec names).
+    # GREEN          : CI contains 0  → consistent with no leak (just noise)
+    # GREEN_LOW      : CI excludes 0 but upper bound ≤ threshold (signal but tiny)
+    # RED            : CI lower bound > threshold → real, persistent leak
+    # YELLOW         : CI straddles the threshold → more seeds needed
+    if math.isnan(ci_low_full) or math.isnan(ci_high_full):
+        status = "YELLOW"
+        verdict_note = "insufficient seeds to compute CI"
+    elif ci_low_full > threshold:
+        status = "RED"
+        verdict_note = (f"CI [{ci_low_full:+.2%}, {ci_high_full:+.2%}] is entirely above "
+                        f"threshold {threshold:+.2%} — persistent positional-leak signal")
+    elif ci_low_full <= 0 and ci_high_full <= threshold:
+        status = "GREEN"
+        verdict_note = (f"CI [{ci_low_full:+.2%}, {ci_high_full:+.2%}] contains 0 — "
+                        f"L1 wobble is consistent with optimizer noise, no leak detected")
+    elif ci_low_full > 0 and ci_high_full <= threshold:
+        status = "GREEN"  # statistically nonzero but tiny — still PASS
+        verdict_note = (f"CI [{ci_low_full:+.2%}, {ci_high_full:+.2%}] is statistically "
+                        f"nonzero but stays below threshold {threshold:+.2%} (no harmful leak)")
+    else:
+        status = "YELLOW"
+        verdict_note = (f"CI [{ci_low_full:+.2%}, {ci_high_full:+.2%}] straddles the "
+                        f"threshold {threshold:+.2%} — increase n_seeds or n_steps to disambiguate")
+
+    print(f"\n{'-'*70}\nCheck B multi-seed summary ({n_seeds} seeds)\n{'-'*70}")
+    print(f"\n{'seed':>5} {'L1 rel (full)':>18} {'L1 rel (post-warmup)':>22} "
+          f"{'comp rel (full)':>18} {'comp rel (post)':>18}")
+    for s_offset in range(n_seeds):
+        seed = base_seed + s_offset
+        print(f"{seed:>5} {l1_rels_full[s_offset]:>+18.4%} "
+              f"{l1_rels_post[s_offset]:>+22.4%} "
+              f"{composite_rels_full[s_offset]:>+18.4%} "
+              f"{composite_rels_post[s_offset]:>+18.4%}")
+    print(f"\nL1 rel (full): mean={mean_full:+.4%} std={std_full:.4%} "
+          f"95% CI=[{ci_low_full:+.4%}, {ci_high_full:+.4%}]")
+    print(f"L1 rel (post): mean={mean_post:+.4%} std={std_post:.4%} "
+          f"95% CI=[{ci_low_post:+.4%}, {ci_high_post:+.4%}]")
+    print(f"\nthreshold: ≤ {threshold:+.0%}")
+    print(f"VERDICT: {status} — {verdict_note}\n")
+
+    return CheckResult(
+        name="B_input_independent_multi",
+        status=status,
+        details={
+            "n_seeds": n_seeds,
+            "base_seed": base_seed,
+            "threshold": threshold,
+            "per_seed_l1_rel_full": l1_rels_full,
+            "per_seed_l1_rel_post_warmup": l1_rels_post,
+            "per_seed_composite_rel_full": composite_rels_full,
+            "per_seed_composite_rel_post_warmup": composite_rels_post,
+            "l1_rel_full_mean": mean_full,
+            "l1_rel_full_std": std_full,
+            "l1_rel_full_ci_low_95": ci_low_full,
+            "l1_rel_full_ci_high_95": ci_high_full,
+            "l1_rel_post_mean": mean_post,
+            "l1_rel_post_std": std_post,
+            "l1_rel_post_ci_low_95": ci_low_post,
+            "l1_rel_post_ci_high_95": ci_high_post,
+            "per_seed_results": [r.to_dict() for r in per_seed],
+            "verdict_note": verdict_note,
+        },
+        notes=verdict_note,
     )
 
 
@@ -783,12 +919,45 @@ def check_b(
     loss_kind: str = "l1_plus_mrstft",
     use_bf16: bool = False,
     input_kind: str = "ar1",
+    seed: int = 0,
 ):
-    """Run only Check B (input-independent baseline)."""
+    """Run only Check B (input-independent baseline) with one seed."""
     check_b_input_independent(
         n_steps=n_steps, lr=lr, loss_kind=loss_kind,
-        use_bf16=use_bf16, input_kind=input_kind,
+        use_bf16=use_bf16, input_kind=input_kind, seed=seed,
     )
+
+
+@app.command()
+def check_b_multi(
+    n_seeds: int = 5,
+    base_seed: int = 0,
+    n_steps: int = 5000,
+    lr: float = 3e-4,
+    loss_kind: str = "l1_plus_mrstft",
+    use_bf16: bool = False,
+    input_kind: str = "ar1",
+    threshold: float = 0.01,
+    output_json: Path = typer.Option(None, help="Where to write the per-seed details + verdict"),
+):
+    """Run Check B across multiple seeds and aggregate to a single verdict.
+
+    Computes a 95% CI on the L1-raw rel improvement statistic and decides:
+      - GREEN: CI contains 0 (consistent with no leak; observed wobble is noise)
+      - GREEN_LOW: CI excludes 0 but mean is below threshold (statistically
+                   nonzero but tiny; not worth chasing)
+      - RED: CI excludes 0 and lower bound is above threshold (real leak)
+      - YELLOW: CI straddles the threshold (more seeds needed to disambiguate)
+    """
+    result = run_check_b_multi(
+        n_seeds=n_seeds, base_seed=base_seed, n_steps=n_steps, lr=lr,
+        loss_kind=loss_kind, use_bf16=use_bf16, input_kind=input_kind,
+        threshold=threshold,
+    )
+    if output_json is not None:
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(result.to_dict(), indent=2, default=str))
+        print(f"\nresult written to {output_json}")
 
 
 @app.command()
