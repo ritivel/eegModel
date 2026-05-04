@@ -3,7 +3,153 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-04 ~14:15 IST / 08:45 UTC
+> **Last refreshed:** 2026-05-04 ~16:30 IST / 11:00 UTC
+
+---
+
+## 2026-05-04T11:00 UTC (16:30 IST) — Track A complete; mini-exp 01 fully closed; exp17 paradigm code dropped
+
+**TL;DR.** Two things happened in this session, both Mac-driven coding
+plus one ~3-hour GPU run on `i-0b8ee8096fd9176c0` (g5.8xlarge):
+
+1. **Track A landed.** Mini-experiment 01's last open follow-up — the
+   Protocol A.4 (TUH) floor row — is filled in. ✅ GREEN.
+2. **exp17 paradigm code dropped.** Three generative-paradigm heads
+   (G0 MAE / G1 AR / G2 MAR + diffusion) plus a paradigm-agnostic
+   training loop (HF accelerate + wandb). Smoke-tested on Mac.
+
+### Track A: Protocol A.4 floor numbers
+
+Random-init §4.2-default model, frozen, mean-pool encoder features:
+
+| metric                                | point    | 95 % CI          |
+|---------------------------------------|---------:|------------------|
+| TUAB binary AUROC                     | **0.591** | [0.562, 0.617]   |
+| TUEV 6-class BAC                      | **0.240** | [0.221, 0.261]   |
+| TUEV 6-class WF1                      | **0.676** | [0.659, 0.695]   |
+| TUEV k-NN top-1 (k=5, cosine, 6-task) | **0.660** | [0.643, 0.678]   |
+
+Filled into `mini_experiments/01_sanity_baselines/results.md` under the
+new "Check D extension — Protocol A.4 floor" section. Run JSON synced
+to `s3://eegmodel-warehouse/runs/exp03/01_sanity_baselines/2026-05-04T09-58-21Z_track_a/check_d_with_a4_v3.json`.
+
+### Track A timeline (wall-clock)
+
+- 08:55 UTC — instance started, SSH chain bootstrapped (NEDC key
+  agent-forwarded; nedc-tuh alias added on box; host keys pinned)
+- 08:56 — pre-sync 80 HBN subjects (24 GB, 18 sec, ~1.3 GB/s S3-to-EC2)
+- 08:56–09:38 — rsync TUAB v3.0.1 from NEDC SFTP (62 GB at ~23 MB/s; 42 min)
+- 09:38–09:52 — rsync TUEV v2.0.1 (20 GB at ~24 MB/s; 14 min)
+- 09:52 — first preprocess attempt failed (`tuh.py` regex assumed
+  TUAB v2 deep layout `<subj>/<sess>/<recname>.edf`; v3.0.1 flattened
+  it to `<recname>.edf`; subject is now in the filename). Fixed
+  in commit `064aee7`.
+- 09:58–10:14 — TUAB preprocess (300 train + 276 eval shards via
+  `--n 300`; 16 min)
+- 10:14–10:26 — TUEV preprocess (440 shards; 12 min)
+- 10:26 — sync derived to S3 (~17 sec, small)
+- 10:26–10:33 — first probe run; TUAB hit `single-class train split`
+  because Linux `rglob` walked `train/normal/` before
+  `train/abnormal/` so all 300 train shards were label-0
+- 10:33–10:43 — `/tmp/balance_tuab.py` added 300 train-abnormal shards
+  (~10 min, 0.5 rec/s on single-thread CPU)
+- 10:43–10:55 — re-probe with `--tuh-max-subjects 300`; **all four
+  Protocol A.4 metrics landed cleanly**.
+- 11:00 — instance stopped.
+
+**Total session GPU compute:** ~2 h × $2.45/hr ≈ $5. Plus ~1 h of CPU-
+only preprocess time inside that 2 h; the GPU was used for ~10 minutes
+total (just the feature extraction inside the probe).
+
+### exp17 paradigm code (committed `d56c4d5`)
+
+~1500 LOC across three new modules + extensions to model.py / cli.py:
+
+- `src/exp03/diffusion.py` — minimal cosine-schedule + ε-prediction
+  MSE loss (port of LTH14/mar's diffusion utility, simplified to
+  representation-only; no sampling / VLB / reverse process).
+- `src/exp03/paradigms.py` — three paradigm heads with shared interface:
+    - `MAEHead` — wraps the existing decoder + recon_head.
+    - `ARNextPatchHead` — forward-only encoder, per-token next-patch
+      L1+0.3·MR-STFT loss; ARM-style.
+    - `MARDiffLossHead` — bidirectional encoder + per-masked-token
+      `SimpleMLPAdaLN` diffusion MLP (depth=3, width=1024); port of
+      MAR's models/diffloss.py.
+- `src/exp03/train.py` — paradigm-agnostic SSL training loop on
+  HuggingFace accelerate (DDP/multi-GPU readiness, mixed precision,
+  gradient accumulation) + wandb logging. Same recipe as
+  facebookresearch/mae's engine_pretrain.py: AdamW (β=(0.9,0.95),
+  wd=0.05), cosine LR with warmup, MAE-style absolute LR
+  (`lr = blr * eff_batch / 256`), gradient clip, periodic checkpoint,
+  end-of-train Protocol A frozen-probe eval auto-logged to wandb
+  under `eval/*`.
+- `src/exp03/cli.py` — new `exp03 train --paradigm <mae|ar|mar> ...`
+  subcommand; --help has runnable examples for the smoke test, the
+  exp17 G2 cell at ~35M tokens-seen (the README's iso-data budget),
+  and the G1 cell.
+- `src/exp03/model.py` — `EEGSSLModel.__init__` now branches on
+  `paradigm.kind`; G1 drops mask + decoder + mask_token + recon_head;
+  G2 drops the Mamba decoder block (replaced by the diffusion MLP);
+  G0 keeps the existing pipeline. `forward(compute_loss=True)`
+  dispatches to the paradigm head; `compute_loss=False` preserves the
+  rich output dict that Check A's external losses iterate over
+  (backwards-compatible).
+
+Mac smoke tests (transformer backbone — Mamba-2 is CUDA-only):
+
+- G1 AR: 467K params, loss-at-init L1 = 0.80 (matches √(2/π) ≈ 0.798
+  theory), backprop OK.
+- G2 MAR: 19.8M params (the diffusion MLP at 1024×3 is the bulk),
+  loss-at-init eps-MSE = 1.00 (matches noise variance), 50-step
+  single-batch overfit drops loss 50% (stability check passes).
+- End-to-end `train.py` with synthetic parquet shards: data loader →
+  accelerate prepare → AR forward+loss+backward+step → cosine LR
+  schedule → final checkpoint → summary.json. All paths exercised.
+- G0 MAE smoke-test deferred to GPU box (needs mamba_ssm).
+
+### Library reuse (per the user's "use libraries" directive)
+
+- HuggingFace **accelerate** (Accelerator.prepare, accelerator.backward,
+  accelerator.clip_grad_norm_) — already in pyproject [gpu] extras.
+- HuggingFace **wandb integration** (mode=online/offline/disabled,
+  config from TrainConfig.to_dict()).
+- **MAR** (LTH14/mar) — code-level port of models/diffloss.py.
+- **ARM** (OliverRensu/ARM) — recipe for forward-only AR-Mamba
+  pretraining; we follow their per-token next-patch loss pattern.
+- **MAE** (facebookresearch/mae) — engine_pretrain.py training-loop
+  recipe; AdamW betas, MAE-style absolute LR formula,
+  cosine-warmup-cosine-decay schedule.
+
+### Track A code-side fix-ups committed
+
+- `7c20a51` — Track A code drop (tuh.py + paradigms scaffold + ...)
+- `d56c4d5` — exp17 paradigm code drop
+- `064aee7` — TUAB v3.0.1 path-regex fix (the `<subj>/<sess>/`
+  subtree is optional in v3.0.1; subject is now parsed from the
+  filename `<subj>_s###_t###.edf`)
+
+### Cost summary for this session
+
+- GPU box: ~2 hr × $2.45/hr = **$5** (most of that was rsync / CPU
+  preprocess time; the GPU was used ~10 min total for feature
+  extraction)
+- AWS S3: negligible (the new derived/{tuab,tuev}_v2_clean_250hz/
+  prefixes added ~5 GB of parquet to the warehouse; ~$0.10/mo
+  steady-state)
+- Total: **~$5 of compute credits used** out of the $210k pool.
+- Mac coding: $0.
+
+### State at session end
+
+- Instance `i-0b8ee8096fd9176c0` stopped 2026-05-04T11:00 UTC. EBS
+  root + venv + repo + IAM creds + new TUH preprocess code preserved.
+  NVMe scratch wiped on stop; the canonical preprocessed shards live
+  in S3 at `s3://eegmodel-warehouse/derived/{tuab,tuev}_v2_clean_250hz/`.
+- Mini-experiment 01 fully closed (5/5 GREEN + Protocol A.4 row).
+- exp17 (generative paradigm) code is GPU-ready. Next session needs a
+  multi-GPU node (recommended: p4de.24xlarge or g6.48xlarge) and
+  ~45 H100-hours of compute (= 30 cells × 1.5 H100-h, where cells =
+  3 paradigms × 2 controls × 5 seeds).
 
 ---
 
