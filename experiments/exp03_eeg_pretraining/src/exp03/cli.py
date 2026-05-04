@@ -10,6 +10,7 @@ Top-level commands (each a ``typer`` subcommand):
     exp03 preprocess             — apply minimal (and/or v2_clean) pipelines → parquet shards (HBN)
     exp03 tuh-rsync              — rsync TUAB / TUEV from NEDC SFTP into local NVMe
     exp03 tuh-preprocess         — apply v2_clean pipeline → parquet shards (TUH)
+    exp03 train                  — run one SSL pretraining cell (any paradigm) with wandb logging
     exp03 sync-derived-up        — rclone the local derived/ tree to s3://eegmodel-warehouse/
     exp03 sync-derived-down      — rclone s3://eegmodel-warehouse/derived/ → local NVMe (bootstrap)
 
@@ -653,6 +654,130 @@ def tuh_preprocess_cmd(
         f"{n_rows_total:,} rows in {dt:.1f}s "
         f"({n_rows_total / max(dt, 1e-3):.0f} rows/s)"
     )
+
+
+# ---------------------------------------------------------------------------
+# `exp03 train` — run one SSL pretraining cell (paradigm × seed)
+# ---------------------------------------------------------------------------
+
+
+@app.command("train")
+def train_cmd(
+    paradigm: str = typer.Option("mae", "--paradigm",
+                                 help="Generative paradigm: 'mae' (G0), 'ar' (G1), 'mar' (G2)."),
+    backbone_kind: str = typer.Option("mamba2", "--backbone-kind",
+                                      help="Backbone: 'mamba2' (default) or 'transformer' (CPU/Mac fallback)"),
+    backbone_layers: int = typer.Option(6, "--backbone-layers"),
+    backbone_d_model: int = typer.Option(256, "--backbone-d-model"),
+    decoder_layers: int = typer.Option(2, "--decoder-layers",
+                                       help="Only used by G0 MAE."),
+    mask_ratio: float = typer.Option(0.50, "--mask-ratio",
+                                     help="Only used by G0/G2; G1 has no masking."),
+    diffloss_d: int = typer.Option(3, "--diffloss-d", help="MAR DiffLoss MLP depth."),
+    diffloss_w: int = typer.Option(1024, "--diffloss-w", help="MAR DiffLoss MLP width."),
+    diffusion_batch_mul: int = typer.Option(1, "--diffusion-batch-mul",
+                                            help="MAR per-sample replication for noise-level coverage. "
+                                                 "MAR paper uses 4."),
+    data_root: Path = typer.Option(None, "--data-root",
+                                   help="Override $EXP03_DATA_ROOT/derived/<pipeline>/."),
+    pipeline: str = typer.Option("hbn_minimal_500hz", "--pipeline",
+                                 help="Which derived/<pipeline>/ folder to read from. "
+                                      "Default 'hbn_minimal_500hz' is the §4.1 primary."),
+    max_steps: int = typer.Option(1000, "--steps"),
+    batch_size: int = typer.Option(32, "--batch-size"),
+    accum_iter: int = typer.Option(1, "--accum-iter"),
+    lr: float = typer.Option(1e-4, "--lr"),
+    blr: float = typer.Option(None, "--blr",
+                              help="Base LR; if set, lr = blr * eff_batch / 256 (MAE convention)."),
+    weight_decay: float = typer.Option(0.05, "--weight-decay"),
+    warmup_steps: int = typer.Option(100, "--warmup-steps"),
+    grad_clip_norm: float = typer.Option(1.0, "--grad-clip-norm"),
+    precision: str = typer.Option("bf16", "--precision",
+                                  help="'bf16' (default), 'fp32', or 'fp16'. Mamba-2's segsum primitive "
+                                       "can NaN under fp16 — prefer bf16 or fp32."),
+    seed: int = typer.Option(0, "--seed"),
+    output_dir: Path = typer.Option(None, "--output-dir",
+                                    help="Where to write checkpoints + summary.json. Default: "
+                                         "$EXP03_DATA_ROOT/runs/<wandb_run_name or auto>."),
+    log_every: int = typer.Option(20, "--log-every"),
+    ckpt_every: int = typer.Option(0, "--ckpt-every",
+                                   help="0 = checkpoint at end only. Otherwise every N steps."),
+    eval_at_end: bool = typer.Option(True, "--eval-at-end/--no-eval-at-end"),
+    eval_max_subjects: int = typer.Option(50, "--eval-max-subjects"),
+    num_workers: int = typer.Option(2, "--num-workers",
+                                    help="DataLoader workers. Set 0 for single-process dev "
+                                         "(macOS, stdin scripts) or to debug worker errors."),
+    wandb_project: str = typer.Option("exp03", "--wandb-project"),
+    wandb_run_name: str = typer.Option(None, "--wandb-run-name"),
+    wandb_mode: str = typer.Option("online", "--wandb-mode",
+                                   help="'online' / 'offline' / 'disabled'"),
+    wandb_tags: str = typer.Option("", "--wandb-tags",
+                                   help="Comma-separated tags."),
+):
+    """Run one SSL pretraining cell.
+
+    Examples:
+
+    \b
+        # Smoke-test G0 MAE for 100 steps with wandb disabled
+        exp03 train --paradigm mae --steps 100 --wandb-mode disabled --no-eval-at-end
+
+    \b
+        # Real exp17 cell: G2 MAR, ~35M tokens (= 17500 steps × batch 32 × patch 8 / 2000 samples)
+        exp03 train --paradigm mar --steps 17500 --batch-size 32 \\
+            --diffusion-batch-mul 4 --blr 1e-4 \\
+            --wandb-run-name exp17-g2-seed0 --wandb-tags exp17,g2,mar
+
+    \b
+        # Forward-only Mamba AR pretraining (G1)
+        exp03 train --paradigm ar --steps 17500 --batch-size 32 \\
+            --wandb-run-name exp17-g1-seed0 --wandb-tags exp17,g1,ar
+    """
+    from . import train as train_mod
+
+    s = storage.from_env()
+    if data_root is None:
+        data_root = s.derived_pipeline(pipeline)
+    if output_dir is None:
+        run_id = wandb_run_name or f"exp17-{paradigm}-seed{seed}-{int(time.time())}"
+        output_dir = s.runs_root / run_id
+
+    cfg = train_mod.TrainConfig(
+        paradigm=paradigm,
+        backbone_kind=backbone_kind,
+        backbone_layers=backbone_layers,
+        backbone_d_model=backbone_d_model,
+        decoder_layers=decoder_layers,
+        mask_ratio=mask_ratio,
+        diffloss_d=diffloss_d,
+        diffloss_w=diffloss_w,
+        diffusion_batch_mul=diffusion_batch_mul,
+        data_root=data_root,
+        max_steps=max_steps,
+        batch_size=batch_size,
+        accum_iter=accum_iter,
+        lr=lr,
+        blr=blr,
+        weight_decay=weight_decay,
+        warmup_steps=warmup_steps,
+        grad_clip_norm=grad_clip_norm,
+        precision=precision,
+        seed=seed,
+        output_dir=output_dir,
+        log_every=log_every,
+        ckpt_every=ckpt_every,
+        eval_at_end=eval_at_end,
+        eval_max_subjects=eval_max_subjects,
+        num_workers=num_workers,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
+        wandb_mode=wandb_mode,
+        wandb_tags=tuple(t.strip() for t in wandb_tags.split(",") if t.strip()),
+    )
+    console.print(f"[cyan]train cell[/cyan] paradigm={paradigm} seed={seed} "
+                  f"steps={max_steps} batch={batch_size} -> {output_dir}")
+    result = train_mod.train(cfg)
+    console.print(f"[green]done[/green]: {result}")
 
 
 # ---------------------------------------------------------------------------

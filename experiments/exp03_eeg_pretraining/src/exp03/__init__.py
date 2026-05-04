@@ -3,7 +3,7 @@
 Public API:
 
     from exp03.storage import Storage, from_env
-    from exp03 import preprocess, hbn, tuh
+    from exp03 import preprocess, hbn, tuh, paradigms, train
 
 Submodules:
 
@@ -16,6 +16,12 @@ Submodules:
     tuh         TUH-EEG ingestion (TUAB v3.0.1 + TUEV v2.0.1): walk the
                 rsync'd local tree, read EDF via MNE, parse `.rec` event
                 annotations, derive Protocol A.4 labels.
+    diffusion   Minimal cosine-schedule + epsilon-prediction loss for the
+                MAR (G2) diffusion head (port of LTH14/mar's diffusion utilities).
+    paradigms   Three generative-paradigm heads for exp17: MAE / AR / MAR.
+                G2's diffusion head ports MAR's SimpleMLPAdaLN.
+    train       Generic SSL pretraining loop (HF accelerate + wandb), shared
+                across paradigms.
     cli         Typer CLI; `exp03 --help` for entrypoints.
 
 Deliberately self-contained: no imports from `packages/eeg_common`. eeg_common

@@ -186,10 +186,14 @@ class ModelConfig:
                 f"frontend.d_model ({self.frontend.d_model}) must match "
                 f"backbone.d_model ({self.backbone.d_model})"
             )
-        if self.backbone.d_model != self.decoder.d_model:
+        # The decoder is only used by the MAE paradigm. AR (G1) has no
+        # decoder; MAR (G2) replaces the decoder with a diffusion MLP that
+        # consumes the encoder dim directly. So we only enforce the
+        # decoder.d_model match for MAE.
+        if self.paradigm.kind == "mae" and self.backbone.d_model != self.decoder.d_model:
             raise ValueError(
                 f"backbone.d_model ({self.backbone.d_model}) must match "
-                f"decoder.d_model ({self.decoder.d_model})"
+                f"decoder.d_model ({self.decoder.d_model}) for MAE paradigm"
             )
 
 
@@ -670,44 +674,68 @@ class EEGSSLModel(nn.Module):
         # --- frontend ------------------------------------------------------
         self.frontend = build_frontend(cfg.frontend)
 
-        # --- positional embeddings (encoder + decoder, separate to allow
-        # different schemes per exp20) -------------------------------------
+        # --- positional embedding for the encoder (the decoder pos emb is
+        # paradigm-specific; only built for G0 MAE) ------------------------
         self.encoder_pos_emb = build_pos_emb(cfg.pos_emb, cfg.frontend.d_model)
-        self.decoder_pos_emb = build_pos_emb(cfg.pos_emb, cfg.decoder.d_model)
 
-        # --- masking + encoder backbone -----------------------------------
-        self.mask_module = build_mask(cfg.mask)
+        # --- encoder backbone (built unconditionally; bidirectionality is
+        # an axis of cfg.backbone, so the AR paradigm sets bidirectional=False
+        # at config-build time) -------------------------------------------
         self.encoder = build_backbone(cfg.backbone)
-
-        # --- mask token + decoder -----------------------------------------
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, cfg.decoder.d_model))
-        nn.init.normal_(self.mask_token, std=0.02)
-
-        # If encoder.d_model != decoder.d_model we'd need a projection here;
-        # forced equal in ModelConfig.__post_init__.
-        self.decoder = build_decoder(cfg.decoder)
-
-        # --- reconstruction head: per-token Linear → patch_samples raw values
-        # Zero-init the bias and use a small Normal for the weight, per MAE
-        # 2022 §3 and the discussion in `01_sanity_baselines/README.md` Check A.
-        # This makes the model output ≈ 0 at init, so the loss-at-init values
-        # match the closed-form theory (L2 ≈ Var(target) = 1.0 for z-scored
-        # input, L1 ≈ √(2/π) ≈ 0.7979). Without this, PyTorch's default
-        # Linear init produces output variance σ_r² ≈ 0.4 that adds to the
-        # target variance and confuses Check A.
-        self.recon_head = nn.Linear(cfg.decoder.d_model, cfg.patch_samples, bias=True)
-        nn.init.normal_(self.recon_head.weight, std=0.01)
-        nn.init.zeros_(self.recon_head.bias)
 
         if cfg.target.kind != "raw":
             raise NotImplementedError(
                 f"Reconstruction target {cfg.target.kind!r} not implemented; "
                 f"see mini_experiments/18_reconstruction_target/README.md"
             )
-        if cfg.paradigm.kind != "mae":
-            raise NotImplementedError(
-                f"Paradigm {cfg.paradigm.kind!r} not implemented; "
-                f"see mini_experiments/17_generative_paradigm/README.md"
+
+        # --- paradigm-specific components (mask + decoder + per-paradigm head)
+        # The G0 MAE path keeps the decoder Mamba block + reconstruction head
+        # exactly as the §4.2 default; G1 AR drops the decoder entirely;
+        # G2 MAR replaces the decoder with the SimpleMLPAdaLN diffusion head.
+        # We build all that lives "above" the encoder here.
+        from . import paradigms                       # avoid circular import at module load
+        self._paradigm_kind = cfg.paradigm.kind
+
+        if self._paradigm_kind in ("mae", "mar"):
+            self.mask_module = build_mask(cfg.mask)
+        else:
+            self.mask_module = None                   # G1 AR: no masking
+
+        if self._paradigm_kind == "mae":
+            self.decoder_pos_emb = build_pos_emb(cfg.pos_emb, cfg.decoder.d_model)
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, cfg.decoder.d_model))
+            nn.init.normal_(self.mask_token, std=0.02)
+            self.decoder = build_decoder(cfg.decoder)
+            self.recon_head = nn.Linear(cfg.decoder.d_model, cfg.patch_samples, bias=True)
+            # MAE 2022 zero-init recon head per Check A.
+            nn.init.normal_(self.recon_head.weight, std=0.01)
+            nn.init.zeros_(self.recon_head.bias)
+            self.paradigm = paradigms.build_paradigm(
+                cfg.paradigm,
+                d_model=cfg.decoder.d_model,
+                patch_samples=cfg.patch_samples,
+                decoder_module=self.decoder,
+                decoder_pos_emb=self.decoder_pos_emb,
+                mask_token=self.mask_token,
+                recon_head=self.recon_head,
+            )
+        else:
+            # G1 AR / G2 MAR — no MAE decoder block, no MAE mask token,
+            # no MAE recon head. The paradigm head builds whatever it needs
+            # internally.
+            self.decoder_pos_emb = None
+            self.mask_token = None
+            self.decoder = None
+            self.recon_head = None
+            self.paradigm = paradigms.build_paradigm(
+                cfg.paradigm,
+                d_model=cfg.backbone.d_model,
+                patch_samples=cfg.patch_samples,
+                decoder_module=None,
+                decoder_pos_emb=None,
+                mask_token=None,
+                recon_head=None,
             )
 
     # ------------------------------------------------------------------
@@ -735,15 +763,16 @@ class EEGSSLModel(nn.Module):
         return encoded.mean(dim=1)       # mean-pool over time
 
     # ------------------------------------------------------------------
-    # Full SSL forward: reconstructs and returns mask.
+    # Full SSL forward: dispatches to the paradigm head.
     # ------------------------------------------------------------------
     def forward(
         self,
         x: torch.Tensor,
         *,
         zero_token_content: bool = False,
+        compute_loss: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Full MAE forward.
+        """Run the SSL forward + (optionally) the paradigm-specific loss.
 
         Args:
             x: (B, T_samples) or (B, 1, T_samples) raw EEG input.
@@ -752,19 +781,35 @@ class EEGSSLModel(nn.Module):
                 encoder then sees just the positional-embedding pattern with
                 no signal content; the target is still the original signal.
                 This is the operational definition of Check B's "input-
-                independent baseline" per `01_sanity_baselines/README.md`
-                and the risk-mitigation note: *"Use the same positional
-                embedding the real model uses, but zero out all token
-                content."* If the loss decreases meaningfully under this
-                mode, the positional embedding is leaking signal info
-                (a bug in the model, not the test).
+                independent baseline" per `01_sanity_baselines/README.md`.
+            compute_loss: When True, also computes the paradigm-specific
+                training loss internally and includes ``"loss"`` and
+                ``"components"`` in the returned dict. The trainer in
+                :mod:`exp03.train` sets this; Check A uses ``False`` so
+                multiple external losses can be evaluated against the
+                same forward output.
 
-        Returns a dict with keys:
-            "reconstruction":  (B, T_samples) raw reconstructed signal
-            "target":          (B, T_samples) the target to compare against (raw input)
-            "mask":            (B, T_samples) 1 at masked sample positions, 0 at visible
-            "encoder_features": (B, n_visible, D) encoder output before decoder
-            "decoder_features": (B, T_tokens, D)  decoder output (pre-recon-head)
+        Returns a dict; keys depend on the paradigm:
+
+        * **G0 MAE** (always populated, for backwards compat with the
+          sanity checks):
+            ``"reconstruction"``, ``"target"``, ``"mask"`` (sample-level),
+            ``"encoder_features"``, ``"decoder_features"``, ``"token_mask"``,
+            ``"ids_keep"``, ``"ids_restore"``. Plus ``"loss"`` /
+            ``"components"`` if ``compute_loss=True``.
+
+        * **G1 AR**: ``"reconstruction"`` (next-patch predictions, length
+          ``T_samples - patch_samples``), ``"target"`` (the corresponding
+          ground-truth next-patch slice), ``"mask"`` (all-ones).
+          ``"encoder_features"`` is ``(B, T_tokens, D)`` since AR has no
+          masking. Plus ``"loss"`` if ``compute_loss=True``.
+
+        * **G2 MAR**: ``"encoder_features"`` (visible only),
+          ``"token_mask"``, ``"ids_keep"``, ``"ids_restore"``. The MAR
+          head's loss involves stochastic noise sampling, so a meaningful
+          ``"reconstruction"`` is *only* produced when ``compute_loss=True``
+          (it's just ``"loss"`` then). Use ``encode_features(x)`` for the
+          frozen-probe path, *not* this method's output.
         """
         if x.dim() == 2:
             x = x.unsqueeze(1)
@@ -775,49 +820,87 @@ class EEGSSLModel(nn.Module):
         # --- frontend ---
         tokens = self.frontend(x)         # (B, T_tokens, D)
         if zero_token_content:
-            # Erase the frontend output content; pos emb is added next so
-            # the encoder ends up seeing only the positional pattern.
             tokens = torch.zeros_like(tokens)
         tokens = self.encoder_pos_emb(tokens)
         T_tokens = tokens.size(1)
         D = tokens.size(2)
 
-        # --- mask + encode ---
+        out: dict[str, torch.Tensor] = {"target": target}
+
+        if self._paradigm_kind == "ar":
+            # G1: encoder runs over all tokens (no mask).
+            encoded = self.encoder(tokens)                        # (B, T_tokens, D)
+            out["encoder_features"] = encoded
+            if compute_loss:
+                head_out = self.paradigm(
+                    encoded=encoded,
+                    target=target,
+                )
+                out["loss"] = head_out["loss"]
+                out["components"] = head_out["components"]
+                out["reconstruction"] = head_out["reconstruction"]
+                # AR paradigm trims first/last tokens; pad target to match
+                # the trimmed reconstruction so external code sees aligned shapes.
+                P = self.cfg.patch_samples
+                target_patches = rearrange(target, "b (t p) -> b t p", p=P)
+                out["target"] = rearrange(target_patches[:, 1:, :], "b t p -> b (t p)")
+                out["mask"] = head_out["sample_mask"]
+            return out
+
+        # --- G0 MAE / G2 MAR: mask + encode visible only ---
         m = self.mask_module(B, T_tokens, x.device)
         n_visible = m.ids_keep.size(1)
         ids_keep_d = m.ids_keep.unsqueeze(-1).expand(-1, -1, D)
         visible_tokens = torch.gather(tokens, dim=1, index=ids_keep_d)   # (B, n_visible, D)
-        encoded = self.encoder(visible_tokens)
+        encoded = self.encoder(visible_tokens)                           # (B, n_visible, D)
 
-        # --- decoder input: encoded + mask tokens, restored to original order
-        n_masked = T_tokens - n_visible
-        mask_tokens = self.mask_token.expand(B, n_masked, D)
-        x_full = torch.cat([encoded, mask_tokens], dim=1)                # (B, T_tokens, D)
-        ids_restore_d = m.ids_restore.unsqueeze(-1).expand(-1, -1, D)
-        x_full = torch.gather(x_full, dim=1, index=ids_restore_d)        # restore original order
+        out["encoder_features"] = encoded
+        out["token_mask"] = m.mask
+        out["ids_keep"] = m.ids_keep
+        out["ids_restore"] = m.ids_restore
 
-        x_full = self.decoder_pos_emb(x_full)
-        decoded = self.decoder(x_full)                                    # (B, T_tokens, D)
+        if self._paradigm_kind == "mae":
+            # Run the decoder once and surface its reconstruction in the
+            # output dict so Check A's external losses (which iterate over
+            # several losses on the same model output) still work without
+            # re-running the decoder.
+            n_masked = T_tokens - n_visible
+            mask_tokens = self.mask_token.expand(B, n_masked, D)
+            x_full = torch.cat([encoded, mask_tokens], dim=1)
+            ids_restore_d = m.ids_restore.unsqueeze(-1).expand(-1, -1, D)
+            x_full = torch.gather(x_full, dim=1, index=ids_restore_d)
+            x_full = self.decoder_pos_emb(x_full)
+            decoded = self.decoder(x_full)
+            recon_patches = self.recon_head(decoded)
+            recon = rearrange(recon_patches, "b t p -> b (t p)")
+            sample_mask = repeat(m.mask, "b t -> b (t p)", p=self.cfg.patch_samples)
+            out["reconstruction"] = recon
+            out["mask"] = sample_mask
+            out["decoder_features"] = decoded
+            if compute_loss:
+                # Use the MAE paradigm head's default loss on the already-
+                # computed reconstruction (avoids running the decoder twice).
+                loss, components = self.paradigm.default_loss({
+                    "reconstruction": recon,
+                    "target": target,
+                    "mask": sample_mask,
+                })
+                out["loss"] = loss
+                out["components"] = components
+            return out
 
-        # --- per-token reconstruction → flatten to sample-level signal ---
-        recon_patches = self.recon_head(decoded)                         # (B, T_tokens, patch_samples)
-        recon = rearrange(recon_patches, "b t p -> b (t p)")             # (B, T_samples)
-
-        # --- expand token-level mask to sample-level ---
-        # Each token covers `patch_samples` samples; broadcast the mask
-        # accordingly. This is the mask the loss should weight by.
-        sample_mask = repeat(m.mask, "b t -> b (t p)", p=self.cfg.patch_samples)
-
-        return {
-            "reconstruction": recon,
-            "target": target,
-            "mask": sample_mask,
-            "encoder_features": encoded,
-            "decoder_features": decoded,
-            "token_mask": m.mask,
-            "ids_keep": m.ids_keep,
-            "ids_restore": m.ids_restore,
-        }
+        # G2 MAR — diffusion-loss head; loss is paradigm-internal.
+        if compute_loss:
+            head_out = self.paradigm(
+                encoded=encoded,
+                mask_module_out=m,
+                target=target,
+            )
+            out["loss"] = head_out["loss"]
+            out["components"] = head_out["components"]
+        # Provide a sample-level mask for any downstream analysis code.
+        out["mask"] = repeat(m.mask, "b t -> b (t p)", p=self.cfg.patch_samples)
+        return out
 
 
 # =============================================================================
