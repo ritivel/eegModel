@@ -123,13 +123,24 @@ TUEV_BCKG_INDEX = 5  # default fallback label when a window has no overlap with 
 # handles both — we don't need the recording_num downstream.
 _TUEV_FILENAME_RE = re.compile(r"^(?P<stem>.+)\.edf$", re.IGNORECASE)
 
-# TUAB filenames are ``<subj>_s###_t###.edf`` under the recording-session
-# subtree. We don't need to parse them — the subject and session are taken
-# from the *path*, not the filename, since the path is the authoritative
-# normal/abnormal label source.
+# TUAB v3.0.1 flattens the per-subject / per-session subtree: each .edf
+# lives directly under ``<split>/<class>/<montage>/`` and the subject /
+# session / recording numbers live in the filename:
+#
+#     <subj>_s<sess>_t<rec>.edf      e.g. aaaaaicc_s003_t000.edf
+#
+# Older TUAB releases used a deeper layout (`<subj>/<sess>/<recname>.edf`).
+# The filename regex below supports both — :class:`Recording.subject_id`
+# is parsed from the filename, not the path, so we don't depend on the
+# parent-directory shape.
 _TUAB_PATH_RE = re.compile(
     r"/(?P<split>train|eval)/(?P<class>normal|abnormal)/(?P<montage>[^/]+)/"
-    r"(?P<subj>[^/]+)/(?P<sess>[^/]+)/(?P<recname>[^/]+\.edf)$",
+    r"(?:(?P<subj_dir>[^/]+)/(?P<sess_dir>[^/]+)/)?"
+    r"(?P<recname>[^/]+\.edf)$",
+    re.IGNORECASE,
+)
+_TUAB_FILENAME_RE = re.compile(
+    r"^(?P<subj>[A-Za-z0-9]+)_s(?P<sess>\d+)_t(?P<rec>\d+)\.edf$",
     re.IGNORECASE,
 )
 
@@ -183,7 +194,13 @@ class Recording:
 
 
 def _walk_tuab(corpus_root: Path, version: str) -> list[Recording]:
-    """Walk the local TUAB tree under ``corpus_root/edf/{train,eval}/...``."""
+    """Walk the local TUAB tree under ``corpus_root/edf/{train,eval}/...``.
+
+    Supports both the v3.0.1 flat layout (``<split>/<class>/<montage>/<recname>.edf``)
+    and the older deep layout (``<split>/<class>/<montage>/<subj>/<sess>/<recname>.edf``).
+    Subject ID is parsed from the filename, which is uniform across versions:
+    ``<subj>_s<sess>_t<rec>.edf``.
+    """
     edf_root = corpus_root / "edf"
     if not edf_root.exists():
         raise FileNotFoundError(
@@ -195,16 +212,23 @@ def _walk_tuab(corpus_root: Path, version: str) -> list[Recording]:
     for path in edf_root.rglob("*.edf"):
         m = _TUAB_PATH_RE.search(str(path))
         if not m:
-            # Tolerate occasional non-standard path layouts but warn loudly
-            # — these will be ingested with subject_id = parent dir + label = -1.
             continue
         d = m.groupdict()
         klass = d["class"].lower()
+        # Subject ID from filename (uniform across versions).
+        fm = _TUAB_FILENAME_RE.match(path.name)
+        if fm:
+            subj = fm.group("subj")
+        elif d.get("subj_dir"):
+            subj = d["subj_dir"]
+        else:
+            # Last-resort fallback: use the filename stem.
+            subj = path.stem
         out.append(Recording(
             corpus="tuab",
             version=version,
             split=d["split"].lower(),
-            subject_id=d["subj"],
+            subject_id=subj,
             edf_path=path,
             rec_path=None,
             montage=d["montage"],
