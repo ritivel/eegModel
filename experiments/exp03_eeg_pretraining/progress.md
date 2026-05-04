@@ -3,7 +3,315 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-03 ~22:30 IST / 17:00 UTC
+> **Last refreshed:** 2026-05-04 ~14:15 IST / 08:45 UTC
+
+---
+
+## 2026-05-04T08:45 UTC (14:15 IST) — Track A code drop: TUH ingestion + Protocol A.4 floor
+
+**TL;DR.** Wrote / extended ~700 LOC of TUH-side ingestion + eval code so
+the next GPU session can land the §4.3 Protocol A.4 floor row in one
+push-button command. **No GPU spin-up this session** — pure CPU-only
+authoring + smoke testing on the local Mac. Bill: $0.
+
+**What landed (per file):**
+
+- **`src/exp03/tuh.py`** (NEW, ~310 LOC) — TUH-EEG ingestion mirror of
+  `hbn.py`'s shape:
+  - Constants: TUAB_VERSION="v3.0.1", TUEV_VERSION="v2.0.1", remote
+    subdirectory map, `nedc-tuh` SSH alias, label name table per the
+    AAREADME (SPSW / GPED / PLED / EYEM / ARTF / BCKG; REC int 1..6
+    → 0-indexed class 0..5).
+  - `Recording` dataclass with corpus-specific extras (split, montage,
+    `tuab_label` from path, optional `rec_path` for TUEV).
+  - `walk_corpus(local_root, corpus)` → walks the rsync'd local tree
+    and returns Recording's. Path regexes verified against the actual
+    NEDC layouts (TUAB: `edf/{train,eval}/{normal,abnormal}/01_tcp_ar/...`;
+    TUEV: `edf/{train,eval}/<subj>/<rec>.{edf,rec}` flat per-subject).
+  - `parse_rec(rec_path)` → list[RecEvent] from the canonical CSV-like
+    `channel,start_s,end_s,label_int` format. Smoke-tested on a real
+    NEDC sample (`aaaaaaar_00000001.rec`, 384 events, channels 0–21,
+    matches the AAREADME's TCP montage definition).
+  - `tuev_window_label(events, win_start, win_seconds)` → int — the
+    per-window argmax-overlap-duration label across all channels. Falls
+    back to BCKG (5) if no events overlap the window. Verified:
+    window [24, 28) on the sample correctly returns EYEM (3) because
+    the lone [26.0, 27.0] EYEM annotation contributes 1.0 s of overlap
+    while no other event types overlap the window.
+  - `load_recording(edf_path, eeg_only=True)` → `(eeg, sr, channel_names)`
+    via MNE; default-filters to `EEG <site>-<REF|LE>` to drop ECG / EMG /
+    PHOTIC / etc. that TUH EDFs ship as extra channels.
+  - `rsync_corpus(corpus, local_root, ...)` → wraps `rsync -avL` into a
+    single-call helper used by the CLI's `tuh-rsync`.
+
+- **`src/exp03/storage.py`** (extended) — added:
+  - `raw_tuab` / `raw_tuev` properties pointing to
+    `$EXP03_DATA_ROOT/raw/{tuab,tuev}/`.
+  - `PIPELINE_TUAB_V2_CLEAN = "tuab_v2_clean_250hz"` and
+    `PIPELINE_TUEV_V2_CLEAN = "tuev_v2_clean_250hz"` (both ride the
+    existing `SPEC_V2_CLEAN`).
+  - `ALL_PIPELINES` tuple for "all four" iteration in the CLI.
+  - `ensure_dirs` extended to mkdir the new TUH paths.
+  - Module docstring updated with a note: raw TUH is **not** mirrored
+    to our S3 warehouse (NEDC's per-application access agreement asks
+    each licensee to keep raw within their own systems and delete it
+    when done; preprocessed parquet is fine because the raw signal is
+    not clinically recoverable from z-scored 4-s float16 windows).
+
+- **`src/exp03/preprocess.py`** (extended) — schema additions, fully
+  backward-compatible with the 24,270 HBN parquet shards already in S3:
+  - New columns: `corpus` (string), `tuab_label` (int8), `tuev_label`
+    (int8), `tuh_split` (string).
+  - `_FIELD_DEFAULTS` map filled in by `rows_to_parquet_table` so HBN
+    code paths that don't know about TUH labels just leave them blank
+    and the writer drops the right sentinels.
+  - HBN `cli.preprocess` updated to explicitly tag rows with
+    `corpus="hbn"` (cosmetic — the default would do the right thing,
+    but explicit matches the TUH side).
+  - Module docstring rewritten with the new corpus-tagged schema layout.
+
+- **`src/exp03/cli.py`** (extended) — two new commands:
+  - `exp03 tuh-rsync <corpus> [--version] [--dry-run] [--extra-rsync-args]`
+    wraps `rsync` over the `nedc-tuh` SSH alias to mirror a NEDC corpus
+    version into local NVMe. Includes a sanity-check on the SSH chain
+    and a "use ssh-agent forwarding" note in the help text.
+  - `exp03 tuh-preprocess <corpus> [--pipeline v2_clean] [--splits] [--n]`
+    applies `SPEC_V2_CLEAN` to the local TUH tree → parquet shards. Reads
+    `.rec` annotations on TUEV recordings to fill `tuev_label` per window
+    via the same argmax-overlap-duration rule. The `--splits` and `--n`
+    flags exist for smoke-testing on a small slice before the full ingest.
+  - `sync-derived-up`/`sync-derived-down` now accept four pipeline
+    groups: `all` / `hbn` / `tuh` (and individual names). Default stays
+    at `hbn` to match pre-2026-05-04 behaviour.
+  - `exp03 paths` updated to print all four `derived/<pipeline>/` paths
+    plus `raw_tuab` / `raw_tuev`.
+
+- **`src/exp03/eval.py`** (extended, ~330 LOC added) — Protocol A.4 path:
+  - `ExtractedFeaturesTUH` dataclass mirroring `ExtractedFeatures` with
+    TUH-specific label slots (`tuab_label`, `tuev_label`, `tuh_split`).
+  - `extract_features_tuh(model, derived_root, corpus="tuab"|"tuev", ...)`
+    — same zero-copy ListArray signal-extraction path as the HBN
+    extractor (commit `1ef2036`); reads only the TUH-specific columns
+    from parquet so old HBN shards remain untouched.
+  - `_split_by_official_or_lnso` — prefers NEDC's official train/eval
+    split for direct literature comparability; LNSO fallback if the
+    official eval set has < 50 windows after subsampling.
+  - `run_protocol_a4_tuab(extracted)` → `{tuab_binary_auroc: {point, ci_low_95, ci_high_95}, ...}`
+    via sklearn `LogisticRegression` + 200-bootstrap CI.
+  - `run_protocol_a4_tuev(extracted)` → 6-class BAC + WF1 (linear probe)
+    + k-NN top-1 (k=5, cosine) with bootstrap CIs.
+  - `run_random_init_probe(...)` (Check D entrypoint) extended with two
+    optional kwargs — `derived_root_tuab` and `derived_root_tuev`. When
+    supplied, runs the A.4 probe on top of the existing HBN A primary
+    and merges the metrics into `result.details["metrics_a4"]`.
+
+- **`src/exp03/sanity.py`** (extended) — Check D's `--derived-root-tuab`,
+  `--derived-root-tuev`, `--tuh-max-subjects`, `--output-json` CLI flags
+  added to the existing `sanity check-d` typer command. The HBN code
+  path is unchanged, so re-running `check-d` without the new flags
+  reproduces the existing 5/5-GREEN result.
+
+- **`scripts/track_a_run_on_gpu_box.sh`** (NEW) — single-command Track A
+  runner for the next GPU session:
+  1. SSH access smoke test (rsync TEST file).
+  2. `exp03 tuh-rsync tuab` + `tuh-rsync tuev`.
+  3. `exp03 tuh-preprocess tuab` + `tuh-preprocess tuev` (v2_clean).
+  4. `exp03 sync-derived-up --pipeline tuh`.
+  5. `python -m exp03.sanity check-d --derived-root-tuab ... --derived-root-tuev ... --output-json ...`
+  6. Renders the populated A.4 floor row to stdout (markdown table) +
+     keeps the full JSON for the audit trail.
+  7. Optional S3 sync of the run JSON.
+  Idempotent at every step (rsync re-uses, preprocess skips, rclone copy
+  is no-op-on-match). Knobs: `TRACK_A_TUH_MAX_SUBJECTS`,
+  `TRACK_A_TUH_MAX_PER_SPLIT`, `TRACK_A_SKIP_{RSYNC,PREPROCESS,SYNC}`.
+
+- **`mini_experiments/01_sanity_baselines/results.md`** (extended) —
+  added the "Check D extension — Protocol A.4 floor (secondary, TUH
+  literature-comparable)" section with the experimental setup, the
+  per-window TUEV labelling rationale, an empty results table to be
+  populated by the GPU run, and an anticipated-band comment (TUAB
+  ~ 0.50 chance, TUEV BAC ~ 0.17 chance). Headline summary table got a
+  new row "D.4 — Protocol A.4 floor (TUH secondary): 🟡 PENDING". The
+  open follow-up "Append TUH Protocol A.4 floor numbers when NEDC SFTP
+  host arrives" is now strikethrough'd with a pointer to the new
+  section + the runner script.
+
+**Smoke tests passed locally on Mac:**
+
+1. `python -m py_compile` on all 7 touched modules → all OK.
+2. ReadLints on the same 7 files → no errors.
+3. `parse_rec` against the real NEDC sample (`aaaaaaar_00000001.rec`,
+   pulled this morning via the SSH smoke test) → 384 events parsed,
+   class distribution {ARTF: 204, BCKG: 172, EYEM: 8} consistent with
+   a typical TUEV recording, channel indices in range 0..21 matching
+   the AAREADME's TCP-montage definition.
+4. `tuev_window_label` on the same events → per-window argmax-overlap
+   labelling correctly identifies the EYEM-dominant window at [24, 28)
+   (one [26.0, 27.0] EYEM annotation, 1 s of overlap, no other event
+   types overlap → EYEM wins).
+5. `exp03 paths` → prints all four pipeline directories + raw_tuab/tuev.
+6. `exp03 tuh-rsync --help` and `tuh-preprocess --help` → render with
+   the documented arg / option lists.
+7. `exp03 sync-derived-up --pipeline {all,hbn,tuh,tuab,tuev}` →
+   resolves to the right pipeline groups.
+8. Schema round-trip: a TUEV row + an HBN row (HBN row missing the new
+   TUH fields entirely) written to a single parquet via
+   `rows_to_parquet_table` → reads back with `corpus = ["tuev", "hbn"]`,
+   `tuev_label = [5, -1]`, `tuh_split = ["train", ""]`. Old HBN parquet
+   shards in S3 remain readable because `extract_features` still
+   requests only the original column subset.
+9. `python -m exp03.sanity check-d --help` → surfaces the new
+   `--derived-root-tuab` / `--derived-root-tuev` / `--tuh-max-subjects`
+   / `--output-json` flags.
+10. `bash -n scripts/track_a_run_on_gpu_box.sh` → syntax OK.
+
+**Cost summary:** $0 (no GPU spin-up; all coding + smoke tests on Mac).
+
+**Next session — push-button Track A close-out:**
+
+```bash
+# On Mac: forward the SSH agent so the GPU box can use the NEDC key
+# without copying it to NVMe.
+ssh-add ~/.ssh/id_ed25519_nedc
+ssh -A ubuntu@<gpu-box-ip>
+
+# On GPU box:
+cd /home/ubuntu/eegModel
+git pull
+source .venv/bin/activate
+bash experiments/exp03_eeg_pretraining/scripts/track_a_run_on_gpu_box.sh
+```
+
+Expected wall-clock: ~1.5 h on g5.8xlarge. The script prints the populated
+Protocol A.4 floor row at the end; copy-paste it into the empty table in
+`mini_experiments/01_sanity_baselines/results.md` and commit. That fully
+closes mini-experiment 01.
+
+**Files changed this session:**
+
+```
+experiments/exp03_eeg_pretraining/
+├── progress.md                                            ← THIS ENTRY
+├── mini_experiments/01_sanity_baselines/results.md        ← +A.4 placeholder section
+├── scripts/track_a_run_on_gpu_box.sh                      ← NEW (1-cmd runner)
+└── src/exp03/
+    ├── __init__.py                                        ← surface tuh module
+    ├── tuh.py                                             ← NEW (TUH ingestion)
+    ├── storage.py                                         ← +TUAB/TUEV pipelines
+    ├── preprocess.py                                      ← +corpus / tuab_label / tuev_label / tuh_split
+    ├── cli.py                                             ← +tuh-rsync / tuh-preprocess
+    ├── eval.py                                            ← +Protocol A.4 path
+    └── sanity.py                                          ← +Check D TUH wiring
+```
+
+Local SSH state (durable, paid for once on 2026-05-04):
+- `~/.ssh/config` aliased `nedc-tuh` → `nedc-tuh-eeg@www.isip.piconepress.com`
+  via `~/.ssh/id_ed25519_nedc` (`IdentitiesOnly yes`).
+- `~/.ssh/known_hosts` pinned with NEDC's ed25519/rsa/ecdsa keys
+  (server is OpenSSH 8.0). First-use prompts no longer fire.
+
+---
+
+## 2026-05-04T08:20 UTC (13:50 IST) — TUH NEDC SFTP unlocked; Protocol A.4 now reachable
+
+**TL;DR.** Joe Picone replied 2026-05-04T03:14 UTC (Gmail msg
+`19df0fb0965e253e`, thread `19df0fb0965e253e`, ~13 h after we sent the
+ed25519 public key on 2026-05-03T04:01 UTC). He installed the key into
+`authorized_keys` on the NEDC SFTP host `www.isip.piconepress.com` (user
+`nedc-tuh-eeg`) and asked us to verify access with the canonical
+`rsync -auvxL …:data/tuh_eeg/TEST .` command. **Smoke test on the local
+Mac passed first try** — TEST file (96 bytes, "This is a test:
+nedc-tuh-eeg.") pulled cleanly, and a non-recursive listing confirms all
+**seven NEDC TUH-EEG corpora** are exposed to our key (sizes are
+directory entry counts at depth 1, not recording counts):
+
+| corpus path                     | latest version | use in this project              |
+|---------------------------------|----------------|----------------------------------|
+| `data/tuh_eeg/tuh_eeg/`         | v2.0.1         | full TUEG (~26k recordings) — secondary pretraining if HBN→TUH cross-corpus probe is ever wanted |
+| `data/tuh_eeg/tuh_eeg_abnormal/`| v3.0.1         | **TUAB** — Protocol A.4a primary (binary normal/abnormal AUROC) |
+| `data/tuh_eeg/tuh_eeg_events/`  | v2.0.1         | **TUEV** — Protocol A.4b primary (6-class BAC + weighted F1) |
+| `data/tuh_eeg/tuh_eeg_artifact/`|  —             | reference (artifact-detection corpus, not used as eval slot) |
+| `data/tuh_eeg/tuh_eeg_epilepsy/`|  —             | reference (epilepsy detection, not used as eval slot) |
+| `data/tuh_eeg/tuh_eeg_seizure/` |  —             | reference (seizure, not used as eval slot) |
+| `data/tuh_eeg/tuh_eeg_slowing/` |  —             | reference (slowing, not used as eval slot) |
+
+This unblocks **mini-experiment 01's last open follow-up** ("Append TUH
+Protocol A.4 floor numbers when NEDC SFTP host arrives") and the **§4.3
+Protocol A.4 secondary eval** — TUAB-binary AUROC + TUEV 6-class BAC/WF1,
+the literature-comparable cell vs BENDR / LaBraM / CBraMod / REVE.
+
+**Local-side changes made this session** (all on the Mac, no GPU spin-up):
+
+1. **SSH config entry** added to `~/.ssh/config` for host alias `nedc-tuh`
+   routing to `nedc-tuh-eeg@www.isip.piconepress.com` via the dedicated
+   `~/.ssh/id_ed25519_nedc` keypair (with `IdentitiesOnly yes` so the
+   default `id_ed25519` is never offered). Backup of the prior config at
+   `~/.ssh/config.bak.2026-05-04`.
+2. **Host keys pinned** in `~/.ssh/known_hosts` via `ssh-keyscan -t
+   ed25519,rsa,ecdsa www.isip.piconepress.com` (server runs OpenSSH 8.0;
+   ed25519 fingerprint `AAAAC3NzaC1lZDI1NTE5AAAAIBvD55DL9Rlsl9sj3NA86HIke3eHTg2IfsPEUlCDWl+c`).
+   Strict host checking now succeeds on first connection without prompts.
+3. **Smoke test**: `rsync -auvxL nedc-tuh:data/tuh_eeg/TEST /tmp/nedc_smoke/`
+   → `sent 42 bytes  received 201 bytes  2430000 bytes/sec`, exit 0.
+4. **Top-level corpus inventory** via `rsync -d --list-only` (above table).
+5. **Reply sent in-thread** (Gmail msg `19df2113fe53d2a7`, thread
+   `19df0fb0965e253e`) confirming the test passed and listing the seven
+   visible corpora — closes the loop on Joe's "Let us know if there are
+   problems" ask.
+
+**Note on key path.** Joe's email is a templated boilerplate to
+`undisclosed-recipients:;` and uses `~/.ssh/id_ed25519` (the default
+location) in the rsync command. Our actual key lives at
+`~/.ssh/id_ed25519_nedc` per the 2026-05-03 decision to keep NEDC access
+independently revocable. The SSH config alias makes the path-substitution
+invisible to future commands — `rsync … nedc-tuh:…` Just Works.
+
+**Now unblocked (sequenced for the next GPU session):**
+
+1. **Copy the private key** `~/.ssh/id_ed25519_nedc` to the GPU box (or
+   `ssh-add` it locally and use agent-forwarding via `ForwardAgent yes`
+   in the GPU box's SSH config entry — agent-forwarding avoids leaving a
+   long-lived private key on a remote NVMe that gets wiped on stop).
+   **Recommended: agent-forwarding** so the key never lives on the box;
+   if the box is ever compromised, NEDC access is not impacted.
+2. **Pull TUAB v3.0.1** to `/opt/dlami/nvme/eeg/raw/tuab/`:
+   ```bash
+   rsync -avL nedc-tuh:data/tuh_eeg/tuh_eeg_abnormal/v3.0.1/ /opt/dlami/nvme/eeg/raw/tuab/
+   ```
+   ~50 GB raw, ~25 min on the g5/g6 instance's typical 30-50 MB/s
+   download rate.
+3. **Pull TUEV v2.0.1** to `/opt/dlami/nvme/eeg/raw/tuev/`:
+   ```bash
+   rsync -avL nedc-tuh:data/tuh_eeg/tuh_eeg_events/v2.0.1/ /opt/dlami/nvme/eeg/raw/tuev/
+   ```
+   ~30 GB raw, ~15 min.
+4. **Run the canonical `SPEC_V2_CLEAN`** pipeline (60 Hz notch +
+   0.5–100 Hz Butterworth bandpass + 500→250 Hz polyphase resample +
+   per-channel z-score + ±5σ clip + 4-s windowing + iid expansion). This
+   is the literature-comparable preprocessing matching BENDR / LaBraM /
+   CBraMod / REVE — **not** `SPEC_MINIMAL` like HBN, because Protocol A.4
+   exists *exactly* for direct numerical comparability with that
+   literature. Ingestion / preprocess code: `src/exp03/hbn.py` already has
+   the BIDS-EEG MNE loader; TUH ships `.edf` (single-file, no sidecar)
+   under a different naming convention (`<subj>_s###_t###.edf` per
+   session/recording) — needs a small `src/exp03/tuh.py` ingestion module
+   parallel to `hbn.py`.
+5. **Sync derived parquet** to `s3://eegmodel-warehouse/derived/v2_clean_tuh/`
+   (sibling to the existing `derived/hbn_minimal_500hz/` prefix).
+6. **Run Check D's frozen-probe pipeline** on TUAB-binary + TUEV-6-class
+   to fill in the secondary "Protocol A.4 floor" row in
+   `mini_experiments/01_sanity_baselines/results.md`. Expected to take
+   ~15 min on the g5.8xlarge given the same feature-extraction code path
+   as the HBN floor (just different label fields). Closes the only
+   remaining open follow-up from mini-exp 01.
+
+**Cost expectation for the TUH ingestion session:** g5.8xlarge for 1.5 h
+including all 6 steps above = ~$3.70 (or jump to a g6.8xlarge if g5
+capacity is tight; same NVMe + ~similar $/h). Negligible vs the $210k
+AWS credit pool.
+
+**No code or compute spent this session beyond the local smoke test** —
+this was pure access-handshake work.
 
 ---
 

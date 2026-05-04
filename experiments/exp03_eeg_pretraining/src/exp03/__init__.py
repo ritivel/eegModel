@@ -3,7 +3,7 @@
 Public API:
 
     from exp03.storage import Storage, from_env
-    from exp03 import preprocess, hbn
+    from exp03 import preprocess, hbn, tuh
 
 Submodules:
 
@@ -13,6 +13,9 @@ Submodules:
                 + resample) per `mini_experiments.md` §4.1.
     hbn         HBN-EEG ingestion: list / download from `s3://fcp-indi/...`,
                 read EEGLAB .set/.fdt via MNE, parse BIDS-iEEG metadata.
+    tuh         TUH-EEG ingestion (TUAB v3.0.1 + TUEV v2.0.1): walk the
+                rsync'd local tree, read EDF via MNE, parse `.rec` event
+                annotations, derive Protocol A.4 labels.
     cli         Typer CLI; `exp03 --help` for entrypoints.
 
 Deliberately self-contained: no imports from `packages/eeg_common`. eeg_common

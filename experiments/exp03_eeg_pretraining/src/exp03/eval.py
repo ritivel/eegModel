@@ -52,7 +52,7 @@ from .sanity import CheckResult
 
 @dataclass
 class ExtractedFeatures:
-    """Frozen-encoder features + per-window labels.
+    """Frozen-encoder features + per-window labels (HBN, Protocol A).
 
     `features` is (N, D=encoder.d_model) float32.
     `subject_ids` is length-N list of HBN subject IDs (used for LNSO splits).
@@ -67,6 +67,31 @@ class ExtractedFeatures:
     internalizing: np.ndarray                     # CBCL internalizing
     age: np.ndarray
     site: list[str]
+
+
+@dataclass
+class ExtractedFeaturesTUH:
+    """Frozen-encoder features + per-window labels (TUH, Protocol A.4).
+
+    Mirrors :class:`ExtractedFeatures` with TUH-specific label slots:
+
+    * ``tuab_label`` ∈ {0, 1, -1} for TUAB normal/abnormal/missing
+    * ``tuev_label`` ∈ {0..5, -1} for TUEV's 6 events (per
+      :data:`tuh.TUEV_LABEL_NAMES`)
+    * ``tuh_split`` is NEDC's official train/eval split — preserved on
+      every row so we can either (a) honour the official split for
+      direct literature comparability or (b) fall back to LNSO if the
+      official eval set has too-few subjects for a stable bootstrap.
+
+    `corpus` is "tuab" or "tuev"; an extracted-features object always
+    holds rows from one corpus.
+    """
+    features: np.ndarray                          # (N, D)
+    subject_ids: list[str]                        # (N,)
+    corpus: str                                   # "tuab" or "tuev"
+    tuab_label: np.ndarray                        # int8 (0/1/-1)
+    tuev_label: np.ndarray                        # int8 (0..5/-1)
+    tuh_split: list[str]                          # "train" / "eval" per row
 
 
 @torch.no_grad()
@@ -474,6 +499,331 @@ def run_protocol_a(
 
 
 # =============================================================================
+# TUH feature extraction (Protocol A.4)
+# =============================================================================
+#
+# Mirrors `extract_features` for HBN but reads the TUH-specific label
+# columns (`corpus`, `tuab_label`, `tuev_label`, `tuh_split`) from the
+# parquet instead of CBCL factors. Two parquet roots in are supported:
+#   derived/tuab_v2_clean_250hz/   (TUAB normal/abnormal)
+#   derived/tuev_v2_clean_250hz/   (TUEV 6-class events)
+
+
+@torch.no_grad()
+def extract_features_tuh(
+    encoder_model: nn.Module,
+    derived_root: Path,
+    *,
+    corpus: str,
+    max_subjects: int = 100,
+    max_windows_per_shard: int = 20,
+    batch_size: int = 64,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    seed: int = 0,
+    progress: bool = True,
+) -> ExtractedFeaturesTUH:
+    """Run the encoder over a subset of a TUH parquet root and pool features.
+
+    Args:
+        encoder_model: same `EEGSSLModel` shape as for HBN; the encoder
+            is corpus-agnostic — only the labels read from parquet
+            differ. We mean-pool over time identically.
+        derived_root: path to ``derived/{tuab,tuev}_v2_clean_250hz/`` on
+            local NVMe (or a pulled-down warehouse mirror).
+        corpus: "tuab" or "tuev". Determines which label column we read
+            and what the returned ``tuab_label`` / ``tuev_label`` arrays
+            look like (the other one is filled with -1 sentinels).
+        max_subjects: cap the number of TUH subjects to read. TUH has
+            ~2700 unique subjects across TUAB+TUEV; even 200 is enough
+            for the random-init probe floor with comfortable CIs.
+        max_windows_per_shard: cap iid windows per recording-shard.
+        batch_size: GPU batch size for feature extraction.
+        device: "cuda" or "cpu".
+        seed: RNG seed for shard / subject selection.
+        progress: print a progress line per few shards.
+    """
+    import pyarrow.parquet as pq
+
+    if corpus not in ("tuab", "tuev"):
+        raise ValueError(f"unknown corpus: {corpus!r}; valid: 'tuab', 'tuev'")
+    encoder_model = encoder_model.to(device).eval()
+
+    all_shards = data.list_shards(derived_root)
+    subject_ids_avail = sorted({s.subject_id for s in all_shards})
+    if not subject_ids_avail:
+        raise RuntimeError(f"no shards under {derived_root} — did you run `tuh-preprocess`?")
+    rng = np.random.default_rng(seed)
+    keep = set(rng.choice(subject_ids_avail,
+                          size=min(max_subjects, len(subject_ids_avail)),
+                          replace=False).tolist())
+    chosen_shards = [s for s in all_shards if s.subject_id in keep]
+    if progress:
+        print(f"[extract_features_tuh:{corpus}] {len(keep)} subjects, "
+              f"{len(chosen_shards)} shards")
+
+    feat_chunks: list[np.ndarray] = []
+    subject_ids: list[str] = []
+    tuab_labels: list[int] = []
+    tuev_labels: list[int] = []
+    splits: list[str] = []
+
+    t0 = time.time()
+    n_done = 0
+    for shard_i, entry in enumerate(chosen_shards):
+        try:
+            table = pq.read_table(entry.path, columns=[
+                "subject_id", "tuab_label", "tuev_label", "tuh_split", "signal",
+            ])
+        except Exception as e:                           # noqa: BLE001
+            print(f"[extract_features_tuh] WARN skipping {entry.path.name}: {e}")
+            continue
+        n_rows = table.num_rows
+        if n_rows == 0:
+            continue
+        n_take = min(max_windows_per_shard, n_rows)
+        table_slice = table.slice(0, n_take)
+
+        # Stack signals via the same zero-copy ListArray path as the HBN
+        # extractor (see commit 1ef2036 for why this is ~50× faster than
+        # to_pylist on a list<float16> column).
+        sig_col = table_slice.column("signal")
+        ca = sig_col.combine_chunks() if hasattr(sig_col, "combine_chunks") else sig_col
+        if hasattr(ca, "chunks"):
+            ca = ca.chunks[0]
+        flat = ca.values.to_numpy(zero_copy_only=False)
+        if flat.size == 0:
+            continue
+        T_samples = flat.size // n_take
+        signals = flat.astype(np.float32).reshape(n_take, T_samples)
+
+        # Per-row labels
+        sub_arr = table_slice.column("subject_id").to_pylist()
+        split_arr = table_slice.column("tuh_split").to_pylist()
+        tuab_arr = np.asarray(table_slice.column("tuab_label").to_pylist(), dtype=np.int8)
+        tuev_arr = np.asarray(table_slice.column("tuev_label").to_pylist(), dtype=np.int8)
+
+        x_full = torch.from_numpy(signals).to(device, non_blocking=True)
+        feats_chunks_for_shard = []
+        for i in range(0, x_full.size(0), batch_size):
+            x = x_full[i : i + batch_size]
+            feats = encoder_model.encode_features(x)
+            feats_chunks_for_shard.append(feats.detach().cpu().numpy().astype(np.float32))
+        feat_chunks.append(np.concatenate(feats_chunks_for_shard, axis=0))
+
+        subject_ids.extend(sub_arr)
+        splits.extend(split_arr)
+        tuab_labels.extend(tuab_arr.tolist())
+        tuev_labels.extend(tuev_arr.tolist())
+
+        n_done += signals.shape[0]
+        if progress and (shard_i % 50 == 0 or shard_i == len(chosen_shards) - 1):
+            elapsed = time.time() - t0
+            rate = n_done / max(elapsed, 1e-3)
+            print(f"[extract_features_tuh:{corpus}] shard {shard_i + 1}/{len(chosen_shards)} "
+                  f"  windows={n_done}  rate={rate:.0f}/s")
+
+    if not feat_chunks:
+        raise RuntimeError(f"no windows extracted under {derived_root} (corpus={corpus})")
+
+    features = np.concatenate(feat_chunks, axis=0)
+    if progress:
+        print(f"[extract_features_tuh:{corpus}] done: {features.shape[0]} windows in "
+              f"{time.time() - t0:.1f}s -> features shape {features.shape}")
+
+    return ExtractedFeaturesTUH(
+        features=features,
+        subject_ids=subject_ids,
+        corpus=corpus,
+        tuab_label=np.asarray(tuab_labels, dtype=np.int8),
+        tuev_label=np.asarray(tuev_labels, dtype=np.int8),
+        tuh_split=splits,
+    )
+
+
+# =============================================================================
+# §4.3 Protocol A.4 — TUAB-binary AUROC + TUEV 6-class BAC/WF1/k-NN
+# =============================================================================
+
+
+def _split_by_official_or_lnso(
+    extracted: ExtractedFeaturesTUH,
+    *,
+    test_frac: float = 0.30,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Pick the train/test split for a TUH eval.
+
+    Prefers NEDC's official ``train``/``eval`` split (so the floor row is
+    *directly* comparable to literature numbers reported on the same
+    split). Falls back to a subject-disjoint LNSO split if the
+    extracted-features set has fewer than 50 windows in the official
+    eval split (typically because ``max_subjects`` was set so low we
+    didn't sample any official-eval subjects).
+    """
+    splits = np.asarray(extracted.tuh_split)
+    train_mask = splits == "train"
+    test_mask = splits == "eval"
+    if test_mask.sum() >= 50 and train_mask.sum() >= 50:
+        return (np.where(train_mask)[0],
+                np.where(test_mask)[0],
+                "official_train_eval")
+    train_idx, test_idx = lnso_split(extracted.subject_ids,
+                                      test_frac=test_frac, seed=seed)
+    return train_idx, test_idx, "lnso_fallback"
+
+
+def run_protocol_a4_tuab(
+    extracted: ExtractedFeaturesTUH,
+    *,
+    test_frac: float = 0.30,
+    seed: int = 0,
+    n_bootstrap: int = 200,
+) -> dict[str, Any]:
+    """TUAB binary AUROC (Protocol A.4a) on extracted features.
+
+    Returns a dict with one metric: ``tuab_binary_auroc`` plus a small
+    diagnostic preamble (split mode, n_train/n_test, class counts).
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.preprocessing import StandardScaler
+
+    if extracted.corpus != "tuab":
+        raise ValueError(f"expected corpus='tuab', got {extracted.corpus!r}")
+
+    train_idx, test_idx, split_mode = _split_by_official_or_lnso(
+        extracted, test_frac=test_frac, seed=seed)
+    X = extracted.features
+    y_all = extracted.tuab_label
+
+    # Drop -1 sentinels
+    keep_train = (y_all[train_idx] >= 0)
+    keep_test = (y_all[test_idx] >= 0)
+    train_idx = train_idx[keep_train]
+    test_idx = test_idx[keep_test]
+    if train_idx.size < 50 or test_idx.size < 50:
+        return {"split_mode": split_mode, "reason": "insufficient labelled samples",
+                "n_train": int(train_idx.size), "n_test": int(test_idx.size)}
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X[train_idx])
+    X_test = scaler.transform(X[test_idx])
+    y_train = y_all[train_idx].astype(np.int8)
+    y_test = y_all[test_idx].astype(np.int8)
+
+    if y_train.sum() == 0 or y_train.sum() == y_train.size:
+        return {"split_mode": split_mode, "reason": "single-class train split"}
+
+    clf = LogisticRegression(max_iter=5000, n_jobs=1).fit(X_train, y_train)
+    y_score = clf.predict_proba(X_test)[:, 1]
+    auroc_full = roc_auc_score(y_test, y_score)
+
+    def _auroc(idx: np.ndarray) -> float:
+        return roc_auc_score(y_test[idx], y_score[idx])
+
+    return {
+        "split_mode": split_mode,
+        "n_train": int(train_idx.size), "n_test": int(test_idx.size),
+        "n_pos_test": int(y_test.sum()),
+        "n_neg_test": int(y_test.size - y_test.sum()),
+        "tuab_binary_auroc": {
+            "point": float(auroc_full),
+            **bootstrap_ci(_auroc, n_bootstrap=n_bootstrap, seed=seed,
+                           n=test_idx.size),
+        },
+    }
+
+
+def run_protocol_a4_tuev(
+    extracted: ExtractedFeaturesTUH,
+    *,
+    test_frac: float = 0.30,
+    seed: int = 0,
+    n_bootstrap: int = 200,
+    knn_k: int = 5,
+    knn_subset: int = 10_000,
+) -> dict[str, Any]:
+    """TUEV 6-class BAC + WF1 + k-NN top-1 (Protocol A.4b)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import balanced_accuracy_score, f1_score
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.preprocessing import StandardScaler
+
+    if extracted.corpus != "tuev":
+        raise ValueError(f"expected corpus='tuev', got {extracted.corpus!r}")
+
+    train_idx, test_idx, split_mode = _split_by_official_or_lnso(
+        extracted, test_frac=test_frac, seed=seed)
+    X = extracted.features
+    y_all = extracted.tuev_label
+
+    keep_train = (y_all[train_idx] >= 0)
+    keep_test = (y_all[test_idx] >= 0)
+    train_idx = train_idx[keep_train]
+    test_idx = test_idx[keep_test]
+    if train_idx.size < 50 or test_idx.size < 50:
+        return {"split_mode": split_mode, "reason": "insufficient labelled samples",
+                "n_train": int(train_idx.size), "n_test": int(test_idx.size)}
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X[train_idx])
+    X_test = scaler.transform(X[test_idx])
+    y_train = y_all[train_idx]
+    y_test = y_all[test_idx]
+    if len(set(y_train.tolist())) < 2:
+        return {"split_mode": split_mode, "reason": "single-class train split"}
+
+    out: dict[str, Any] = {
+        "split_mode": split_mode,
+        "n_train": int(train_idx.size), "n_test": int(test_idx.size),
+        "class_distribution_test": {
+            int(c): int((y_test == c).sum()) for c in range(6)
+        },
+    }
+
+    clf = LogisticRegression(max_iter=5000, n_jobs=1, solver="lbfgs").fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    bac_full = balanced_accuracy_score(y_test, y_pred)
+    wf1_full = f1_score(y_test, y_pred, average="weighted")
+
+    def _bac(idx: np.ndarray) -> float:
+        return balanced_accuracy_score(y_test[idx], y_pred[idx])
+    def _wf1(idx: np.ndarray) -> float:
+        return f1_score(y_test[idx], y_pred[idx], average="weighted")
+    out["tuev_bac"] = {"point": float(bac_full),
+                       **bootstrap_ci(_bac, n_bootstrap=n_bootstrap, seed=seed,
+                                      n=test_idx.size)}
+    out["tuev_wf1"] = {"point": float(wf1_full),
+                       **bootstrap_ci(_wf1, n_bootstrap=n_bootstrap, seed=seed,
+                                      n=test_idx.size)}
+
+    # k-NN top-1 on a subset (mirrors HBN Protocol A.3)
+    knn_n = min(knn_subset, train_idx.size + test_idx.size)
+    if knn_n > 200:
+        idx_subset = np.concatenate([train_idx, test_idx])
+        if idx_subset.size > knn_n:
+            rng = np.random.default_rng(seed)
+            idx_subset = rng.choice(idx_subset, size=knn_n, replace=False)
+        sub_subset = [extracted.subject_ids[i] for i in idx_subset]
+        knn_train_idx, knn_test_idx = lnso_split(sub_subset, test_frac=0.30, seed=seed)
+        X_knn = scaler.transform(X[idx_subset])
+        knn = KNeighborsClassifier(n_neighbors=knn_k, metric="cosine", n_jobs=1)
+        knn.fit(X_knn[knn_train_idx], y_all[idx_subset][knn_train_idx])
+        y_pred_knn = knn.predict(X_knn[knn_test_idx])
+        top1 = float((y_pred_knn == y_all[idx_subset][knn_test_idx]).mean())
+
+        def _top1(idx: np.ndarray) -> float:
+            return float((y_pred_knn[idx] == y_all[idx_subset][knn_test_idx][idx]).mean())
+        out["tuev_knn_top1"] = {"point": top1, "k": knn_k,
+                                 **bootstrap_ci(_top1, n_bootstrap=n_bootstrap, seed=seed,
+                                                n=knn_test_idx.size)}
+    else:
+        out["tuev_knn_top1"] = {"reason": "subset too small"}
+
+    return out
+
+
+# =============================================================================
 # Check D entrypoint
 # =============================================================================
 
@@ -486,6 +836,9 @@ def run_random_init_probe(
     max_windows_per_shard: int = 20,
     seed: int = 0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    derived_root_tuab: Path | None = None,
+    derived_root_tuev: Path | None = None,
+    tuh_max_subjects: int = 100,
 ) -> CheckResult:
     """Build a random-init `EEGSSLModel`, extract frozen features, run the eval.
 
@@ -495,16 +848,29 @@ def run_random_init_probe(
     metrics fall within 1% of this floor is broken — either SSL didn't
     transfer, or the feature extraction is wrong (wrong layer, wrong
     pooling, wrong split).
+
+    When ``derived_root_tuab`` and/or ``derived_root_tuev`` are supplied,
+    runs the §4.3 Protocol A.4 secondary eval as well (TUAB binary AUROC
+    and/or TUEV 6-class BAC + WF1 + k-NN top-1) and merges the results
+    into the same `CheckResult.details["metrics_a4"]` dict. Either or
+    both may be omitted — the function will skip whichever isn't supplied
+    rather than failing.
     """
     print(f"\n{'='*70}\nCheck D — Random-init linear-probe floor\n{'='*70}")
-    print(f"derived_root={derived_root}")
-    print(f"max_subjects={max_subjects} max_windows_per_shard={max_windows_per_shard}")
+    print(f"derived_root[hbn]={derived_root}")
+    if derived_root_tuab is not None:
+        print(f"derived_root[tuab]={derived_root_tuab}")
+    if derived_root_tuev is not None:
+        print(f"derived_root[tuev]={derived_root_tuev}")
+    print(f"max_subjects[hbn]={max_subjects} max_windows_per_shard={max_windows_per_shard} "
+          f"tuh_max_subjects={tuh_max_subjects}")
 
     torch.manual_seed(seed)
     encoder = model.build_model(cfg).to(device).eval()
     p = model.count_params(encoder)
     print(f"random-init model: total params={p['total']:,}")
 
+    # ---- Protocol A (HBN, primary) ----
     extracted = extract_features(
         encoder, derived_root,
         max_subjects=max_subjects,
@@ -515,7 +881,6 @@ def run_random_init_probe(
     # Quick feature health check — flat features mean a broken encoder
     # or pooling. Standard exp-floor sanity.
     feat_std = extracted.features.std(axis=0)
-    feat_dim = extracted.features.shape[1]
     print(f"feature stats: per-dim mean abs = {np.abs(extracted.features.mean(0)).mean():.4f}")
     print(f"               per-dim std mean = {feat_std.mean():.4f}")
     print(f"               per-dim std min  = {feat_std.min():.4f}")
@@ -523,8 +888,8 @@ def run_random_init_probe(
 
     metrics = run_protocol_a(extracted, seed=seed)
 
-    # Pretty-print the headline numbers
-    print(f"\n{'metric':<26}{'point':>10}{'95% CI low':>14}{'95% CI high':>14}")
+    print(f"\n[Protocol A — HBN primary]")
+    print(f"{'metric':<26}{'point':>10}{'95% CI low':>14}{'95% CI high':>14}")
     print("-" * 64)
     for name in ["externalizing_r2", "externalizing_mae",
                  "attention_r2", "attention_mae", "attention_binary_auroc",
@@ -538,6 +903,55 @@ def run_random_init_probe(
             reason = d.get("reason", "MISSING")
             print(f"{name:<26}  {reason}")
 
+    # ---- Protocol A.4 (TUH, secondary) ----
+    metrics_a4: dict[str, Any] = {}
+
+    if derived_root_tuab is not None:
+        try:
+            extracted_tuab = extract_features_tuh(
+                encoder, derived_root_tuab, corpus="tuab",
+                max_subjects=tuh_max_subjects,
+                max_windows_per_shard=max_windows_per_shard,
+                seed=seed, device=device,
+            )
+            tuab_out = run_protocol_a4_tuab(extracted_tuab, seed=seed)
+            metrics_a4["tuab"] = tuab_out
+            print(f"\n[Protocol A.4a — TUAB secondary]  split={tuab_out.get('split_mode')}")
+            d = tuab_out.get("tuab_binary_auroc", {})
+            if "point" in d:
+                print(f"  tuab_binary_auroc: {d['point']:.4f} "
+                      f"[{d.get('ci_low_95', float('nan')):.4f}, "
+                      f"{d.get('ci_high_95', float('nan')):.4f}]  "
+                      f"(n_pos={tuab_out.get('n_pos_test')}, n_neg={tuab_out.get('n_neg_test')})")
+            else:
+                print(f"  tuab_binary_auroc: {tuab_out.get('reason', 'MISSING')}")
+        except Exception as e:                           # noqa: BLE001
+            print(f"[Protocol A.4a]  TUAB extraction failed: {e}")
+            metrics_a4["tuab"] = {"error": str(e)}
+
+    if derived_root_tuev is not None:
+        try:
+            extracted_tuev = extract_features_tuh(
+                encoder, derived_root_tuev, corpus="tuev",
+                max_subjects=tuh_max_subjects,
+                max_windows_per_shard=max_windows_per_shard,
+                seed=seed, device=device,
+            )
+            tuev_out = run_protocol_a4_tuev(extracted_tuev, seed=seed)
+            metrics_a4["tuev"] = tuev_out
+            print(f"\n[Protocol A.4b — TUEV secondary]  split={tuev_out.get('split_mode')}")
+            for name in ("tuev_bac", "tuev_wf1", "tuev_knn_top1"):
+                d = tuev_out.get(name, {})
+                if "point" in d:
+                    print(f"  {name:<18}: {d['point']:.4f} "
+                          f"[{d.get('ci_low_95', float('nan')):.4f}, "
+                          f"{d.get('ci_high_95', float('nan')):.4f}]")
+                else:
+                    print(f"  {name:<18}: {d.get('reason', 'MISSING')}")
+        except Exception as e:                           # noqa: BLE001
+            print(f"[Protocol A.4b]  TUEV extraction failed: {e}")
+            metrics_a4["tuev"] = {"error": str(e)}
+
     return CheckResult(
         name="D_random_init_probe",
         status="GREEN",                       # always GREEN — Check D records, doesn't gate
@@ -549,6 +963,7 @@ def run_random_init_probe(
             "feat_per_dim_std_max": float(feat_std.max()),
             "n_subjects_used": len(set(extracted.subject_ids)),
             "metrics": metrics,
+            "metrics_a4": metrics_a4,
         },
         notes=("This is the ablation floor — every later pretrained encoder "
                "must clearly beat these numbers. Any future encoder whose "

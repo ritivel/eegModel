@@ -7,7 +7,9 @@ Top-level commands (each a ``typer`` subcommand):
     exp03 list-subjects          — list subjects in one release
     exp03 download               — pull raw .set/.fdt + sidecars for a (release, subject) range
     exp03 audit                  — Phase-0 data audit (Karpathy step 1) on the local raw dir
-    exp03 preprocess             — apply minimal (and/or v2_clean) pipelines → parquet shards
+    exp03 preprocess             — apply minimal (and/or v2_clean) pipelines → parquet shards (HBN)
+    exp03 tuh-rsync              — rsync TUAB / TUEV from NEDC SFTP into local NVMe
+    exp03 tuh-preprocess         — apply v2_clean pipeline → parquet shards (TUH)
     exp03 sync-derived-up        — rclone the local derived/ tree to s3://eegmodel-warehouse/
     exp03 sync-derived-down      — rclone s3://eegmodel-warehouse/derived/ → local NVMe (bootstrap)
 
@@ -26,7 +28,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import hbn, preprocess, storage
+from . import hbn, preprocess, storage, tuh
 
 app = typer.Typer(
     name="exp03",
@@ -56,14 +58,14 @@ def paths_cmd():
     table.add_column("Path / URI")
     table.add_row("data_root", str(s.data_root))
     table.add_row("raw_hbn", str(s.raw_hbn))
-    table.add_row(f"derived/{storage.PIPELINE_MINIMAL}",
-                  str(s.derived_pipeline(storage.PIPELINE_MINIMAL)))
-    table.add_row(f"derived/{storage.PIPELINE_V2_CLEAN}",
-                  str(s.derived_pipeline(storage.PIPELINE_V2_CLEAN)))
+    table.add_row("raw_tuab", str(s.raw_tuab))
+    table.add_row("raw_tuev", str(s.raw_tuev))
+    for pl in storage.ALL_PIPELINES:
+        table.add_row(f"derived/{pl}", str(s.derived_pipeline(pl)))
     table.add_row("runs_root", str(s.runs_root))
     table.add_row("hf_cache", str(s.hf_cache))
-    table.add_row("[s3] derived(minimal)", s.s3_derived(storage.PIPELINE_MINIMAL))
-    table.add_row("[s3] derived(v2_clean)", s.s3_derived(storage.PIPELINE_V2_CLEAN))
+    for pl in storage.ALL_PIPELINES:
+        table.add_row(f"[s3] derived({pl})", s.s3_derived(pl))
     table.add_row("[s3] runs/exp03", s.s3_uri("runs", "exp03"))
     console.print(table)
 
@@ -387,6 +389,7 @@ def preprocess_cmd(
                     continue
 
                 base_meta = {
+                    "corpus": "hbn",
                     "subject_id": sub_id,
                     "site": meta_subject["site"],
                     "recording_id": recording_id,
@@ -400,6 +403,11 @@ def preprocess_cmd(
                     "internalizing": float(meta_subject["internalizing"]),
                     "externalizing": float(meta_subject["externalizing"]),
                     "adhd": int(meta_subject["adhd"]),
+                    # TUH-only sentinels (the default writer fills these,
+                    # but being explicit matches the TUH-side code below).
+                    "tuab_label": -1,
+                    "tuev_label": -1,
+                    "tuh_split": "",
                     "pipeline": pl,
                     "src_sha256_8": src_sha8,
                 }
@@ -420,27 +428,276 @@ def preprocess_cmd(
 
 
 # ---------------------------------------------------------------------------
+# `exp03 tuh-rsync` — pull a TUH corpus from NEDC SFTP
+# ---------------------------------------------------------------------------
+
+
+@app.command("tuh-rsync")
+def tuh_rsync_cmd(
+    corpus: str = typer.Argument(..., help="Which corpus: 'tuab' or 'tuev'"),
+    version: str = typer.Option(None, "--version",
+                                help="Override version (default: latest pinned per tuh.py)"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="Show what rsync would transfer without pulling"),
+    extra: str = typer.Option("", "--extra-rsync-args",
+                              help="Extra space-separated rsync args (advanced)"),
+):
+    """rsync a TUH corpus from NEDC SFTP into ``$EXP03_DATA_ROOT/raw/<corpus>/``.
+
+    Requires the local SSH config alias ``nedc-tuh`` (set up 2026-05-04 to
+    route through ``~/.ssh/id_ed25519_nedc``). On the GPU box, prefer
+    ``ssh-agent`` forwarding (``ssh -A`` from the Mac) over copying the
+    private key onto NVMe — the box's NVMe is wiped on instance stop and
+    leaving a long-lived NEDC private key there is unnecessary risk.
+
+    Sizes (rough, 2026-05-04 NEDC inventory):
+    - TUAB v3.0.1: ~50 GB raw, ~25 min on g5.8xlarge's typical 30-50 MB/s
+    - TUEV v2.0.1: ~30 GB raw, ~15 min
+    """
+    if corpus not in tuh.CORPORA:
+        console.print(f"[red]error:[/red] unknown corpus {corpus!r}; valid: {tuh.CORPORA}")
+        raise typer.Exit(1)
+    s = storage.from_env()
+    s.ensure_dirs()
+    local_root = s.raw_tuh(corpus)
+    extra_args = tuple(extra.split()) if extra.strip() else ()
+    console.print(f"[cyan]rsync[/cyan] NEDC:{tuh.REMOTE_CORPUS_SUBDIR[corpus]}/"
+                  f"{version or tuh.DEFAULT_VERSION_BY_CORPUS[corpus]}/ → {local_root}/")
+    rc = tuh.rsync_corpus(corpus, local_root, version=version,
+                          dry_run=dry_run, extra_rsync_args=extra_args)
+    if rc != 0:
+        console.print(f"[red]rsync exited with code {rc}[/red]")
+        raise typer.Exit(rc)
+    console.print(f"[green]done.[/green] Use `exp03 tuh-preprocess {corpus}` next.")
+
+
+# ---------------------------------------------------------------------------
+# `exp03 tuh-preprocess` — build TUH parquet shards (Protocol A.4 fuel)
+# ---------------------------------------------------------------------------
+
+
+@app.command("tuh-preprocess")
+def tuh_preprocess_cmd(
+    corpus: str = typer.Argument(..., help="Which corpus: 'tuab' or 'tuev'"),
+    pipeline: str = typer.Option("v2_clean", "--pipeline",
+                                 help="Only 'v2_clean' is supported for TUH (Protocol A.4 is "
+                                      "the literature-comparable cell, by design)"),
+    version: str = typer.Option(None, "--version",
+                                help="Override version (default: latest pinned per tuh.py)"),
+    splits: str = typer.Option("train,eval", "--splits",
+                               help="Comma-separated NEDC splits to ingest. Default 'train,eval' "
+                                    "ingests both; pass 'eval' to skip the train set if you "
+                                    "only need the floor probe to land."),
+    n_recordings: int = typer.Option(None, "--n",
+                                     help="Cap to first N recordings per split (smoke-testing)"),
+    overwrite: bool = typer.Option(False, "--overwrite",
+                                   help="Re-write parquet shards even if they exist"),
+):
+    """Apply ``SPEC_V2_CLEAN`` to a TUH corpus → parquet shards under
+    ``derived/{tuab,tuev}_v2_clean_250hz/sub-<id>/``.
+
+    The Protocol A.4 evaluation cell is *literature-comparable* by design,
+    so we use ``SPEC_V2_CLEAN`` (60 Hz notch + 0.5–100 Hz bandpass + 500
+    →250 Hz polyphase resample) rather than the ``SPEC_MINIMAL`` we use
+    for HBN — see ``mini_experiments.md`` §4.1 for the rationale (we
+    want to compare against BENDR / LaBraM / CBraMod / REVE numbers
+    measured on the same preprocessed input). Anything else is reserved
+    for a future cell.
+
+    For TUEV recordings we additionally read the sibling ``.rec`` event
+    annotations to produce a per-window ``tuev_label`` (0..5; argmax-
+    overlap-duration; falls back to BCKG=5 if no annotations overlap a
+    window). For TUAB the label is read directly from the path.
+    """
+    if corpus not in tuh.CORPORA:
+        console.print(f"[red]error:[/red] unknown corpus {corpus!r}; valid: {tuh.CORPORA}")
+        raise typer.Exit(1)
+    if pipeline != "v2_clean":
+        console.print(f"[red]error:[/red] only 'v2_clean' is wired for TUH today.")
+        raise typer.Exit(1)
+
+    splits_t = tuple(s_.strip() for s_ in splits.split(",") if s_.strip())
+    valid_splits = {"train", "eval"}
+    bad = [s for s in splits_t if s not in valid_splits]
+    if bad:
+        console.print(f"[red]error:[/red] bad split(s) {bad}; valid: {sorted(valid_splits)}")
+        raise typer.Exit(1)
+
+    s = storage.from_env()
+    s.ensure_dirs()
+    corpus_root = s.raw_tuh(corpus)
+    derived_pipeline_name = (
+        storage.PIPELINE_TUAB_V2_CLEAN if corpus == "tuab" else storage.PIPELINE_TUEV_V2_CLEAN
+    )
+    derived_root = s.derived_pipeline(derived_pipeline_name)
+    derived_root.mkdir(parents=True, exist_ok=True)
+
+    recordings = tuh.iter_recordings(
+        corpus_root, corpus, splits=splits_t,
+        version=version, max_per_split=n_recordings,
+    )
+    if not recordings:
+        console.print(f"[red]error:[/red] no recordings under {corpus_root} for splits {splits_t}; "
+                      f"did `exp03 tuh-rsync {corpus}` complete?")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]TUH corpus:[/cyan] {corpus} ({len(recordings)} recordings)")
+    console.print(f"[cyan]Output:[/cyan] {derived_root}")
+
+    from tqdm.auto import tqdm
+
+    n_recs_done = 0
+    n_rows_total = 0
+    n_skipped = 0
+    t0 = time.time()
+    for rec in tqdm(recordings, desc=f"{corpus}/{pipeline}", unit="rec"):
+        sub_dir = derived_root / f"sub-{rec.subject_id}"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        # The recording stem (e.g. "aaaaaaar_00000001") is unique within a
+        # subject — collisions only happen if a subject has multiple sessions
+        # *with the same filename*, which doesn't happen in TUH's layout.
+        shard_path = sub_dir / f"{rec.basename}.parquet"
+        if shard_path.exists() and not overwrite:
+            n_skipped += 1
+            continue
+
+        # Provenance
+        sha = hashlib.sha256()
+        sha.update(rec.edf_path.read_bytes())
+        if rec.rec_path is not None:
+            sha.update(rec.rec_path.read_bytes())
+        src_sha8 = sha.hexdigest()[:8]
+
+        try:
+            eeg, sr_native, channel_names = tuh.load_recording(rec.edf_path)
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]skip[/yellow] {rec.edf_path.name}: {e}")
+            n_skipped += 1
+            continue
+
+        # TUEV: read .rec once and cache for per-window label derivation
+        rec_events: list[tuh.RecEvent] = []
+        if corpus == "tuev":
+            if rec.rec_path is None:
+                console.print(f"[yellow]skip[/yellow] {rec.edf_path.name}: missing .rec")
+                n_skipped += 1
+                continue
+            try:
+                rec_events = tuh.parse_rec(rec.rec_path)
+            except (ValueError, FileNotFoundError) as e:
+                console.print(f"[yellow]skip[/yellow] {rec.rec_path.name}: {e}")
+                n_skipped += 1
+                continue
+
+        # Apply v2_clean and window
+        eeg_pp, sr_pp = preprocess.apply_pipeline(eeg, sr_native, pipeline)
+        windows, starts = preprocess.window_4s(eeg_pp, sr_pp)
+        if windows.shape[0] == 0:
+            console.print(f"[yellow]skip[/yellow] {rec.edf_path.name}: too short for one 4-s window")
+            n_skipped += 1
+            continue
+
+        # Derive per-window labels for TUEV (one label per window, shared
+        # across the n_channels iid rows from that window).
+        per_window_tuev = None
+        if corpus == "tuev":
+            per_window_tuev = [
+                tuh.tuev_window_label(rec_events, float(starts[w]),
+                                      window_seconds=preprocess.WINDOW_SECONDS)
+                for w in range(windows.shape[0])
+            ]
+
+        # Build per-row dicts. We extend `iid_expand_rows` with the TUH
+        # specifics by post-processing — that keeps the HBN code path
+        # untouched.
+        base_meta = {
+            "corpus": corpus,
+            "subject_id": rec.subject_id,
+            "site": "",
+            "recording_id": rec.basename,
+            "task_label": -1,
+            "sample_rate_hz": int(sr_pp),
+            "age": float("nan"),
+            "sex": "",
+            "p_factor": float("nan"),
+            "attention": float("nan"),
+            "internalizing": float("nan"),
+            "externalizing": float("nan"),
+            "adhd": -1,
+            "tuab_label": int(rec.tuab_label) if corpus == "tuab" else -1,
+            "tuev_label": -1,                # filled per-row below for TUEV
+            "tuh_split": rec.split,
+            "pipeline": pipeline,
+            "src_sha256_8": src_sha8,
+        }
+
+        rows = preprocess.iid_expand_rows(windows, starts, channel_names,
+                                          base_metadata=base_meta)
+        if corpus == "tuev":
+            # iid_expand_rows produces n_windows × n_channels rows in
+            # window-major order: windows[0] across all channels, then
+            # windows[1], etc. So row index = w * n_channels + c.
+            n_channels = len(channel_names)
+            for w, label in enumerate(per_window_tuev):
+                base = w * n_channels
+                for c in range(n_channels):
+                    rows[base + c]["tuev_label"] = int(label)
+
+        n_written = preprocess.write_parquet_shard(rows, shard_path)
+        n_rows_total += n_written
+        n_recs_done += 1
+
+    dt = time.time() - t0
+    console.print(
+        f"\n[green]done[/green]: {n_recs_done} recordings ingested ({n_skipped} skipped), "
+        f"{n_rows_total:,} rows in {dt:.1f}s "
+        f"({n_rows_total / max(dt, 1e-3):.0f} rows/s)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # `exp03 sync-derived-up` / `exp03 sync-derived-down`
 # ---------------------------------------------------------------------------
 
 
+_PIPELINE_GROUPS: dict[str, tuple[str, ...]] = {
+    "all": storage.ALL_PIPELINES,
+    "hbn": (storage.PIPELINE_MINIMAL, storage.PIPELINE_V2_CLEAN),
+    "tuh": (storage.PIPELINE_TUAB_V2_CLEAN, storage.PIPELINE_TUEV_V2_CLEAN),
+    "both": (storage.PIPELINE_MINIMAL, storage.PIPELINE_V2_CLEAN),  # legacy alias for HBN-only
+    "minimal": (storage.PIPELINE_MINIMAL,),
+    "v2_clean": (storage.PIPELINE_V2_CLEAN,),
+    "tuab": (storage.PIPELINE_TUAB_V2_CLEAN,),
+    "tuev": (storage.PIPELINE_TUEV_V2_CLEAN,),
+}
+
+
+def _resolve_pipelines(pipeline: str) -> list[str]:
+    if pipeline in _PIPELINE_GROUPS:
+        return list(_PIPELINE_GROUPS[pipeline])
+    raise typer.BadParameter(
+        f"unknown pipeline group {pipeline!r}; valid: {sorted(_PIPELINE_GROUPS)}"
+    )
+
+
 @app.command("sync-derived-up")
 def sync_up_cmd(
-    pipeline: str = typer.Option("both", "--pipeline",
-                                 help="'minimal', 'v2_clean', or 'both'"),
+    pipeline: str = typer.Option("hbn", "--pipeline",
+                                 help=("Pipeline group to sync up: "
+                                       "'all' (everything), 'hbn' (minimal+v2_clean), "
+                                       "'tuh' (tuab+tuev), or one of "
+                                       "'minimal'|'v2_clean'|'tuab'|'tuev'. "
+                                       "Default 'hbn' matches the pre-2026-05-04 behaviour.")),
 ):
     """Sync local derived/<pipeline>/ → s3://eegmodel-warehouse/derived/<pipeline>/.
 
-    Idempotent (rclone copy). Use after `exp03 preprocess` to materialise
-    the warehouse mirror.
+    Idempotent (rclone copy). Use after `exp03 preprocess` or
+    `exp03 tuh-preprocess` to materialise the warehouse mirror.
     """
     import subprocess
 
     s = storage.from_env()
-    pipelines = [storage.PIPELINE_MINIMAL, storage.PIPELINE_V2_CLEAN] if pipeline == "both" \
-        else [storage.PIPELINE_MINIMAL if pipeline == "minimal" else storage.PIPELINE_V2_CLEAN]
-
-    for pl in pipelines:
+    for pl in _resolve_pipelines(pipeline):
         local = s.derived_pipeline(pl)
         remote = s.s3_uri("derived", pl).replace("s3://", "s3:")
         console.print(f"[cyan]rclone copy[/cyan] {local} → {remote}")
@@ -453,8 +710,10 @@ def sync_up_cmd(
 
 @app.command("sync-derived-down")
 def sync_down_cmd(
-    pipeline: str = typer.Option("both", "--pipeline",
-                                 help="'minimal', 'v2_clean', or 'both'"),
+    pipeline: str = typer.Option("hbn", "--pipeline",
+                                 help=("Pipeline group to sync down: same set as "
+                                       "sync-derived-up. Default 'hbn' matches "
+                                       "the pre-2026-05-04 behaviour.")),
 ):
     """Sync s3://eegmodel-warehouse/derived/<pipeline>/ → local derived/.
 
@@ -465,10 +724,7 @@ def sync_down_cmd(
 
     s = storage.from_env()
     s.ensure_dirs()
-    pipelines = [storage.PIPELINE_MINIMAL, storage.PIPELINE_V2_CLEAN] if pipeline == "both" \
-        else [storage.PIPELINE_MINIMAL if pipeline == "minimal" else storage.PIPELINE_V2_CLEAN]
-
-    for pl in pipelines:
+    for pl in _resolve_pipelines(pipeline):
         local = s.derived_pipeline(pl)
         remote = s.s3_uri("derived", pl).replace("s3://", "s3:")
         console.print(f"[cyan]rclone copy[/cyan] {remote} → {local}")

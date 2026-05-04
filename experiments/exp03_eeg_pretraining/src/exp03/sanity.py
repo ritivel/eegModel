@@ -771,13 +771,21 @@ def check_d_random_init_probe(
     max_windows_per_shard: int = 20,
     seed: int = 0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    derived_root_tuab: Path | None = None,
+    derived_root_tuev: Path | None = None,
+    tuh_max_subjects: int = 100,
 ) -> CheckResult:
     """Frozen-feature linear probe + k-NN on the random-init encoder.
 
-    Stub for now — calls into eval.py once that's wired. For mini-exp 01
-    we record the floor numbers (HBN externalizing R²/MAE; attention R²/MAE;
-    attention-binary AUROC; 6-task BAC/WF1; k-NN top-1) with 95% bootstrap
-    CIs. Every subsequent pretrained encoder must clearly beat these.
+    Records the floor numbers (HBN Protocol A — externalizing R²/MAE;
+    attention R²/MAE; attention-binary AUROC; 6-task BAC/WF1; k-NN top-1)
+    with 95 % bootstrap CIs. Every subsequent pretrained encoder must
+    clearly beat these.
+
+    Optional Protocol A.4 secondary eval: pass ``derived_root_tuab``
+    and/or ``derived_root_tuev`` to also produce TUAB binary AUROC and/or
+    TUEV 6-class BAC + WF1 + k-NN top-1 floor numbers from the same
+    random-init encoder. Both default to None (skip A.4).
     """
     print(f"\n{'='*70}\nCheck D — Random-init linear-probe floor\n{'='*70}")
     cfg = cfg or ModelConfig()
@@ -789,20 +797,22 @@ def check_d_random_init_probe(
             notes="run with --derived-root pointing at synced parquet shards",
         )
     try:
-        from . import eval as eval_mod   # populated by Step K
+        from . import eval as eval_mod
     except ImportError:
         return CheckResult(
             name="D_random_init_probe",
             status="SKIPPED",
-            details={"reason": "exp03.eval not implemented yet (Step K)"},
-            notes="Step K of mini-exp 01 will populate eval.py",
+            details={"reason": "exp03.eval not importable"},
+            notes="ensure scikit-learn is installed (uv pip install -e '.[gpu]')",
         )
-    # Once eval.py exists, delegate.
     return eval_mod.run_random_init_probe(
         cfg, derived_root=derived_root,
         max_subjects=max_subjects,
         max_windows_per_shard=max_windows_per_shard,
         seed=seed, device=device,
+        derived_root_tuab=derived_root_tuab,
+        derived_root_tuev=derived_root_tuev,
+        tuh_max_subjects=tuh_max_subjects,
     )
 
 
@@ -977,14 +987,46 @@ def check_c(
 
 @app.command()
 def check_d(
-    derived_root: Path = typer.Option(None, help="parquet derived root"),
-    max_subjects: int = typer.Option(50, help="cap subjects to extract from"),
+    derived_root: Path = typer.Option(None, help="HBN parquet derived root (Protocol A primary)"),
+    max_subjects: int = typer.Option(50, help="cap HBN subjects to extract from"),
     max_windows_per_shard: int = typer.Option(20, help="cap iid windows per shard"),
+    derived_root_tuab: Path = typer.Option(
+        None, "--derived-root-tuab",
+        help="TUAB v3.0.1 parquet derived root (Protocol A.4a). "
+             "If supplied, also runs the TUAB binary-AUROC floor.",
+    ),
+    derived_root_tuev: Path = typer.Option(
+        None, "--derived-root-tuev",
+        help="TUEV v2.0.1 parquet derived root (Protocol A.4b). "
+             "If supplied, also runs the TUEV 6-class BAC + WF1 + k-NN floor.",
+    ),
+    tuh_max_subjects: int = typer.Option(100, "--tuh-max-subjects",
+                                          help="cap TUH subjects per corpus"),
+    output_json: Path = typer.Option(
+        None, "--output-json",
+        help="Write the full CheckResult.details dict to this JSON path "
+             "for downstream programmatic consumption (e.g. results.md "
+             "row generation).",
+    ),
 ):
-    """Run only Check D (random-init linear-probe floor)."""
-    check_d_random_init_probe(derived_root=derived_root,
-                              max_subjects=max_subjects,
-                              max_windows_per_shard=max_windows_per_shard)
+    """Run only Check D (random-init linear-probe floor).
+
+    With ``--derived-root-tuab`` and/or ``--derived-root-tuev`` also runs
+    the §4.3 Protocol A.4 secondary eval (TUH literature-comparable
+    floor) on top of the HBN primary.
+    """
+    result = check_d_random_init_probe(
+        derived_root=derived_root,
+        max_subjects=max_subjects,
+        max_windows_per_shard=max_windows_per_shard,
+        derived_root_tuab=derived_root_tuab,
+        derived_root_tuev=derived_root_tuev,
+        tuh_max_subjects=tuh_max_subjects,
+    )
+    if output_json is not None:
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(result.to_dict(), indent=2, default=str))
+        print(f"\nresult written to {output_json}")
 
 
 @app.command()

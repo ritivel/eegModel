@@ -26,15 +26,25 @@ inside ``ProcessPoolExecutor`` workers without holding the GIL.
 
 Output schema (one row per (channel, 4-sec window) after iid expansion):
 
-    subject_id      string         e.g. "NDARABCD1234"
-    site            string         RU / CBIC / CUNY / SI (HBN site code)
-    recording_id    string         e.g. "task-RestingState"
+    # Corpus + identifying fields (the only mandatory keys; everything
+    # below is allowed to carry a sentinel for cross-corpus rows)
+    corpus          string         "hbn" / "tuab" / "tuev" (added 2026-05-04)
+    subject_id      string         e.g. "NDARABCD1234" (HBN), "aaaaaaaa" (TUH)
+    site            string         RU / CBIC / CUNY / SI (HBN site code), "" for TUH
+    recording_id    string         e.g. "task-RestingState" (HBN), "<edf_basename>"
+                                   (TUH); per-corpus the value is unique to the
+                                   recording but the format differs.
+
+    # HBN-only label (sentinel = -1 on TUH rows)
     task_label      int8           0..5  (RestingState=0 / seqLearning=1 /
                                           symbolSearch=2 / surroundSupp=3 /
                                           contrastChangeDetection=4 / Video=5)
-    channel_idx     int16          0..128 (HydroCel position; see hbn.HYDROCEL_128_NAMES;
-                                   index 128 = Cz reference, typically dropped downstream)
-    channel_name    string         e.g. "E62" or "Cz"
+
+    channel_idx     int16          per-corpus channel position. HBN: 0..128
+                                   (HydroCel, index 128 = Cz). TUH: 0..N-1
+                                   indexing into the per-recording channel
+                                   list returned by `tuh.load_recording`.
+    channel_name    string         e.g. "E62" / "Cz" (HBN), "EEG FP1-REF" (TUH)
     window_idx      int32          0, 1, 2, ... per recording
     window_start_s  float32        offset within recording, in seconds
     sample_rate_hz  int16          500 for minimal, 250 for v2_clean
@@ -46,7 +56,8 @@ Output schema (one row per (channel, 4-sec window) after iid expansion):
     # CBCL Pearson-z factors (the §4.3 Protocol A.1 eval targets — these
     # replaced the originally-spec'd ADHD-binary label after empirical
     # verification that HBN releases ship NO DSM-V Dx columns; see
-    # mini_experiments.md §4.3 Protocol A.1 for rationale)
+    # mini_experiments.md §4.3 Protocol A.1 for rationale).
+    # Sentinel = NaN on TUH rows.
     p_factor        float32        general psychopathology, NaN if missing
     attention       float32        ADHD-severity proxy (CBCL Attention factor), NaN if missing
     internalizing   float32        anxiety / depression, NaN if missing
@@ -58,8 +69,15 @@ Output schema (one row per (channel, 4-sec window) after iid expansion):
                                    future HBN release ships DSM-V Dx columns that match
                                    `hbn.ADHD_DX_PATTERN`
 
+    # TUH-only labels (sentinel = -1 on HBN rows; eval/A.4 reads these).
+    tuab_label      int8           0=normal, 1=abnormal, -1=N/A (TUAB only)
+    tuev_label      int8           0..5 per `tuh.TUEV_LABEL_NAMES`, -1=N/A (TUEV only)
+    tuh_split       string         "train" or "eval" — NEDC's official split
+                                   (per the AAREADME); empty on HBN rows.
+
     pipeline        string         "minimal" or "v2_clean"
-    src_sha256_8    string         first 8 hex chars of sha256(raw .set [+ .fdt if present]) — provenance
+    src_sha256_8    string         first 8 hex chars of sha256(raw .set [+ .fdt if present])
+                                   for HBN, sha256(.edf) for TUH — provenance
 
 Amplitude-scale note: MNE's `read_raw_eeglab(...).get_data()` returns raw
 sample values in volts as a numerical convention, but HBN .set files store
@@ -357,25 +375,57 @@ def iid_expand_rows(windows: np.ndarray, starts: np.ndarray, channel_names: list
 # ---------------------------------------------------------------------------
 
 
+# Default values for fields that weren't supplied by the caller. The schema
+# below is shared across HBN and TUH; corpora that don't have a particular
+# label (e.g. HBN doesn't have `tuab_label`) get the sentinel here so the
+# schema stays uniform and pyarrow can read mixed-corpus parquet sets without
+# dtype reconciliation.
+_FIELD_DEFAULTS: dict[str, object] = {
+    "corpus":      "hbn",
+    "tuh_split":   "",
+    "tuab_label":  -1,
+    "tuev_label":  -1,
+    # Existing fields (sentinels documented at module top)
+    "task_label":  -1,
+    "p_factor":    float("nan"),
+    "attention":   float("nan"),
+    "internalizing": float("nan"),
+    "externalizing": float("nan"),
+    "adhd":        -1,
+    "site":        "",
+    "age":         float("nan"),
+    "sex":         "",
+}
+
+
 PARQUET_SCHEMA_FIELDS = (
+    "corpus",
     "subject_id", "site", "recording_id", "task_label",
     "channel_idx", "channel_name", "window_idx", "window_start_s",
     "sample_rate_hz", "n_samples", "signal",
     "age", "sex",
     "p_factor", "attention", "internalizing", "externalizing",
     "adhd",
+    "tuab_label", "tuev_label", "tuh_split",
     "pipeline", "src_sha256_8",
 )
 
 
 def rows_to_parquet_table(rows: list[dict]):
-    """Build a pyarrow Table with an explicit schema (avoids type inference)."""
+    """Build a pyarrow Table with an explicit schema (avoids type inference).
+
+    Fills in :data:`_FIELD_DEFAULTS` for any column the caller didn't
+    populate — this is what lets HBN and TUH rows share the same schema
+    without forcing every caller to know about every other corpus's label
+    columns.
+    """
     import pyarrow as pa
 
     if not rows:
         raise ValueError("no rows to write")
 
     schema = pa.schema([
+        pa.field("corpus", pa.string()),
         pa.field("subject_id", pa.string()),
         pa.field("site", pa.string()),
         pa.field("recording_id", pa.string()),
@@ -396,6 +446,10 @@ def rows_to_parquet_table(rows: list[dict]):
         pa.field("externalizing", pa.float32()),
         # Legacy ADHD-binary slot (always -1 for current HBN)
         pa.field("adhd", pa.int8()),
+        # TUH labels (sentinels on HBN rows; populated only on tuab/tuev)
+        pa.field("tuab_label", pa.int8()),
+        pa.field("tuev_label", pa.int8()),
+        pa.field("tuh_split", pa.string()),
         pa.field("pipeline", pa.string()),
         pa.field("src_sha256_8", pa.string()),
     ])
@@ -403,7 +457,7 @@ def rows_to_parquet_table(rows: list[dict]):
     columns = {name: [] for name in PARQUET_SCHEMA_FIELDS}
     for r in rows:
         for name in PARQUET_SCHEMA_FIELDS:
-            columns[name].append(r.get(name))
+            columns[name].append(r.get(name, _FIELD_DEFAULTS.get(name)))
     return pa.table(columns, schema=schema)
 
 

@@ -28,4 +28,8 @@ wandb/
 
 # Local secrets / overrides
 .env
+.env.*
 .envrc
+
+# Standups: presentation drafts, working scratch, never committed
+standups/

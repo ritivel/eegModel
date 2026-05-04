@@ -27,6 +27,7 @@
 | **B — Input-independent baseline** | ✅ GREEN  | **5-seed verdict:** L1 rel-improvement mean = **−13.41 %** (CI [−20.81 %, −6.00 %]) across seeds 0–4. All 5 seeds negative (i.e., loss went *up* across training, the opposite of leak). Single-seed +2.1 % from the earlier run was within the noise this CI now reveals. Pos emb is **not** leaking signal info; the model converges to the marginal-prediction floor √(2/π) ≈ 0.80 across all seeds. |
 | **C — One-batch overfit**       | ✅ GREEN  | Loss crashed 1.8964 → 0.0139 in 1000 steps (final/init = 0.73%, beats the ≤1% threshold around step 350). |
 | **D — Random-init linear-probe floor** | ✅ GREEN  | Floor numbers recorded for the §4.3 Protocol A primary suite (HBN). 6-task BAC = 0.20 (chance ≈ 0.17), 6-task WF1 = 0.29, k-NN top-1 = 0.28, externalizing R² = −0.05, attention R² = −0.32, attention-binary AUROC = 0.43. All metrics consistent with "random encoder" baseline. Every later pretrained encoder must clearly beat these. |
+| **D.4 — Protocol A.4 floor (TUH secondary)** | 🟡 PENDING | Code-ready 2026-05-04 after NEDC SFTP unlock; awaits next GPU session. TUAB binary AUROC + TUEV 6-class BAC/WF1/k-NN to land via `scripts/track_a_run_on_gpu_box.sh`. See "Check D extension — Protocol A.4 floor" below. |
 | **E — Shape-and-mask audit**    | ✅ GREEN  | Every tensor shape matches `ModelConfig` predictions; encoder output (B, 125, 256) for B=2, 50% mask, T=2000 → 250 tokens, 125 visible. Decoder output (B, 250, 256). Reconstruction (B, 2000) with sample-level mask (B, 2000). |
 
 **Overall verdict:** 5/5 GREEN. No YELLOW, no RED. The pipeline is
@@ -310,12 +311,77 @@ most of the discrimination).
   must exceed: linear ≥ 0.21 and k-NN ≥ 0.30 are the "barely above
   floor" thresholds.
 
-**Caveat — TUH NEDC eval.** The §4.3 Protocol A.4 secondary (TUAB-binary
-AUROC + TUEV 6-class BAC + WF1) is pending TUH NEDC SFTP host arrival
-(per `progress.md` 2026-05-03T04:01 entry — application approved
-2026-05-02, ed25519 public key sent in-thread, awaiting Joe Picone's
-SFTP host). Will append TUH floor numbers as a separate row when
-access lands; mini-experiment 01 does not block on this.
+**Caveat — TUH NEDC eval (resolved 2026-05-04).** The §4.3 Protocol A.4
+secondary (TUAB-binary AUROC + TUEV 6-class BAC + WF1) was pending TUH
+NEDC SFTP host arrival; access **landed 2026-05-04T03:14 UTC** (Joe
+Picone installed our ed25519 key into NEDC's `authorized_keys`; smoke
+test on the local Mac passed first try). The follow-up row is now
+unblocked — see "Protocol A.4 floor (secondary)" below.
+
+---
+
+## Check D extension — Protocol A.4 floor (secondary, TUH literature-comparable)
+
+**Status:** code-ready 2026-05-04 (this commit); numbers will be filled
+in by the next GPU session via
+[`scripts/track_a_run_on_gpu_box.sh`](../../scripts/track_a_run_on_gpu_box.sh).
+
+**Setup.**
+- TUAB v3.0.1 (binary normal/abnormal AUROC, Protocol A.4a) and TUEV
+  v2.0.1 (6-class events: SPSW / GPED / PLED / EYEM / ARTF / BCKG;
+  Protocol A.4b BAC + WF1 + k-NN top-1).
+- Both ingested via `SPEC_V2_CLEAN` (60 Hz notch + 0.5–100 Hz Butterworth
+  bandpass + 500→250 Hz polyphase resample + per-channel z-score + ±5σ
+  clip + 4-s windowing + iid-channel expansion + float16 parquet) — the
+  literature-comparable cell matching BENDR / LaBraM / CBraMod / REVE
+  per `mini_experiments.md` §4.1.
+- Same random-init §4.2-default `EEGSSLModel` as Check D's primary HBN
+  run, frozen, mean-pool encoder output → (D = 256) features.
+- Per-corpus split: prefer NEDC's official `train` / `eval` partition for
+  direct literature comparability. LNSO (subject-disjoint 70/30) fallback
+  if the official eval set has < 50 windows after the per-corpus
+  `tuh_max_subjects=100` cap.
+- StandardScaler on train features only (no test leakage).
+- TUAB binary AUROC: sklearn `LogisticRegression` (lbfgs, max_iter=5000).
+- TUEV 6-class: sklearn `LogisticRegression` for BAC + WF1; sklearn
+  `KNeighborsClassifier` (k=5, cosine) for top-1.
+- 200 bootstrap resamples on the test split for 95 % CIs.
+
+**Per-window TUEV labels.** TUEV `.rec` annotations are `(channel,
+start_s, end_s, label_int_1..6)`. For the iid-channel pretraining recipe,
+we collapse the per-channel annotations to a *per-window file-level*
+label by summing event durations across all channels within the window
+and taking argmax. Windows with no overlapping `.rec` rows fall back to
+BCKG (5). This is the appropriate granularity for the random-init
+linear-probe floor; a finer per-channel labelling becomes possible after
+exp02 (frontend) decides whether the TCP montage transform belongs in
+the model. See `tuh.tuev_window_label` for the implementation.
+
+**Results.**
+
+| metric                                | point | 95 % CI low | 95 % CI high |
+|---------------------------------------|------:|------------:|-------------:|
+| TUAB binary AUROC                     |   _to be filled by GPU run_ |   |   |
+| TUEV 6-class BAC                      |   _to be filled_ |   |   |
+| TUEV 6-class WF1                      |   _to be filled_ |   |   |
+| TUEV k-NN top-1 (k=5, cosine, 6-task) |   _to be filled_ |   |   |
+
+After the next GPU session runs `track_a_run_on_gpu_box.sh`, the script
+prints the populated row to stdout and writes the full result JSON to
+`runs/01_sanity_baselines/<ts>_track_a/check_d_with_a4.json`. The "fill
+in the table" step is then literally a copy-paste; the JSON is the
+canonical record.
+
+**Reading the numbers (anticipated band).** Random features on TUAB-
+binary should land around 0.50 ± noise (chance for an evenly-balanced
+binary); the §4.3 spec calls a result within 1 % of this band "broken".
+TUEV 6-class BAC should land around 1/6 ≈ 0.17 ± noise; k-NN top-1
+typically beats linear probe on the 6-class task by a few pp because
+amplitude-similarity within the train set leaks something. Both numbers
+form the *floor* every later pretrained encoder must clearly exceed for
+its A.4 column to be honest.
+
+---
 
 ---
 
@@ -396,8 +462,13 @@ Per the spec's "What gets carried forward" section:
 - Re-run Check C with the §4.2 composite + bf16 once Mamba-2 segsum
   numerical stability is addressed in `03_backbone_ablation` (or a
   segsum-specific patch lands in mamba_ssm).
-- Append TUH Protocol A.4 floor numbers (TUAB AUROC, TUEV BAC + WF1)
-  when NEDC SFTP host arrives.
+- ~~Append TUH Protocol A.4 floor numbers (TUAB AUROC, TUEV BAC + WF1)
+  when NEDC SFTP host arrives.~~ **NEDC access landed 2026-05-04.**
+  Code is ready (`src/exp03/tuh.py`, `tuh-rsync` / `tuh-preprocess` CLI
+  commands, `eval.run_protocol_a4_*`, extended Check D in `sanity.py`).
+  Numbers will be filled by the next GPU session via
+  [`scripts/track_a_run_on_gpu_box.sh`](../../scripts/track_a_run_on_gpu_box.sh).
+  See "Check D extension — Protocol A.4 floor" above.
 
 ---
 

@@ -5,20 +5,32 @@ Layout (canonical):
     Local NVMe (ephemeral, fast working set on the GPU box):
         $EXP03_DATA_ROOT/                 — root, default /opt/dlami/nvme/eeg
         $EXP03_DATA_ROOT/raw/hbn/         — raw HBN .set/.fdt (downloaded once)
+        $EXP03_DATA_ROOT/raw/tuab/        — raw TUAB v3.0.1 EDFs (rsync from NEDC)
+        $EXP03_DATA_ROOT/raw/tuev/        — raw TUEV v2.0.1 EDFs + .rec annotations
         $EXP03_DATA_ROOT/derived/
             hbn_minimal_500hz/            — minimum-offline parquet shards (PRIMARY)
             hbn_v2_clean_250hz/           — F0-prep cell only (notch + bandpass + 250 Hz)
+            tuab_v2_clean_250hz/          — TUAB binary-AUROC eval cell (Protocol A.4a)
+            tuev_v2_clean_250hz/          — TUEV 6-class BAC/WF1 eval cell (Protocol A.4b)
         $EXP03_DATA_ROOT/runs/<exp>/<id>/ — checkpoints + metrics during training
         $EXP03_DATA_ROOT/models/          — HF cache (REVE / TFM / etc., later)
 
     S3 warehouse (persistent, cross-cloud):
         s3://eegmodel-warehouse/derived/hbn_minimal_500hz/        (mirror of above)
         s3://eegmodel-warehouse/derived/hbn_v2_clean_250hz/       (mirror of above)
+        s3://eegmodel-warehouse/derived/tuab_v2_clean_250hz/      (mirror of above)
+        s3://eegmodel-warehouse/derived/tuev_v2_clean_250hz/      (mirror of above)
         s3://eegmodel-warehouse/runs/exp03/<NN_name>/<run_id>/    (synced at job end)
         s3://eegmodel-warehouse/models/hf_cache/                  (mirror of above)
 
 Raw HBN is *not* mirrored to our bucket — FCP-INDI's `s3://fcp-indi/...` is
-the canonical NIH-funded source and will outlive our project.
+the canonical NIH-funded source and will outlive our project. Raw TUH is also
+*not* mirrored: NEDC's per-application access agreement explicitly asks
+each licensee to keep the data within their own systems and delete it
+when done; mirroring it to our bucket (even private) would violate the
+spirit of that agreement. The preprocessed parquet (z-scored, windowed,
+no raw signal recoverable in any clinically-useful sense) is fine to
+warehouse for our own re-use.
 """
 
 from __future__ import annotations
@@ -40,10 +52,22 @@ HBN_S3_PREFIX = "data/Projects/HBN/EEG"
 
 # Derived-shard pipeline names (one folder per pipeline variant, so the same
 # subject+task can have multiple parquet shards under different pipelines).
-PIPELINE_MINIMAL = "hbn_minimal_500hz"        # primary, per mini_experiments.md §4.1
-PIPELINE_V2_CLEAN = "hbn_v2_clean_250hz"      # F0-prep literature-comparability cell only
+PIPELINE_MINIMAL = "hbn_minimal_500hz"            # primary HBN, per mini_experiments.md §4.1
+PIPELINE_V2_CLEAN = "hbn_v2_clean_250hz"          # F0-prep literature-comparability cell only
+PIPELINE_TUAB_V2_CLEAN = "tuab_v2_clean_250hz"    # Protocol A.4a (TUAB binary AUROC)
+PIPELINE_TUEV_V2_CLEAN = "tuev_v2_clean_250hz"    # Protocol A.4b (TUEV 6-class BAC + WF1)
 
-DEFAULT_DATA_ROOT = "/opt/dlami/nvme/eeg"     # GPU-box NVMe scratch; override via env on other machines
+# Convenience: every derived-pipeline name we know about, in the order the
+# CLI prints them. Used by `sync-derived-up`/`sync-derived-down` when the
+# user asks for "all".
+ALL_PIPELINES: tuple[str, ...] = (
+    PIPELINE_MINIMAL,
+    PIPELINE_V2_CLEAN,
+    PIPELINE_TUAB_V2_CLEAN,
+    PIPELINE_TUEV_V2_CLEAN,
+)
+
+DEFAULT_DATA_ROOT = "/opt/dlami/nvme/eeg"         # GPU-box NVMe scratch; override via env on other machines
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +97,24 @@ class Storage:
     @property
     def raw_hbn(self) -> Path:
         return self.raw_root / "hbn"
+
+    @property
+    def raw_tuab(self) -> Path:
+        """Local mirror of NEDC's TUAB v3.0.1 tree (after `exp03 tuh-rsync tuab`)."""
+        return self.raw_root / "tuab"
+
+    @property
+    def raw_tuev(self) -> Path:
+        """Local mirror of NEDC's TUEV v2.0.1 tree (after `exp03 tuh-rsync tuev`)."""
+        return self.raw_root / "tuev"
+
+    def raw_tuh(self, corpus: str) -> Path:
+        """Dispatch helper: ``raw_tuh("tuab")`` → ``raw_tuab``, etc."""
+        if corpus == "tuab":
+            return self.raw_tuab
+        if corpus == "tuev":
+            return self.raw_tuev
+        raise ValueError(f"unknown TUH corpus: {corpus!r} (expected tuab|tuev)")
 
     @property
     def derived_root(self) -> Path:
@@ -125,8 +167,12 @@ class Storage:
     def ensure_dirs(self) -> None:
         for p in (
             self.raw_hbn,
+            self.raw_tuab,
+            self.raw_tuev,
             self.derived_pipeline(PIPELINE_MINIMAL),
             self.derived_pipeline(PIPELINE_V2_CLEAN),
+            self.derived_pipeline(PIPELINE_TUAB_V2_CLEAN),
+            self.derived_pipeline(PIPELINE_TUEV_V2_CLEAN),
             self.runs_root,
             self.hf_cache,
             self.scratch,
