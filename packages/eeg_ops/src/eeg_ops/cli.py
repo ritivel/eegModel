@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import aws as aws_mod
+from . import launcher as launcher_mod
 from . import prewarm
 from . import sky as sky_mod
 from .config import (
@@ -198,81 +199,211 @@ app.add_typer(cluster_app, name="cluster")
 
 @cluster_app.command("up")
 def cluster_up(
+    via: str = typer.Option(
+        "boto3", "--via",
+        help="'boto3' (default, fast, deterministic) or 'skypilot' (multi-cloud, "
+             "requires every AWS regional endpoint reachable from this network)."),
+    cluster_name: str = typer.Option("eeg-mumbai-2026w19", "--name"),
+    instance_type: str = typer.Option("p5.48xlarge", "--instance-type"),
+    key_name: str = typer.Option("eeg-mumbai-2026w19", "--key-name"),
+    security_group_id: str = typer.Option("sg-0a7017c9b48c300ca", "--sg"),
+    repo_url: str = typer.Option(
+        "https://github.com/ritivel/eegModel.git", "--repo-url"),
+    repo_branch: str = typer.Option("main", "--repo-branch"),
     yaml_path: Path = typer.Option(
         Path("infrastructure/aws-mumbai/eeg.sky.yaml"), "--yaml",
-        help="SkyPilot task YAML."),
-    cluster_name: str = typer.Option("eeg-mumbai-2026w19", "--name"),
-    retry_until_up: bool = typer.Option(True, "--retry-until-up/--no-retry"),
+        help="(SkyPilot path only) task YAML."),
+    retry_until_up: bool = typer.Option(True, "--retry-until-up/--no-retry",
+                                        help="(SkyPilot path only)"),
     forward_envs: list[str] = typer.Option(
         ["WANDB_API_KEY", "HF_TOKEN"], "--env",
         help="Local env-var names to forward into the cluster."),
 ):
-    """Launch the cluster. SkyPilot finds the registered reservation and
-    waits for it to flip to 'active' if needed (--retry-until-up)."""
+    """Launch the cluster against the active reservation.
+
+    Default ``--via boto3`` runs ``ec2:RunInstances`` directly with the
+    instance profile, security group, AMI, and reservation we already have
+    set up. Returns in ~3-5 min (instance pending → running → SSH ready).
+
+    ``--via skypilot`` delegates to ``sky launch``; nicer long-term
+    (multi-cloud failover, recipes, managed jobs) but currently fails on
+    networks that can't reach all AWS regional endpoints (it scans every
+    region for capacity reservations).
+    """
     import os
     state = State.load()
-    if state.active_reservation_id is None:
-        console.print("[yellow]warn[/yellow] no active reservation in state.toml — "
-                      "SkyPilot will fall back to on-demand pricing.")
-    extra_envs = {k: os.environ[k] for k in forward_envs if os.environ.get(k)}
-    rc = sky_mod.launch(
-        cluster_name=cluster_name, yaml_path=yaml_path,
-        retry_until_up=retry_until_up, extra_envs=extra_envs,
-    )
-    if rc == 0:
-        state.cluster_name = cluster_name
-        state.save()
-    raise typer.Exit(rc)
+
+    if via == "boto3":
+        active = state.get_active()
+        if active is None:
+            console.print("[red]no active reservation in state.toml[/red]")
+            raise typer.Exit(1)
+        rc = region_config(active.region)
+
+        # Resolve the IAM instance profile ARN — created by `eeg-ops iam create`.
+        import boto3
+        prof = boto3.client("iam").get_instance_profile(
+            InstanceProfileName=rc.instance_profile_name
+        )["InstanceProfile"]
+        ip_arn = prof["Arn"]
+
+        console.print(f"[cyan]launching[/cyan] {instance_type} into "
+                      f"{active.reservation_id} ({rc.region}) ...")
+        result = launcher_mod.launch_into_reservation(
+            region_cfg=rc,
+            reservation_id=active.reservation_id,
+            instance_type=instance_type,
+            key_name=key_name,
+            security_group_id=security_group_id,
+            instance_profile_arn=ip_arn,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            name_tag=cluster_name,
+            wandb_api_key=os.environ.get("WANDB_API_KEY"),
+            hf_token=os.environ.get("HF_TOKEN"),
+        )
+        launcher_mod.remember_launch(
+            state, cluster_name=cluster_name,
+            instance_id=result.instance_id, public_ip=result.public_ip,
+        )
+        console.print(f"[green]✓[/green] instance: [cyan]{result.instance_id}[/cyan]")
+        console.print(f"[green]✓[/green] public IP: [cyan]{result.public_ip}[/cyan]")
+        console.print()
+        console.print("Connect:")
+        console.print(f"  [bold]ssh -A -i ~/.ssh/{key_name}.pem ubuntu@{result.public_ip}[/bold]")
+        console.print()
+        console.print("Bootstrap is running on the box (cloud-init). Tail:")
+        console.print(f"  [dim]ssh ubuntu@{result.public_ip} 'sudo tail -f /var/log/eeg-bootstrap.log'[/dim]")
+        return
+
+    if via == "skypilot":
+        if state.active_reservation_id is None:
+            console.print("[yellow]warn[/yellow] no active reservation in state.toml.")
+        extra_envs = {k: os.environ[k] for k in forward_envs if os.environ.get(k)}
+        rc_code = sky_mod.launch(
+            cluster_name=cluster_name, yaml_path=yaml_path,
+            retry_until_up=retry_until_up, extra_envs=extra_envs,
+        )
+        if rc_code == 0:
+            state.cluster_name = cluster_name
+            state.save()
+        raise typer.Exit(rc_code)
+
+    console.print(f"[red]unknown --via value: {via!r}[/red]")
+    raise typer.Exit(2)
 
 
 @cluster_app.command("status")
 def cluster_status(
     name: str = typer.Option(None, "--name"),
+    via: str = typer.Option("boto3", "--via",
+                            help="'boto3' to query EC2 directly, 'skypilot' for sky status"),
 ):
+    """Show the cluster's instance state, IPs, and ssh command."""
     state = State.load()
-    raise typer.Exit(sky_mod.status(cluster_name=name or state.cluster_name))
+    if via == "skypilot":
+        raise typer.Exit(sky_mod.status(cluster_name=name or state.cluster_name))
+
+    # boto3 path
+    active = state.get_active()
+    if active is None:
+        console.print("[yellow]no active reservation in state.toml[/yellow]")
+        raise typer.Exit(1)
+    cluster_tag = name or (state.cluster_name or "").split(":")[0] or "eeg-mumbai-2026w19"
+    instances = launcher_mod.find_instances(region=active.region, cluster_tag=cluster_tag)
+    if not instances:
+        console.print(f"[yellow]no instances tagged cluster={cluster_tag} in {active.region}[/yellow]")
+        raise typer.Exit(0)
+    t = Table(title=f"Cluster {cluster_tag}")
+    for col in ("instance_id", "state", "type", "public_ip", "az", "launch_time"):
+        t.add_column(col, style="cyan" if col == "instance_id" else None)
+    for i in instances:
+        t.add_row(*[str(i.get(c, "")) for c in ("instance_id", "state", "type",
+                                                 "public_ip", "az", "launch_time")])
+    console.print(t)
 
 
 @cluster_app.command("exec")
 def cluster_exec(
     command: str = typer.Argument(..., help="Quoted shell command to run on the cluster."),
     name: str = typer.Option(None, "--name"),
+    via: str = typer.Option("boto3", "--via",
+                            help="'boto3' (ssh into the IP from state.toml) or 'skypilot' (sky exec)"),
+    key_name: str = typer.Option("eeg-mumbai-2026w19", "--key-name"),
 ):
+    """Run a shell command on the cluster."""
     state = State.load()
-    cn = name or state.cluster_name
-    if not cn:
-        console.print("[red]no cluster name in state.toml[/red]")
+    if via == "skypilot":
+        cn = name or state.cluster_name
+        if not cn:
+            console.print("[red]no cluster name in state.toml[/red]")
+            raise typer.Exit(1)
+        raise typer.Exit(sky_mod.exec_remote(cluster_name=cn, command=command))
+
+    # boto3 path: ssh in directly
+    active = state.get_active()
+    if active is None or not state.cluster_name or ":" not in state.cluster_name:
+        console.print("[red]boto3 path requires `eeg-ops cluster up --via boto3` first[/red]")
         raise typer.Exit(1)
-    raise typer.Exit(sky_mod.exec_remote(cluster_name=cn, command=command))
+    _name, _instance_id, ip = state.cluster_name.split(":", 2)
+    if ip == "-":
+        console.print("[red]no public IP recorded in state.toml[/red]")
+        raise typer.Exit(1)
+    import subprocess
+    full = (
+        f"ssh -A -i ~/.ssh/{key_name}.pem -o StrictHostKeyChecking=accept-new "
+        f"ubuntu@{ip} {command!r}"
+    )
+    raise typer.Exit(subprocess.call(full, shell=True))
 
 
 @cluster_app.command("down")
 def cluster_down(
     name: str = typer.Option(None, "--name"),
+    via: str = typer.Option("boto3", "--via",
+                            help="'boto3' to ec2:TerminateInstances, 'skypilot' for sky down"),
     sync_runs: bool = typer.Option(True, "--sync-runs/--no-sync",
                                    help="rsync $EXP03_DATA_ROOT/runs/ → warehouse before terminate"),
+    key_name: str = typer.Option("eeg-mumbai-2026w19", "--key-name"),
 ):
     """Terminate the cluster, optionally pushing local runs/ back to the warehouse first."""
     state = State.load()
-    cn = name or state.cluster_name
-    if cn is None:
-        console.print("[red]no cluster name in state.toml[/red]")
+    active = state.get_active()
+    if active is None:
+        console.print("[red]no active reservation in state.toml[/red]")
         raise typer.Exit(1)
 
-    if sync_runs:
-        cmd = (
-            "source ~/sky_workdir/.venv/bin/activate 2>/dev/null; "
-            "rclone copy /opt/dlami/nvme/eeg/runs/ s3w:runs/exp03/ "
-            "--transfers 32 --checkers 32 --quiet"
-        )
-        console.print(f"[cyan]sync runs/ → warehouse on {cn}[/cyan]")
-        sky_mod.exec_remote(cluster_name=cn, command=cmd)
+    cluster_tag = name or (state.cluster_name or "").split(":")[0] or "eeg-mumbai-2026w19"
 
-    rc = sky_mod.down(cluster_name=cn)
+    if sync_runs:
+        instances = launcher_mod.find_instances(region=active.region, cluster_tag=cluster_tag)
+        running = [i for i in instances if i["state"] == "running"]
+        if running and via == "boto3":
+            ip = running[0]["public_ip"]
+            console.print(f"[cyan]sync runs/ → warehouse on {ip}[/cyan]")
+            ssh_cmd = (
+                f"ssh -i ~/.ssh/{key_name}.pem -o StrictHostKeyChecking=accept-new "
+                f"ubuntu@{ip} '"
+                "rclone copy /opt/dlami/nvme/eeg/runs/ s3w:runs/exp03/ "
+                "--transfers 32 --checkers 32 --quiet || true'"
+            )
+            import subprocess
+            subprocess.call(ssh_cmd, shell=True)
+        elif via == "skypilot":
+            sky_cmd = (
+                "rclone copy /opt/dlami/nvme/eeg/runs/ s3w:runs/exp03/ "
+                "--transfers 32 --checkers 32 --quiet"
+            )
+            sky_mod.exec_remote(cluster_name=state.cluster_name or cluster_tag, command=sky_cmd)
+
+    if via == "skypilot":
+        rc = sky_mod.down(cluster_name=state.cluster_name or cluster_tag)
+    else:
+        n = launcher_mod.terminate_cluster(region=active.region, cluster_tag=cluster_tag)
+        console.print(f"[green]✓[/green] terminated {n} instance(s)")
+        rc = 0
+
     if rc == 0:
-        # Unregister the now-spent reservation from sky config so future launches
-        # don't slow down on a dead ID.
-        active = state.get_active()
         if active is not None:
             sky_mod.unregister_capacity_reservation(active.reservation_id)
         state.cluster_name = None
@@ -334,6 +465,9 @@ def iam_create(
     )
     console.print(f"[green]✓[/green] role: [cyan]{arns['role_arn']}[/cyan]")
     console.print(f"[green]✓[/green] instance profile: [cyan]{arns['instance_profile_arn']}[/cyan]")
+    # Plumb the role into ~/.sky/config.yaml so `sky launch` attaches it.
+    sky_mod.set_remote_identity(arns["role_arn"])
+    console.print("[green]✓[/green] ~/.sky/config.yaml updated: aws.remote_identity")
 
 
 # ---------------------------------------------------------------------------

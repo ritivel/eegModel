@@ -39,10 +39,11 @@ resources:
   disk_size: 200          # root EBS; NVMe is separate, 30 TB at /opt/dlami/nvme
   image_id: ami-0eb5a4f0d81f671e3   # DLAMI PyTorch 2.7 Ubuntu 22.04 (2026-04-28)
   use_spot: false
-  # Instance profile created by `eeg-ops iam create --region ap-south-1`.
-  # Grants the box S3 RW on eegmodel-warehouse + eeg-mumbai-139156132535 plus
-  # CloudWatch logs/metrics — no need to scp ~/.aws/credentials onto NVMe.
-  iam_instance_profile_arn: arn:aws:iam::139156132535:instance-profile/eeg-ops-instance-profile
+  # IAM instance profile is set via `aws.remote_identity` in ~/.sky/config.yaml,
+  # populated by `eeg-ops iam create`. We don't put it in the resources block
+  # because SkyPilot rejects it there as of 0.10.x; the global config is the
+  # supported path. The role gives the box S3 RW on eegmodel-warehouse +
+  # eeg-mumbai-139156132535 plus CloudWatch logs/metrics — no creds copy.
 
 # Sync local working tree to /home/ubuntu/sky_workdir on the box. .skyignore
 # excludes large local dirs (data/, .venv*/, etc.) from the rsync.

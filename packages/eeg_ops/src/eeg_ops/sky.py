@@ -37,8 +37,34 @@ def register_capacity_reservation(reservation_id: str) -> None:
     reservations = aws_cfg.setdefault("specific_reservations", [])
     if reservation_id not in reservations:
         reservations.append(reservation_id)
-    # Always also flip on prioritize so reservations are considered free.
-    aws_cfg["prioritize_reservations"] = True
+    # NOTE: deliberately do NOT set ``aws.prioritize_reservations = True``.
+    # That flag tells the optimizer to scan every AWS region globally
+    # looking for "open" reservations to consume. Our capacity blocks are
+    # always ``targeted``, and ``specific_reservations`` plus a region-pinned
+    # ``infra:`` in the task YAML is sufficient for SkyPilot to route the
+    # launch into the reserved capacity at zero on-demand cost. Setting
+    # ``prioritize_reservations`` triggers a 5+ min ``ec2.<region>`` probe
+    # that fails on regions whose endpoint is unreachable from this network
+    # (e.g. me-south-1).
+    aws_cfg.pop("prioritize_reservations", None)
+    SKY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    yaml.dump(cfg, SKY_CONFIG_PATH)
+
+
+def set_remote_identity(role_arn_or_name: str) -> None:
+    """Set ``aws.remote_identity`` in ``~/.sky/config.yaml`` so launched
+    instances assume the IAM role for S3/CloudWatch access.
+
+    Either an ARN (``arn:aws:iam::123:role/Foo``) or a bare role name works;
+    SkyPilot resolves both. Idempotent.
+    """
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    if SKY_CONFIG_PATH.exists():
+        cfg = yaml.load(SKY_CONFIG_PATH) or {}
+    else:
+        cfg = {}
+    cfg.setdefault("aws", {})["remote_identity"] = role_arn_or_name
     SKY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     yaml.dump(cfg, SKY_CONFIG_PATH)
 

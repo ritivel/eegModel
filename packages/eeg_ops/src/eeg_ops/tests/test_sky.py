@@ -21,7 +21,22 @@ def test_register_capacity_reservation_creates_file(isolated_sky_config: Path):
     sky_mod.register_capacity_reservation("cr-123")
     cfg = YAML().load(isolated_sky_config.read_text())
     assert cfg["aws"]["specific_reservations"] == ["cr-123"]
-    assert cfg["aws"]["prioritize_reservations"] is True
+    # Deliberately NOT set: targeted CRs don't need (and break on) the
+    # global region scan that prioritize_reservations triggers.
+    assert "prioritize_reservations" not in cfg["aws"]
+
+
+def test_register_capacity_reservation_strips_prioritize_if_present(
+    isolated_sky_config: Path,
+):
+    isolated_sky_config.parent.mkdir(parents=True, exist_ok=True)
+    isolated_sky_config.write_text(
+        "aws:\n  prioritize_reservations: true\n  specific_reservations: []\n"
+    )
+    sky_mod.register_capacity_reservation("cr-1")
+    cfg = YAML().load(isolated_sky_config.read_text())
+    assert "prioritize_reservations" not in cfg["aws"]
+    assert cfg["aws"]["specific_reservations"] == ["cr-1"]
 
 
 def test_register_capacity_reservation_idempotent(isolated_sky_config: Path):
