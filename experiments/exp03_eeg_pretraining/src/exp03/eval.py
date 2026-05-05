@@ -325,6 +325,170 @@ def bootstrap_ci(
 
 
 # =============================================================================
+# Feature-health diagnostics (added 2026-05-05 for mini-experiment 17 v2)
+# =============================================================================
+#
+# Per the literature review in 17_generative_paradigm/results.md §5.4, the
+# observed v1 failure modes are well-documented mechanisms with concrete
+# diagnostics. These functions implement the diagnostics so v2 cells get
+# scored for known failure modes alongside the headline metric.
+
+
+def compute_feature_diagnostics(
+    extracted: ExtractedFeatures,
+    *,
+    seed: int = 0,
+    subject_id_max: int = 50,                     # cap subjects to keep ID-probe fast
+) -> dict[str, Any]:
+    """Compute literature-grounded feature-health diagnostics.
+
+    Returns a dict with three groups of metrics:
+
+    * ``subject_id_probe`` — accuracy of a logistic regression trained to
+      predict ``subject_id`` from the frozen features. Per ContentVec
+      ICML 2022 (https://proceedings.mlr.press/v162/qian22b.html), HuBERT
+      hits 81.4 % speaker-ID accuracy under linear probe — a sign that
+      the encoder dominantly encodes speaker / subject identity rather
+      than content. Threshold: > 60 % is a warning; > 80 % means
+      subject-fingerprint dominance is the most likely explanation for
+      any downstream linear-probe failure.
+
+    * ``effective_rank`` and ``rank_ratio`` — effective rank of the
+      feature covariance (Roy & Vetterli 2007 entropy-based rank) and
+      the ratio to the embedding dim. Per Jing et al. ICLR 2022
+      (https://openreview.net/forum?id=YevsQ05DEN7), dimensional
+      collapse manifests as a few large eigenvalues dominating the
+      covariance. Threshold: ``rank_ratio < 0.5`` indicates collapse.
+
+    * ``site_id_probe`` — same as subject-ID but for ``site`` labels
+      (when multi-site data is present). Per CRCC arXiv:2602.19138, EEG
+      foundation models often memorise site / amplifier fingerprint;
+      ``> 60 %`` accuracy means downstream metrics may be
+      site-confounded.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import accuracy_score
+    from sklearn.preprocessing import StandardScaler
+
+    out: dict[str, Any] = {}
+    X = extracted.features                                            # (N, D)
+    n, d = X.shape
+
+    # --- 1. Effective rank of the feature covariance -----------------
+    # Numerically stable: standardize features, compute SVD on the
+    # covariance, then entropy of the normalized eigenvalue distribution.
+    Xz = StandardScaler(with_mean=True, with_std=False).fit_transform(X)
+    # Use SVD of (X / sqrt(n-1)) — the singular values squared are the
+    # eigenvalues of the covariance.
+    try:
+        s = np.linalg.svd(Xz / max(np.sqrt(n - 1), 1.0), compute_uv=False)
+        eigvals = s ** 2
+        eigvals = eigvals[eigvals > 1e-12]
+        if eigvals.size > 0:
+            p = eigvals / eigvals.sum()
+            entropy = float(-(p * np.log(p)).sum())
+            eff_rank = float(np.exp(entropy))
+            out["effective_rank"] = eff_rank
+            out["rank_ratio"] = float(eff_rank / d)
+            out["top1_eigenvalue_share"] = float(p[0])
+            out["top5_eigenvalue_share"] = float(p[:5].sum())
+        else:
+            out["effective_rank"] = 0.0
+            out["rank_ratio"] = 0.0
+            out["top1_eigenvalue_share"] = float("nan")
+            out["top5_eigenvalue_share"] = float("nan")
+    except np.linalg.LinAlgError as e:                                # noqa: BLE001
+        out["effective_rank"] = float("nan")
+        out["rank_ratio"] = float("nan")
+        out["error_svd"] = str(e)
+
+    # --- 2. Subject-ID linear-probe accuracy --------------------------
+    # Use a subject-stratified split: pick top-K subjects with the most
+    # samples (capped at ``subject_id_max``), train a logreg to predict
+    # subject ID from features, hold out 30 % of each subject's samples
+    # for evaluation. This is in-distribution for subject identity (we
+    # explicitly want to know if the encoder fingerprints a subject) so
+    # we do NOT use LNSO here.
+    rng = np.random.default_rng(seed)
+    sub_arr = np.asarray(extracted.subject_ids)
+    unique_subs, counts = np.unique(sub_arr, return_counts=True)
+    keep_n = min(subject_id_max, unique_subs.size)
+    if keep_n >= 2:
+        top_subs_idx = np.argsort(counts)[-keep_n:]
+        top_subs = set(unique_subs[top_subs_idx].tolist())
+        keep_mask = np.isin(sub_arr, list(top_subs))
+        Xs = X[keep_mask]
+        ys_str = sub_arr[keep_mask]
+        # encode subject str → int label
+        sub_to_label = {s: i for i, s in enumerate(sorted(set(ys_str.tolist())))}
+        ys = np.asarray([sub_to_label[s] for s in ys_str], dtype=np.int32)
+        # 70/30 within-subject split
+        idx = np.arange(Xs.shape[0])
+        rng.shuffle(idx)
+        n_test = max(int(idx.size * 0.30), keep_n)
+        test_idx, train_idx = idx[:n_test], idx[n_test:]
+        try:
+            scaler = StandardScaler()
+            Xtr = scaler.fit_transform(Xs[train_idx])
+            Xte = scaler.transform(Xs[test_idx])
+            clf = LogisticRegression(max_iter=2000, n_jobs=1, multi_class="auto")
+            clf.fit(Xtr, ys[train_idx])
+            acc = float(accuracy_score(ys[test_idx], clf.predict(Xte)))
+            chance = 1.0 / keep_n
+            out["subject_id_probe"] = {
+                "accuracy": acc,
+                "chance": chance,
+                "lift_above_chance": acc - chance,
+                "n_subjects": int(keep_n),
+                "interpretation": (
+                    "fingerprint_dominance"
+                    if acc > 0.60
+                    else ("moderate_signal" if acc > 2 * chance else "weak_signal")
+                ),
+            }
+        except Exception as e:                                       # noqa: BLE001
+            out["subject_id_probe"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        out["subject_id_probe"] = {"reason": "fewer than 2 subjects"}
+
+    # --- 3. Site-ID linear-probe accuracy (if multi-site) -------------
+    site_arr = np.asarray(extracted.site)
+    unique_sites = np.unique(site_arr)
+    if unique_sites.size >= 2:
+        site_to_label = {s: i for i, s in enumerate(sorted(unique_sites.tolist()))}
+        ys = np.asarray([site_to_label[s] for s in site_arr], dtype=np.int32)
+        idx = np.arange(X.shape[0])
+        rng.shuffle(idx)
+        n_test = max(int(idx.size * 0.30), unique_sites.size)
+        test_idx, train_idx = idx[:n_test], idx[n_test:]
+        try:
+            scaler = StandardScaler()
+            Xtr = scaler.fit_transform(X[train_idx])
+            Xte = scaler.transform(X[test_idx])
+            clf = LogisticRegression(max_iter=2000, n_jobs=1, multi_class="auto")
+            clf.fit(Xtr, ys[train_idx])
+            acc = float(accuracy_score(ys[test_idx], clf.predict(Xte)))
+            chance = 1.0 / unique_sites.size
+            out["site_id_probe"] = {
+                "accuracy": acc,
+                "chance": chance,
+                "lift_above_chance": acc - chance,
+                "n_sites": int(unique_sites.size),
+                "interpretation": (
+                    "site_fingerprint_dominance"
+                    if acc > 0.60
+                    else ("moderate_signal" if acc > 2 * chance else "weak_signal")
+                ),
+            }
+        except Exception as e:                                       # noqa: BLE001
+            out["site_id_probe"] = {"error": f"{type(e).__name__}: {e}"}
+    else:
+        out["site_id_probe"] = {"reason": "single-site data"}
+
+    return out
+
+
+# =============================================================================
 # §4.3 Protocol A — frozen probing (primary)
 # =============================================================================
 
@@ -353,7 +517,7 @@ def run_protocol_a(
         task6_bac, task6_wf1,
         knn_top1_task6,
     """
-    from sklearn.linear_model import LinearRegression, LogisticRegression
+    from sklearn.linear_model import LogisticRegression, RidgeCV
     from sklearn.metrics import (balanced_accuracy_score, f1_score,
                                   mean_absolute_error, r2_score, roc_auc_score)
     from sklearn.neighbors import KNeighborsClassifier
@@ -373,12 +537,19 @@ def run_protocol_a(
 
     out: dict[str, Any] = {}
 
+    # Ridge alphas swept by RidgeCV. The cell-level value is whatever fits
+    # train best in 5-fold CV. With D=256 features and ~thousands of LNSO
+    # samples, plain LinearRegression overfits subject-fingerprint signals
+    # in train and produces strongly negative R² on test (this happened
+    # in the 2026-05-04 first run — that's why we switched to RidgeCV).
+    _RIDGE_ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0, 1_000.0, 10_000.0)
+
     # ---------- A.1a — externalizing-factor regression ----------
     y = extracted.externalizing
     mask_train, y_train = _drop_nan(y[train_idx])
     mask_test, y_test = _drop_nan(y[test_idx])
     if mask_train.sum() >= 50 and mask_test.sum() >= 50:
-        reg = LinearRegression().fit(X_train[mask_train], y_train)
+        reg = RidgeCV(alphas=_RIDGE_ALPHAS, cv=5).fit(X_train[mask_train], y_train)
         y_pred = reg.predict(X_test[mask_test])
         r2_full = r2_score(y_test, y_pred)
         mae_full = mean_absolute_error(y_test, y_pred)
@@ -388,6 +559,7 @@ def run_protocol_a(
         def _mae(idx):
             return mean_absolute_error(y_test[idx], y_pred[idx])
         out["externalizing_r2"] = {"point": float(r2_full),
+                                   "alpha": float(reg.alpha_),
                                    **bootstrap_ci(_r2, n_bootstrap=n_bootstrap, seed=seed,
                                                   n=mask_test.sum())}
         out["externalizing_mae"] = {"point": float(mae_full),
@@ -403,7 +575,7 @@ def run_protocol_a(
     mask_train, y_train = _drop_nan(y[train_idx])
     mask_test, y_test = _drop_nan(y[test_idx])
     if mask_train.sum() >= 50 and mask_test.sum() >= 50:
-        reg = LinearRegression().fit(X_train[mask_train], y_train)
+        reg = RidgeCV(alphas=_RIDGE_ALPHAS, cv=5).fit(X_train[mask_train], y_train)
         y_pred = reg.predict(X_test[mask_test])
         r2_full = r2_score(y_test, y_pred)
         mae_full = mean_absolute_error(y_test, y_pred)
@@ -413,6 +585,7 @@ def run_protocol_a(
         def _mae(idx):
             return mean_absolute_error(y_test[idx], y_pred[idx])
         out["attention_r2"] = {"point": float(r2_full),
+                               "alpha": float(reg.alpha_),
                                **bootstrap_ci(_r2, n_bootstrap=n_bootstrap, seed=seed,
                                               n=mask_test.sum())}
         out["attention_mae"] = {"point": float(mae_full),
@@ -470,6 +643,15 @@ def run_protocol_a(
                                            n=test_idx.size)}
     else:
         out["task6_bac"] = {"reason": "only one task class in train split"}
+
+    # ---------- Diagnostics — failure-mode detectors per v1 lit review ----
+    # These are cheap (sklearn + numpy) and run in <1 s. They give actionable
+    # signals when a paradigm appears to fail downstream — e.g. high subject-ID
+    # accuracy on frozen features means the encoder learned subject identity
+    # rather than task signal (the ContentVec / CLISA failure mode), and low
+    # effective rank means dimensional collapse (Jing et al. ICLR 2022).
+    diagnostics = compute_feature_diagnostics(extracted, seed=seed)
+    out["diagnostics"] = diagnostics
 
     # ---------- A.3 — k-NN top-1 on a 10k subset, 6-task labels ----------
     knn_n = min(knn_subset, train_idx.size + test_idx.size)

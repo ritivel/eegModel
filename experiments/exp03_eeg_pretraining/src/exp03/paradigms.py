@@ -595,6 +595,216 @@ class MARDiffLossHead(ParadigmHead):
 
 
 # ---------------------------------------------------------------------------
+# G3 — Latent-prediction (EEG2Rep / I-JEPA style) — added 2026-05-05 for
+# mini-experiment 17 v2. See `17_generative_paradigm/README.md` "v2 design".
+# ---------------------------------------------------------------------------
+
+
+class LatentJEPAHead(ParadigmHead):
+    """JEPA-style latent-space prediction head for the G3 paradigm.
+
+    The motivation (per `17_generative_paradigm/results.md` §5.2) is that
+    on EEG, raw-signal-reconstruction objectives (G0/G1/G2) are dominated
+    by ~−20 dB acoustic noise — the encoder learns to predict noise
+    structure, not EEG content. The fix that EEG2Rep / I-JEPA / ECG-JEPA
+    converged on independently is to **predict the representation of
+    masked patches**, where the target representation is computed by an
+    EMA-updated copy of the online encoder ("target encoder"). The
+    target encoder has already filtered out un-reconstructable noise
+    because it learns under the same SSL pressure.
+
+    Setup (per `17_generative_paradigm/README.md` v2 G3 row):
+
+    * **Online encoder** = the existing ``EEGSSLModel`` encoder (frontend
+      + bidirectional Mamba-2). Sees only visible patches under random
+      50% masking. Its output at *visible* positions is fed to the
+      predictor along with learned mask tokens at masked positions.
+    * **Target encoder** = an EMA copy of the online encoder, momentum
+      0.996 (BYOL default). Sees the FULL un-masked input and produces
+      ``(B, T_tokens, D)`` features. Its parameters are detached from
+      the autograd graph; updated via a momentum step after every
+      optimizer step (the train loop is responsible for calling
+      :meth:`update_target_encoder`).
+    * **Predictor** = a small MLP (default 2-layer, hidden 1024) that
+      maps ``(B, T_tokens, D) -> (B, T_tokens, D)``. Predicts the
+      target encoder's representation at every position (loss is
+      computed only on masked positions).
+    * **Loss** = smooth-L1 (Huber) between the predictor's output and
+      the target encoder's output, averaged over masked positions.
+      Smooth-L1 (rather than L2) per the I-JEPA recipe — more robust
+      to outlier patches that the target encoder happens to encode
+      with high norm.
+
+    Inputs (from a refactored :meth:`EEGSSLModel.forward` that
+    additionally computes ``target_full_features``):
+
+        encoded               (B, n_visible, D)   online encoder output, masked tokens dropped
+        mask_module_out       MaskOutput          ids_keep, ids_restore, sample-level mask
+        target_full_features  (B, T_tokens, D)    target encoder output on the FULL un-masked input
+        target                (B, T_samples)      raw input signal — UNUSED here; kept for interface
+
+    Outputs:
+
+        loss                  scalar              smooth-L1 on masked positions
+        components            dict[str, float]    loss components for wandb
+        predicted_latent      (B, T_tokens, D)    predictor output at all positions
+
+    References:
+
+    * EEG2Rep (Foumani et al. KDD 2024, https://arxiv.org/abs/2402.17772):
+      ``+13.12% linear-probe accuracy`` over input-space prediction on
+      EEG. The semantic-subsequence-preserving (SSP) masking strategy
+      is from this paper; we use the standard random-patch masking from
+      our existing :mod:`exp03.model.RandomPatchMask` for v2 to keep the
+      ablation clean (G0/G2/G3 all use the same masking).
+    * I-JEPA (Assran et al. CVPR 2023, https://arxiv.org/abs/2301.08243):
+      The original representation-space prediction paper, on images.
+    * ECG-JEPA (Kim 2024, https://arxiv.org/abs/2410.04339):
+      The closest biosignal precedent — JEPA on 12-lead ECG, SOTA on
+      PTB-XL; the architecture template we follow most closely.
+    * BYOL (Grill et al. NeurIPS 2020, https://arxiv.org/abs/2006.07733):
+      EMA target-encoder mechanism; momentum 0.996 is the BYOL default.
+
+    Wire-up notes (for :class:`EEGSSLModel` integration — done in
+    model.py for v2):
+
+    1. ``EEGSSLModel.__init__`` builds a target encoder as
+       ``copy.deepcopy(self.encoder)`` plus a deepcopy of the frontend
+       and ``encoder_pos_emb``, all with ``requires_grad=False``. They
+       are passed into ``LatentJEPAHead(target_encoder=...)``.
+    2. ``EEGSSLModel.forward`` for the JEPA paradigm runs the FULL input
+       (no masking) through the target encoder under ``torch.no_grad()``,
+       producing ``target_full_features``. It then runs the visible
+       patches through the online encoder and dispatches to this head.
+    3. The training loop calls ``model.paradigm.update_target_encoder(
+       model.encoder)`` after each ``optimizer.step()``. (We expose
+       ``update_target_encoder_from(model)`` as a convenience that
+       handles the frontend + encoder + pos-emb update.)
+    """
+
+    def __init__(
+        self,
+        cfg: ParadigmConfig,
+        *,
+        d_model: int,
+        target_encoder: nn.Module,
+        target_frontend: nn.Module | None = None,
+        target_pos_emb: nn.Module | None = None,
+        ema_momentum: float = 0.996,
+        predictor_hidden: int = 1024,
+        predictor_layers: int = 2,
+    ):
+        super().__init__(cfg)
+        self.d_model = d_model
+        self.ema_momentum = ema_momentum
+
+        # The target encoder + frontend + pos-emb are deep copies of the
+        # online versions, with grad disabled. Updated via momentum from
+        # the online encoder after each training step.
+        self.target_encoder = target_encoder
+        self.target_frontend = target_frontend
+        self.target_pos_emb = target_pos_emb
+        for module in (self.target_encoder, self.target_frontend, self.target_pos_emb):
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = False
+
+        # Predictor: visible-features (with mask tokens at masked positions
+        # in original order) → predicted latent at every position.
+        layers: list[nn.Module] = []
+        in_dim = d_model
+        for _ in range(max(predictor_layers - 1, 0)):
+            layers.append(nn.Linear(in_dim, predictor_hidden))
+            layers.append(nn.GELU())
+            in_dim = predictor_hidden
+        layers.append(nn.Linear(in_dim, d_model))
+        self.predictor = nn.Sequential(*layers)
+
+        # Predictor's mask token: a learned vector that fills the masked
+        # positions in the input to the predictor (NOT the same as the
+        # MAE decoder's mask_token, which goes into the decoder).
+        self.mask_token_predictor = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.normal_(self.mask_token_predictor, std=0.02)
+
+    def forward(
+        self,
+        *,
+        encoded: torch.Tensor,                          # (B, n_visible, D)
+        mask_module_out,
+        target_full_features: torch.Tensor,             # (B, T_tokens, D), no_grad
+        target: torch.Tensor | None = None,             # raw signal, UNUSED
+        loss_fn: nn.Module | None = None,
+    ) -> dict[str, Any]:
+        del target, loss_fn  # not used by this head
+
+        B, n_visible, D = encoded.shape
+        T_tokens = mask_module_out.mask.size(1)
+        n_masked = T_tokens - n_visible
+
+        # Build predictor input: visible features (online encoder) +
+        # learned mask tokens at masked positions, restored to original
+        # token order using ids_restore.
+        mask_tokens = self.mask_token_predictor.expand(B, n_masked, D)
+        x_full = torch.cat([encoded, mask_tokens], dim=1)
+        ids_restore_d = mask_module_out.ids_restore.unsqueeze(-1).expand(-1, -1, D)
+        x_full = torch.gather(x_full, dim=1, index=ids_restore_d)
+
+        # Predictor pass — predicts target encoder's features at every
+        # position. We compute loss only on masked positions.
+        predicted = self.predictor(x_full)              # (B, T_tokens, D)
+
+        # Smooth-L1 (Huber) loss per (sample, token, dim), then average
+        # over the embedding dim and the masked positions only. Per the
+        # I-JEPA recipe.
+        per_pos_per_dim = F.smooth_l1_loss(
+            predicted, target_full_features.detach(), reduction="none"
+        )                                               # (B, T_tokens, D)
+        per_pos = per_pos_per_dim.mean(dim=-1)          # (B, T_tokens)
+
+        mask = mask_module_out.mask.float()             # (B, T_tokens), 1 at masked
+        n_masked_total = mask.sum().clamp(min=1.0)
+        loss = (per_pos * mask).sum() / n_masked_total
+
+        return {
+            "loss": loss,
+            "components": {
+                "jepa_smoothl1": float(loss.detach().item()),
+                "n_masked_positions": float(n_masked_total.detach().item()),
+                "ema_momentum": float(self.ema_momentum),
+            },
+            "predicted_latent": predicted,
+        }
+
+    @torch.no_grad()
+    def update_target_encoder_from(self, online_model: nn.Module) -> None:
+        """Momentum-update the target encoder + frontend + pos-emb.
+
+        Call after every ``optimizer.step()`` from the training loop.
+        ``online_model`` is the full :class:`EEGSSLModel`; we pull its
+        ``encoder``, ``frontend``, ``encoder_pos_emb`` and update the
+        target's matching modules in place.
+        """
+        m = self.ema_momentum
+
+        def _update(target_mod: nn.Module | None, online_mod: nn.Module | None) -> None:
+            if target_mod is None or online_mod is None:
+                return
+            for online_p, target_p in zip(online_mod.parameters(),
+                                          target_mod.parameters()):
+                target_p.data.mul_(m).add_(online_p.data, alpha=1.0 - m)
+            # Also momentum-update buffers (e.g. RMSNorm stats) so the
+            # target encoder doesn't drift in batch statistics.
+            for online_b, target_b in zip(online_mod.buffers(),
+                                           target_mod.buffers()):
+                if target_b.dtype.is_floating_point:
+                    target_b.data.mul_(m).add_(online_b.data, alpha=1.0 - m)
+
+        _update(self.target_encoder, getattr(online_model, "encoder", None))
+        _update(self.target_frontend, getattr(online_model, "frontend", None))
+        _update(self.target_pos_emb, getattr(online_model, "encoder_pos_emb", None))
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -612,13 +822,23 @@ def build_paradigm(
     diffloss_w: int = 1024,
     num_diffusion_steps: int = 1000,
     norm_pix_loss: bool = False,
+    # G3 JEPA-only knobs (set up by EEGSSLModel.__init__ when paradigm.kind == "jepa")
+    target_encoder: nn.Module | None = None,
+    target_frontend: nn.Module | None = None,
+    target_pos_emb: nn.Module | None = None,
+    ema_momentum: float = 0.996,
+    predictor_hidden: int = 1024,
+    predictor_layers: int = 2,
 ) -> ParadigmHead:
     """Build the paradigm head matching ``paradigm_cfg.kind``.
 
     The MAE head needs the existing decoder + recon_head + mask_token
     from :class:`EEGSSLModel` (we pass them in rather than re-creating
     so the encoder→decoder shape contract is enforced upstream). The
-    AR and MAR heads create their own internal heads.
+    AR and MAR heads create their own internal heads. The G3 JEPA head
+    needs a *target encoder* (an EMA copy of the online encoder) plus
+    the matching frontend + pos-emb; these are constructed in
+    ``EEGSSLModel.__init__`` and passed in here.
     """
     kind = paradigm_cfg.kind
     if kind == "mae":
@@ -650,8 +870,21 @@ def build_paradigm(
             num_diffusion_steps=num_diffusion_steps,
         )
     if kind == "jepa":
-        raise NotImplementedError(
-            f"JEPA paradigm not implemented; see "
-            f"mini_experiments/18_reconstruction_target/README.md"
+        if target_encoder is None:
+            raise ValueError(
+                "JEPA paradigm requires a target_encoder (EMA copy of the "
+                "online encoder). Built by EEGSSLModel.__init__ when "
+                "cfg.paradigm.kind == 'jepa'. See LatentJEPAHead docstring "
+                "for the full wire-up contract."
+            )
+        return LatentJEPAHead(
+            paradigm_cfg,
+            d_model=d_model,
+            target_encoder=target_encoder,
+            target_frontend=target_frontend,
+            target_pos_emb=target_pos_emb,
+            ema_momentum=ema_momentum,
+            predictor_hidden=predictor_hidden,
+            predictor_layers=predictor_layers,
         )
     raise ValueError(f"unknown paradigm kind: {kind!r}")

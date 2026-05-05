@@ -692,12 +692,15 @@ class EEGSSLModel(nn.Module):
         # --- paradigm-specific components (mask + decoder + per-paradigm head)
         # The G0 MAE path keeps the decoder Mamba block + reconstruction head
         # exactly as the §4.2 default; G1 AR drops the decoder entirely;
-        # G2 MAR replaces the decoder with the SimpleMLPAdaLN diffusion head.
+        # G2 MAR replaces the decoder with the SimpleMLPAdaLN diffusion head;
+        # G3 JEPA (added 2026-05-05 for v2) drops the decoder and adds an
+        # EMA target encoder + a small predictor MLP — see paradigms.LatentJEPAHead.
         # We build all that lives "above" the encoder here.
+        import copy
         from . import paradigms                       # avoid circular import at module load
         self._paradigm_kind = cfg.paradigm.kind
 
-        if self._paradigm_kind in ("mae", "mar"):
+        if self._paradigm_kind in ("mae", "mar", "jepa"):
             self.mask_module = build_mask(cfg.mask)
         else:
             self.mask_module = None                   # G1 AR: no masking
@@ -719,6 +722,32 @@ class EEGSSLModel(nn.Module):
                 decoder_pos_emb=self.decoder_pos_emb,
                 mask_token=self.mask_token,
                 recon_head=self.recon_head,
+            )
+        elif self._paradigm_kind == "jepa":
+            # G3 JEPA — encoder + EMA target encoder + small predictor MLP.
+            # The target encoder, target frontend, and target pos-emb are deep
+            # copies of the online versions, with grad disabled. The training
+            # loop is responsible for calling
+            # `model.paradigm.update_target_encoder_from(model)` after every
+            # `optimizer.step()` to perform the momentum update.
+            self.decoder_pos_emb = None
+            self.mask_token = None
+            self.decoder = None
+            self.recon_head = None
+            target_frontend = copy.deepcopy(self.frontend)
+            target_pos_emb = copy.deepcopy(self.encoder_pos_emb)
+            target_encoder = copy.deepcopy(self.encoder)
+            self.paradigm = paradigms.build_paradigm(
+                cfg.paradigm,
+                d_model=cfg.backbone.d_model,
+                patch_samples=cfg.patch_samples,
+                decoder_module=None,
+                decoder_pos_emb=None,
+                mask_token=None,
+                recon_head=None,
+                target_encoder=target_encoder,
+                target_frontend=target_frontend,
+                target_pos_emb=target_pos_emb,
             )
         else:
             # G1 AR / G2 MAR — no MAE decoder block, no MAE mask token,
@@ -889,16 +918,44 @@ class EEGSSLModel(nn.Module):
                 out["components"] = components
             return out
 
-        # G2 MAR — diffusion-loss head; loss is paradigm-internal.
+        if self._paradigm_kind == "mar":
+            # G2 MAR — diffusion-loss head; loss is paradigm-internal.
+            if compute_loss:
+                head_out = self.paradigm(
+                    encoded=encoded,
+                    mask_module_out=m,
+                    target=target,
+                )
+                out["loss"] = head_out["loss"]
+                out["components"] = head_out["components"]
+            out["mask"] = repeat(m.mask, "b t -> b (t p)", p=self.cfg.patch_samples)
+            return out
+
+        # G3 JEPA — predict the target encoder's representation at masked
+        # positions. The target encoder runs on the FULL un-masked input
+        # under no-grad to produce target_full_features. The online
+        # encoder above ran on visible patches only; the JEPA head's
+        # predictor reconstructs the full-token-order representation
+        # (with learned mask tokens at masked positions) and is supervised
+        # by the target encoder on masked positions.
+        # The training loop must call
+        #   model.paradigm.update_target_encoder_from(model)
+        # after each optimizer.step() to perform the EMA momentum update.
+        with torch.no_grad():
+            t_target = self.paradigm.target_frontend(x)            # (B, T_tokens, D)
+            t_target = self.paradigm.target_pos_emb(t_target)
+            target_full_features = self.paradigm.target_encoder(t_target)
         if compute_loss:
             head_out = self.paradigm(
                 encoded=encoded,
                 mask_module_out=m,
+                target_full_features=target_full_features,
                 target=target,
             )
             out["loss"] = head_out["loss"]
             out["components"] = head_out["components"]
-        # Provide a sample-level mask for any downstream analysis code.
+            out["predicted_latent"] = head_out["predicted_latent"]
+        out["target_full_features"] = target_full_features
         out["mask"] = repeat(m.mask, "b t -> b (t p)", p=self.cfg.patch_samples)
         return out
 

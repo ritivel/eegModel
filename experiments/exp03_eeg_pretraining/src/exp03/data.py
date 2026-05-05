@@ -234,21 +234,38 @@ class ParquetWindowDataset(IterableDataset):
             }
 
     def __iter__(self) -> Iterator[dict]:
+        # Two-level sharding: first by DDP rank (so different processes read
+        # disjoint shards), then by DataLoader worker (so different worker
+        # threads within a process read disjoint shards too).
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+            else:
+                rank, world_size = 0, 1
+        except ImportError:
+            rank, world_size = 0, 1
+        rank_shards = self._index[rank::world_size]
+
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
-            shards = self._index
+            shards = rank_shards
         else:
-            shards = self._index[worker_info.id :: worker_info.num_workers]
+            shards = rank_shards[worker_info.id :: worker_info.num_workers]
 
         for entry in shards:
             yield from self._iter_shard(entry)
 
 
 def collate_signal_batch(rows: list[dict]) -> dict:
-    """Default collate fn for `ParquetWindowDataset`.
+    """Default collate fn for `ParquetWindowDataset` (CPU/single-process eval).
 
     Stacks signals into (B, T_samples), keeps metadata as Python lists for
-    quick filtering / split-by-subject in eval code.
+    quick filtering / split-by-subject in eval code. NOT compatible with
+    `accelerate` DDP `dispatch_batches=True` because the str list values
+    can't be torch.cat'd across ranks; use :func:`collate_signal_batch_train`
+    in that case.
     """
     signals = torch.stack([r["signal"] for r in rows], dim=0)
     keys_int = ["task_label", "channel_idx", "window_idx", "n_samples"]
@@ -262,6 +279,28 @@ def collate_signal_batch(rows: list[dict]) -> dict:
         out[k] = torch.tensor([r[k] for r in rows], dtype=torch.float32)
     for k in keys_str:
         out[k] = [r[k] for r in rows]
+    return out
+
+
+def collate_signal_batch_train(rows: list[dict]) -> dict:
+    """Tensor-only collate for the training loop (DDP-safe).
+
+    Same as :func:`collate_signal_batch` minus the ``str`` metadata fields
+    (subject_id, site, recording_id, channel_name, sex). Required for
+    ``accelerate.Accelerator(dispatch_batches=True)`` because accelerate
+    recursively ``torch.cat``s every dict value across ranks; lists of
+    strings raise. The training loop only consumes ``batch["signal"]``
+    anyway — see :mod:`exp03.train`.
+    """
+    signals = torch.stack([r["signal"] for r in rows], dim=0)
+    keys_int = ["task_label", "channel_idx", "window_idx", "n_samples"]
+    keys_float = ["window_start_s", "p_factor", "attention",
+                  "internalizing", "externalizing", "age"]
+    out = {"signal": signals}
+    for k in keys_int:
+        out[k] = torch.tensor([r[k] for r in rows], dtype=torch.long)
+    for k in keys_float:
+        out[k] = torch.tensor([r[k] for r in rows], dtype=torch.float32)
     return out
 
 

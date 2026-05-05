@@ -306,3 +306,198 @@ context AR is known to be more stable than long-context MAE in the
 Mamba family (the official MAP code reports this), so the C3 30-second
 cell may be feasible for AR/MAR even if it has stability issues for
 MAE.
+
+---
+
+# v2 design (2026-05-05) — addressing v1's underpowered scale
+
+> **Why v2:** v1 ran 30 cells (G0 / G1 / G2 × eeg / noise × 5 seeds) at
+> **100 hours / 100 subjects / 35M tokens / linear-probe under LNSO**. All
+> three paradigms sat at the random-init floor (BAC ≈ 0.196, vs Track A
+> floor 0.20). The verdict was a TIE, but the literature-grounded
+> interpretation is that **v1 was epistemically underpowered** — at our
+> v1 scale, no input-space-prediction SSL paradigm has been shown to lift
+> off the floor, on any biosignal corpus, by anyone. See
+> `results.md` §5 for the full literature-grounded analysis with citations.
+>
+> **v2 fixes the four compounding failure modes simultaneously:**
+> 1. Scale up data by ~10× (cross LaBraM's 1000h plateau threshold)
+> 2. Add a 4th paradigm (G3) outside the input-space-prediction family
+> 3. Switch eval to fine-tuning (the literature consensus for EEG-FMs)
+> 4. Switch headline downstream task to one with demonstrated SSL signal
+
+## v2 — what changes vs v1
+
+### Variants — add G3 latent-prediction (4 paradigms total)
+
+The 4th cell turns the experiment from "3 input-space objectives" into
+"3 input-space + 1 latent-space" — and the literature predicts G3 is the
+ONLY paradigm in this set that should work at our scale.
+
+
+| Code | Variant                                | Topology summary                                                                                                                                                                                                                                                                                                                | Per-step extra cost vs G0     |
+| ---- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| G0   | MAE-bidirectional                      | (unchanged from v1)                                                                                                                                                                                                                                                                                                              | reference                       |
+| G1   | AR-causal-aligned                      | (unchanged from v1)                                                                                                                                                                                                                                                                                                              | ~0.7×                           |
+| G2   | MAR-bidirectional + diffusion head     | (unchanged from v1)                                                                                                                                                                                                                                                                                                              | ~1.4×                           |
+| **G3** | **Latent-prediction (EEG2Rep / I-JEPA style)** | **Random 50% patch mask. Encoder is bidirectional Mamba-2 (same as G0). A small predictor MLP (2-layer, hidden 1024) predicts the **representation** of masked patches, computed by a target encoder (EMA copy of the online encoder, momentum 0.996). Loss = smooth-L1 between predicted and target representations on masked positions. References: [EEG2Rep KDD 2024 §3](https://arxiv.org/abs/2402.17772), [I-JEPA CVPR 2023](https://arxiv.org/abs/2301.08243), [BYOL NeurIPS 2020](https://arxiv.org/abs/2006.07733).** | ~1.1×                           |
+
+
+**Why G3 is expected to lift off the floor at our scale (literature):**
+
+- **EEG2Rep** measures **+13.12% linear-probe accuracy** when switching
+  from input-space to latent-space prediction on EEG, on the same
+  encoder. (KDD 2024.)
+- **STELAR** ([OpenReview ICLR 2026](https://openreview.net/pdf?id=ofwQZjoI4c)):
+  raw-signal reconstruction biases the encoder to "high-frequency noise
+  and acquisition artifacts." Latent prediction (with a stable target
+  encoder) avoids this by construction — the target representation has
+  already filtered out reconstructable noise.
+- **I-JEPA** (Assran et al. CVPR 2023) — the original
+  representation-space prediction paper. ImageNet linear probe matches
+  MAE at fraction of the compute, and substantially outperforms MAE on
+  fine-grained downstream tasks.
+- **ECG-JEPA** ([Kim 2024, arXiv:2410.04339](https://arxiv.org/abs/2410.04339)):
+  the direct biosignal precedent. State-of-the-art on PTB-XL classification,
+  outperforms both invariance-based and generative SSL on ECG. Our G3 is
+  the EEG-Mamba-2 analog.
+
+### Scale: pretraining data
+
+| Axis | v1 | v2 |
+|---|---|---|
+| Pretraining hours | ~100 h | **~1000 h** (cross LaBraM's plateau threshold) |
+| Pretraining subjects | 100 | **~500** (still LNSO-disjoint from eval set) |
+| Tokens-seen per cell | 35 M | **~140 M** (4× more, with same step rate × 4× more data) |
+| Steps per cell | 17,500 | **~17,500–35,000** (depending on epoch budget) |
+
+The 100h subset of HBN was an arbitrary v1 choice; we already have all
+2,500 hours / 2,639 subjects in S3 (`s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`).
+Sync time for ~500 subjects: ~10 min on p4de from in-region S3.
+
+### Eval: fine-tuning (primary) + linear-probe (diagnostic)
+
+v1 used frozen-encoder linear probe under LNSO as the headline. The
+literature consensus is that this is the wrong choice for EEG-FMs:
+
+- [EEG-FM benchmark Liu et al. arXiv:2601.17883](https://arxiv.org/abs/2601.17883):
+  "linear probing is frequently insufficient"
+- [ST-EEGFormer benchmark, ICLR 2026 under review](https://openreview.net/pdf/44f1859e3b0d17192639706701c950b9057aa9cc.pdf):
+  "Linear probing consistently yields poor performance across all models
+  and evaluation protocols"
+- [Wortsman et al. ICML 2022 LP-FT](https://arxiv.org/abs/2202.10054):
+  Linear-probe-then-fine-tune outperforms pure fine-tuning by **+10% OOD
+  accuracy** — and pure linear probe is the worst of the three.
+
+v2 evals each cell three ways and reports all three:
+
+| Eval | Description | Primary use |
+|---|---|---|
+| **FT** | Full fine-tune the encoder + new task head on labeled downstream data; LNSO splits | **Headline** — what the encoder can do |
+| **LP-FT** | Init head with linear probe, then fine-tune (Wortsman et al.) | Compares against pure FT for OOD robustness |
+| **LP** | Frozen encoder + linear probe (with `RidgeCV` for regression) | Diagnostic — measures the "directly usable" representation quality |
+
+### Headline downstream task: TUAB binary AUROC
+
+v1 used HBN 6-task BAC + HBN CBCL externalizing R² as headlines. Both
+turned out to be near-impossible at our scale (the externalizing one is
+*literally* unsolved by the field — only 3 of 1183 NeurIPS 2025 teams
+beat the mean-predictor baseline).
+
+v2 swaps to a feasible primary metric:
+
+| Eval | Task | Why feasible at small scale |
+|---|---|---|
+| **Primary** | **TUAB binary AUROC** (normal/abnormal EEG, [TUH dataset](https://isip.piconepress.com/projects/tuh_eeg/)) | LaBraM achieves 0.84 at 2.5kh pretraining; floor is 0.59 (per Track A.4). The community standard binary-classification benchmark for EEG-FMs. |
+| Secondary | TUEV 6-class BAC | Multi-class extension; LaBraM 0.674 at 2.5kh; floor 0.24 |
+| Stretch | HBN 6-task BAC | Same as v1 — kept for continuity |
+| Diagnostic only | HBN CBCL externalizing R² | Kept to track the field's hardest open problem; not used to rank paradigms |
+
+We already have TUAB + TUEV preprocessed in S3 from Track A
+(2026-05-04 morning session); no new preprocessing required.
+
+### Diagnostic suite (new in v2)
+
+The literature mechanism for why our v1 cells failed has clear
+diagnostics. v2 adds them to `eval.py`:
+
+| Diagnostic | What it detects | Threshold |
+|---|---|---|
+| Subject-ID linear probe accuracy on frozen features | Subject-fingerprint dominance ([ContentVec ICML 2022](https://proceedings.mlr.press/v162/qian22b.html), [PRISM arXiv:2603.02268](https://arxiv.org/abs/2603.02268)) | >60% = encoder is encoding subject identity, not task signal |
+| Effective rank of encoder features ([Roy & Vetterli 2007](https://ieeexplore.ieee.org/document/4290218)) | Dimensional collapse ([Jing et al. ICLR 2022](https://openreview.net/forum?id=YevsQ05DEN7)) | < 0.5× feature_dim = collapse present |
+| Local intrinsic dimensionality ([LDReg ICLR 2024](https://openreview.net/forum?id=oZyAqjAjJW)) | Local collapse hidden by global rank | LID near 1 = local collapse |
+| Site-ID linear probe accuracy (when multi-site data available) | Site / acquisition fingerprint dominance ([CRCC arXiv:2602.19138](https://arxiv.org/abs/2602.19138)) | >60% = encoder learned site, not signal |
+
+These are cheap (sklearn + numpy) and run in <1 min per cell. They give
+us actionable diagnoses if any v2 paradigm fails: we'll know whether to
+add subject-adversarial training (for fingerprint dominance) or
+covariance regularization (for collapse).
+
+## v2 cells & compute budget
+
+
+| Axis             | v1                                  | v2                                                 |
+| ---------------- | ----------------------------------- | -------------------------------------------------- |
+| Paradigms        | 3 (G0, G1, G2)                      | **4** (G0, G1, G2, **G3**)                         |
+| Controls         | 2 (eeg, noise-twin)                 | 2 (eeg, noise-twin)                                |
+| Seeds            | 5                                   | **3** (with FT eval the per-cell signal is stronger; 3 seeds suffices) |
+| Cells            | 30                                  | **24**                                             |
+| Pretraining hours| 100                                 | **1000**                                           |
+| Eval modes       | 1 (LP only)                         | **3** (FT, LP-FT, LP) — all reported               |
+| Steps per cell   | 17500                               | **17500** (10× more tokens-seen because 10× more data) |
+| Wall-clock per cell (training) | ~30 min (8 in parallel) | ~50 min (longer because 4× larger batch via DDP, but DDP-fixed) |
+| Wall-clock per cell (eval)    | ~3 min   | ~10 min (3 evals × 3 protocols) |
+| Total wall-clock | 3.4 h                               | ~5–7 h                                             |
+| Cost (p4de @ $27.45/h on-demand) | ~$75                  | **~$200–300**                                       |
+
+
+## v2 decision rule
+
+**Primary headline: TUAB binary AUROC under fine-tuning.**
+
+Per-paradigm vs G0 MAE-EEG baseline:
+
+- **Strict win**: ≥ 0.02 absolute AUROC AND non-overlapping 95% CIs across 3 seeds AND noise-twin shows no improvement (paired t-test p > 0.10 on noise side)
+- **Weak win**: ≥ 0.01 absolute AUROC with paired-test p < 0.05
+- **Tie**: TOST equivalence within 0.01 AUROC ⇒ keep G0 MAE
+- **Loss**: ≤ −0.01 absolute AUROC with paired-test p < 0.05
+
+Plus the v1 stability guards (no NaN, no diff-loss collapse, encoder
+feature rank > 0.5 × dim) and one new guard:
+
+- **Subject-fingerprint guard**: any cell with subject-ID linear probe
+  accuracy > 60% on frozen features is flagged — its representations
+  may have learned subject identity rather than EEG content. Such cells
+  are NOT disqualified, but the writeup explicitly notes the risk that
+  any apparent downstream lift is from subject-fingerprint memorization.
+
+## v2 pre-registered predictions
+
+Based on the literature analysis in `results.md` §5:
+
+
+| Variant | Prediction (TUAB AUROC, FT) | Reasoning                                                                                                                                  |
+| ------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| G0 MAE  | 0.74–0.78 (vs floor 0.59)   | At 1000h, MAE should give meaningful lift on TUAB (LaBraM's 2500h gets 0.84; we expect ~0.78 at 40% data scale).                            |
+| G1 AR   | 0.74–0.78                   | Should match MAE since the MAP scan-alignment hypothesis is testable at 1000h. The MAP paper reports +1.4 pp; we'll see if it transfers.   |
+| G2 MAR  | 0.72–0.78                   | The diff-loss head's variance is highest; could go either way. MAR paper's mul=4 recipe might be needed for fair comparison.                 |
+| **G3 LATENT** | **0.78–0.82**         | **Predicted winner.** Per EEG2Rep's +13% lift over input-space prediction on EEG. Latent target avoids the noise-prediction trap.          |
+
+
+Anti-prediction: G3 fails to beat MAE (~20% probability). This would
+indicate that even at 1000h, the EEG2Rep mechanism doesn't transfer
+under our specific Mamba-2 backbone + HBN-only pretraining setup, and
+would push us to consider hybrid recipes (STELAR-style dual loss).
+
+## v2 expected output: `results_v2.md`
+
+Same structure as `results.md` but with:
+- 24-cell table (4 × 2 × 3) with FT, LP-FT, LP scores per cell
+- Aggregate by paradigm × control with all three eval modes
+- Subject-fingerprint and effective-rank diagnostic columns
+- Decision rule applied on TUAB-FT
+- Re-runs of HBN 6-task BAC + HBN CBCL R² as secondary metrics for
+  comparison with v1
+- If a paradigm crosses the v2 decision rule's strict-win bar, the
+  README's downstream-experiment-anchoring section gets updated to
+  reflect the new winner

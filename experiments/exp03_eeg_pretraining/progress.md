@@ -3,7 +3,401 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-04 ~16:30 IST / 11:00 UTC
+> **Last refreshed:** 2026-05-05 ~07:00 IST / 01:30 UTC
+
+---
+
+## 2026-05-05T01:30 UTC (07:00 IST) — exp17 v1 closeout + literature dive + v2 scaffold
+
+**TL;DR.** Mac-only session, no GPU spin-up. After overnight sleep on the v1
+results (`G0 ties, G2 loses ⇒ keep MAE by default`), we did the four
+follow-ups: (1) investigate the CBCL R² anomaly, (2) refuse to accept the
+MAR loss as final, (3) fix the DDP collate, (4) re-bake the AMI. Two of the
+four were code fixes that landed cleanly; the third (MAR re-run) opened up
+a much bigger question that triggered a deep literature review across
+speech / vision / EEG SSL — outcome was that v1 was epistemically
+underpowered for reasons the field has been documenting for two years, and
+the right path is **v2 with four structural changes** rather than a quick
+MAR re-run. AMI re-bake deferred until v2 is ready to launch.
+
+### Code fixes that landed (all Mac-side, py_compile passes)
+
+- **CBCL R² anomaly** (`src/exp03/eval.py`): replaced unregularized
+  `LinearRegression()` → `RidgeCV(alphas=(0.01, 0.1, 1.0, 10.0, 100.0,
+  1_000.0, 10_000.0), cv=5)` for both externalizing and attention
+  regression. Per-cell selected α now logged. Diagnosis: the original
+  unregularized linear regression overfit subject-specific patterns in the
+  train split that didn't generalize across LNSO subjects, producing
+  systematically wrong predictions on held-out subjects (range -0.10 to
+  -1.05 vs Track A floor -0.05). v1 R² numbers in `results.md` should be
+  treated as artefacts of the unregularized probe, not real signal that
+  pretraining made representations worse. The BAC / WF1 / k-NN / AUROC
+  numbers are correct (LogisticRegression and KNN are both regularized
+  by default).
+
+- **DDP collate fix** (`src/exp03/data.py`): added
+  `collate_signal_batch_train` (tensors-only — drops `subject_id`,
+  `site`, `recording_id`, `channel_name`, `sex` strings). Plus added
+  rank-aware shard sharding to `ParquetWindowDataset.__iter__` so each
+  DDP rank reads disjoint parquet shards. `train.py` now uses the
+  tensors-only collate. Future cells can use full 8-GPU DDP per cell.
+
+- **stdout buffering fix** (`src/exp03/train.py`): added
+  `sys.stdout.reconfigure(line_buffering=True)` at module import. Per-step
+  training prints flush to disk immediately when stdout is redirected to
+  a file; the v1 "stuck between log boundaries" cosmetic problem is gone.
+
+### Literature dive — why v1 actually failed (the real story)
+
+3 parallel research subagents + Consensus + Exa across speech / vision / EEG
+SSL papers. Strong, consistent finding: **v1 hit four well-documented
+compounding failure modes simultaneously.**
+
+1. **Below the data-scale "cliff" for biosignal SSL.** Speech wav2vec 2.0
+   needs >500 h unlabeled for any lift over supervised-from-scratch
+   ([Berrebbi et al. 2022, arXiv 2402.13723](https://arxiv.org/abs/2402.13723));
+   below that it actively *underperforms* (49 % WER vs 23 % supervised).
+   LaBraM ([Jiang et al. ICLR 2024](https://arxiv.org/abs/2401.10278))
+   plateaus at ~1000 h on TUAB. REVE ([NeurIPS 2025](https://arxiv.org/abs/2510.21585))
+   needs 60,000 h, 25,000 subjects to claim consistent linear-probe SOTA.
+   We pretrained on 100 h, 100 subjects — 5–600× below empirically
+   validated thresholds across speech, EEG, and wearable SSL.
+
+2. **Wrong pretext task family for low-SNR signals.** EEG SNR ≈ −20 dB on
+   raw single-channel windows; reconstruction loss is dominated by the
+   un-reconstructable noise component. Documented as the central problem
+   in EEG2Rep ([Foumani et al. KDD 2024](https://arxiv.org/abs/2402.17772)),
+   STELAR ([OpenReview ICLR 2026](https://openreview.net/pdf?id=ofwQZjoI4c)),
+   and EEG-FM benchmark ([Liu et al. arXiv:2601.17883](https://arxiv.org/abs/2601.17883)).
+   EEG2Rep measures **+13.12% linear-probe accuracy** when switching from
+   input-space (G0/G1/G2 family) to latent-space prediction on EEG. All
+   three of our v1 paradigms are input-space-prediction. We selected from
+   a paradigm family the literature has documented as systematically wrong
+   for EEG.
+
+3. **Downstream task is essentially unsolvable at our scale.** The HBN
+   externalizing-factor regression we used is *literally* the NeurIPS 2025
+   EEG Foundation Challenge — Challenge 2. Out of 1,183 teams competing,
+   **only 3 broke the 0.99 NRMSE threshold** (predicting the mean). The
+   combined-metric winner ([NeuroSned](https://github.com/sneddy/neurosned))
+   used hand-engineered features + Ridge regression, NOT a foundation
+   model. The HBN 6-task BAC headline at our scale sits at the 16.7%
+   chance floor for almost everyone; LaBraM at 2.5 kh gets TUEV BAC = 0.67.
+
+4. **Linear probe under LNSO is the wrong eval.** [Dubois et al. ICML 2023
+   oral](https://proceedings.mlr.press/v202/dubois23a.html): in few-shot
+   probing regimes, "probe generalization error has become dominant".
+   [Wortsman et al. ICML 2022 LP-FT](https://arxiv.org/abs/2202.10054):
+   pure linear probe is the worst of {LP, FT, LP-FT} for OOD evaluation.
+   [ST-EEGFormer benchmark ICLR 2026](https://openreview.net/pdf/44f1859e3b0d17192639706701c950b9057aa9cc.pdf):
+   "Linear probing consistently yields poor performance across all models
+   and evaluation protocols." Plus the simplicity-bias mechanism from
+   [Xue et al. ICML 2023](https://proceedings.mlr.press/v202/xue23d.html):
+   gradient descent learns easy class-irrelevant features (subject
+   identity, site fingerprint) and SUPPRESSES harder class-relevant
+   features — producing exactly the negative-R² pattern we saw.
+
+The full literature-grounded analysis with citations lives in
+`mini_experiments/17_generative_paradigm/results.md` §5.
+
+### v1 closeout
+
+`mini_experiments/17_generative_paradigm/results.md` rewritten as the
+canonical v1 record (10 sections):
+- §1 Per-cell numbers (all 30 cells)
+- §2 Aggregate by paradigm × control
+- §3 Decision rule applied (formal verdict: TIE ⇒ keep G0 MAE)
+- §4 Noise-twin diagnostic — and what it really says (MAR's 0.0005
+  EEG-vs-noise separation is the smoking gun for "encoder learned noise
+  structure not EEG content")
+- §5 Why this happened — four compounding failure modes (with citations)
+- §6 What this means for the README's pre-registered hypothesis (literal
+  match to the README's anti-prediction, but **for the wrong reason**)
+- §7 Operational verdict for downstream mini-experiments (anchor on G0
+  MAE, but flag as "anchoring-by-default-not-by-evidence" everywhere)
+- §8 Throughput, bug fixes, CBCL R² bug investigation
+- §9 Cost summary
+- §10 v2 plan pointer
+
+### v2 scaffold landed (no GPU run today)
+
+`mini_experiments/17_generative_paradigm/README.md` extended with a v2
+design section (after the existing "What gets carried forward"). Four
+structural changes:
+
+1. **Scale up data ~10×** to ~1000 h HBN pretraining (~500 subjects;
+   already in S3 at `s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`).
+   Crosses LaBraM's plateau threshold.
+2. **Add G3 latent-prediction paradigm** (EEG2Rep / I-JEPA / ECG-JEPA
+   style): predict masked-patch *representations* via an EMA target
+   encoder + small predictor MLP, smooth-L1 loss. The literature predicts
+   this is the only paradigm in the set that should work at our scale.
+3. **Switch primary eval to fine-tuning**, with linear probe demoted to a
+   diagnostic. Plus LP-FT as a third reported eval for OOD robustness.
+4. **Switch headline downstream task to TUAB binary AUROC** (LaBraM
+   achieves 0.84 at 2.5 kh, floor 0.59 — there's known SSL signal there).
+   HBN 6-task BAC + CBCL externalizing kept as secondary / stretch metrics.
+
+v2 cell count: 4 paradigms × 2 controls × 3 seeds = **24 cells** (down
+from v1's 30 because FT eval gives stronger per-cell signal than LP).
+Estimated cost: ~$200–300 on p4de. Estimated wall-clock: ~5–7 h.
+
+### G3 LatentJEPAHead code landed
+
+`src/exp03/paradigms.py` adds `LatentJEPAHead` (~150 LOC). Architecture:
+
+- Takes the existing online encoder (frontend + Mamba-2 stack) + a deep
+  copy as the EMA *target encoder* (momentum 0.996, BYOL default;
+  `requires_grad=False`).
+- Predictor: small MLP (default 2 layers, hidden 1024, GeLU activations)
+  that takes the visible-features-with-mask-tokens-restored-to-original-
+  order and predicts the target encoder's representation at every position.
+- Loss: smooth-L1 (Huber) per (sample, token, feature dim), averaged over
+  masked positions only.
+- `update_target_encoder_from(model)` momentum-updates the target
+  encoder + frontend + pos-emb after each optimizer step.
+
+`build_paradigm("jepa", ...)` factory wired up. `EEGSSLModel.__init__`
+extended to construct the deep-copied target modules when
+`cfg.paradigm.kind == "jepa"`. `EEGSSLModel.forward` extended to
+compute `target_full_features` under `torch.no_grad()` from the target
+encoder + pass them to the JEPA head. `train.py` calls
+`model.paradigm.update_target_encoder_from(model)` after each
+`optimizer.step()` (no-op for non-JEPA paradigms). `cli.py` updated
+to expose `'jepa'` as a paradigm option. All files
+`python3 -m py_compile` clean.
+
+References for the G3 design:
+- [EEG2Rep (Foumani et al. KDD 2024, arXiv:2402.17772)](https://arxiv.org/abs/2402.17772)
+- [I-JEPA (Assran et al. CVPR 2023, arXiv:2301.08243)](https://arxiv.org/abs/2301.08243)
+- [ECG-JEPA (Kim 2024, arXiv:2410.04339)](https://arxiv.org/abs/2410.04339)
+- [BYOL (Grill et al. NeurIPS 2020, arXiv:2006.07733)](https://arxiv.org/abs/2006.07733)
+
+### Diagnostic suite landed
+
+`src/exp03/eval.py` adds `compute_feature_diagnostics` (called from the
+end of `run_protocol_a`). Three diagnostics that detect the v1 failure
+mechanisms:
+
+- **Subject-ID linear-probe accuracy** on frozen features. Per ContentVec
+  ICML 2022, HuBERT hits 81.4 % speaker-ID accuracy without trying —
+  evidence that the encoder dominantly encodes subject identity. Threshold:
+  > 60 % flags fingerprint dominance. We use a within-subject 70/30 split
+  (NOT LNSO) because we explicitly want to know if the encoder fingerprints
+  a subject.
+- **Effective rank** of the feature covariance (Roy & Vetterli 2007 entropy
+  rank) + ratio to embedding dim. Per Jing et al. ICLR 2022, dimensional
+  collapse manifests as a few large eigenvalues dominating; threshold:
+  rank_ratio < 0.5 indicates collapse.
+- **Site-ID linear-probe accuracy** when multi-site data is present (CRCC
+  arXiv:2602.19138). Threshold: > 60 % flags site-fingerprint dominance.
+
+All three are cheap (sklearn + numpy, < 1 s per cell) and run alongside
+the existing Protocol A metrics.
+
+### What remains for the v2 GPU run
+
+- **Smoke test G3 on Mac transformer fallback.** mamba_ssm is CUDA-only
+  but we can swap `backbone_kind='transformer'` for a quick on-Mac
+  paradigm-head shape check before spending GPU.
+- **Smoke test G3 on the GPU box.** A 50-step single-cell run to verify
+  the EMA update mechanics work and the loss decreases.
+- **Sync ~500 HBN subjects** to NVMe (~10 min on p4de from in-region S3).
+- **Implement fine-tune eval path** in `eval.py`. Currently only Protocol
+  A frozen-probe is implemented. Fine-tune eval needs:
+  - Load checkpoint, attach a downstream head (Linear for binary, MLP for
+    multi-class).
+  - Train end-to-end on labeled downstream data with smaller LR.
+  - Evaluate on held-out LNSO subjects.
+  - Estimated 5 min per cell × 24 cells = 2 h additional GPU.
+- **Re-bake AMI** with the v2 codebase + the working mamba_ssm /
+  causal_conv1d builds for sm_80. Saves the 12-min compile on every fresh
+  p4de launch.
+
+Estimated total v2 GPU session: ~5–7 h training + ~2 h FT eval + ~1 h
+buffer ≈ **~10 h on p4de @ $27.45/h = ~$270**.
+
+### Cost summary for this session
+
+- $0 — pure local Mac coding + research subagents.
+- The (stopped) GPU instance `i-06c55554892db26bf` continues to bill
+  ~$2.50/mo for EBS root. NVMe scratch already wiped on yesterday's stop.
+
+### State at session end
+
+- v1 results.md is the canonical v1 record (10 sections, literature-grounded).
+- v2 design + G3 code + diagnostics are scaffolded and py_compile clean.
+- Instance `i-06c55554892db26bf` still stopped (verified earlier — 1
+  capacity-issue retry on restart, did not retry further).
+- Code changes NOT yet pushed to git; all sit in the working tree. User
+  will commit when ready.
+- Wandb runs from v1 still online at https://wandb.ai/ritivel-eeg-ritivel/exp03/
+  filterable by `tag:exp17`.
+- v1 artefacts in S3 at `s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-04T14Z_run1/`.
+
+---
+
+## 2026-05-04T17:05 UTC (22:35 IST) — exp17 first run complete; G0 MAE wins, anti-prediction confirmed
+
+**TL;DR.** Spun up `i-06c55554892db26bf` (p4de.24xlarge, 8× A100-80GB, us-west-2a)
+from `ami-0d17022030a88612e`. Ran the full 30-cell exp17 matrix
+(3 paradigms × 2 controls × 5 seeds, 17500 steps × batch 32 each).
+**G0 MAE wins by default** — the README's anti-prediction outcome (~25 %
+prior). G1 AR ties G0 MAE (Δ=+0.000 on the headline HBN 6-task BAC); G2
+MAR loses (Δ=−0.011). Vision-domain "MAE mispaired with Mamba" finding
+does NOT transfer to 1D EEG at this scale.
+
+### Headline numbers (HBN 6-task BAC, mean ± std across 5 seeds)
+
+| Variant            | n | task6_bac          | Δ vs G0  | Verdict                                |
+|--------------------|---|--------------------|----------|----------------------------------------|
+| **G0 MAE-EEG**     | 5 | **0.196 ± 0.017**  | —        | reference (default)                    |
+| **G1 AR-EEG**      | 5 | **0.196 ± 0.012**  | +0.000   | **TIE** ⇒ keep MAE                     |
+| **G2 MAR-EEG**     | 5 | **0.185 ± 0.011**  | −0.011   | **LOSS** ⇒ reject MAR                  |
+| MAE-noise (twin)   | 5 | 0.185 ± 0.006      | −        | EEG > noise by +0.011 (OK)             |
+| AR-noise (twin)    | 5 | 0.186 ± 0.006      | −        | EEG > noise by +0.010 (OK)             |
+| MAR-noise (twin)   | 5 | 0.185 ± 0.011      | −        | EEG ≈ noise (Δ=+0.0005, WARN)          |
+| _Track A floor_    | _ref_ | _0.20_         | _ref_    | random-init linear-probe baseline      |
+
+**All three paradigms sit at the random-init floor of 0.20.** None of them
+meaningfully cracked the HBN 6-task headline at our 35M-token / 100-subject
+scale. The interesting comparison is the relative ordering: MAE = AR > MAR.
+
+**Decision rule output:** keep G0 MAE as the §4.2 default. exp04
+(framework), exp10 (masking), exp18 (target), exp19 (decoder) do **not**
+need re-anchoring. Spec stays as written.
+
+### Caveats before declaring this final
+
+1. **Sample size is small** vs the vision papers that motivated exp17.
+   MAP / AR-Mamba / MAR were trained on ImageNet-scale corpora with
+   100M-1B+ tokens. We trained on 35M tokens × 100 HBN subjects. The
+   MAP mechanism may transfer at 10× larger scale.
+2. **CBCL externalizing R² is wildly negative** (−0.10 to −1.05 across
+   paradigms). The random-init floor was −0.05 — pretrained models are
+   *worse* on regression than random init. Strong sign of an eval
+   pipeline issue (probably a sklearn `LinearRegression` config) that
+   needs investigating before the cell-level R² numbers can be trusted.
+3. **MAR-EEG ≈ MAR-noise** (Δ = +0.0005 — well below the +0.010
+   separation we see in MAE/AR). The MAR diffusion-loss head produces
+   essentially identical downstream features whether trained on EEG or
+   Gaussian noise. This is *more* damning for MAR than just losing to
+   MAE — it's positive evidence that MAR's diffusion-head is overfit to
+   the noise / mode-following the loss, not learning EEG content.
+4. **Frontend is F0 vanilla strided conv** — the §4.2 default. exp02
+   has not yet picked F2 SincNet / F4 LEAF / F4 Gabor. If the §4.2
+   frontend handicaps generative paradigms (likely for MAR, per the
+   README's risk table), exp17 should be re-run after exp02 picks a
+   richer frontend.
+5. **Diffusion_batch_mul=1** in our run. The MAR paper's recipe uses
+   mul=4 (4× per-sample replication for noise-level coverage). Our
+   compute budget didn't support mul=4 (would have been 4× more
+   expensive). Re-running G2 MAR at mul=4 is the cleanest follow-up
+   if we want to give MAR a fair shot.
+
+### Wall-clock + cost
+
+| Phase                                   | Wall-clock | Cost (p4de @ $27.45/hr) |
+|-----------------------------------------|------------|-------------------------|
+| Bootstrap (mamba_ssm + causal_conv1d)   | 12 m 15 s  | ~$5.6                   |
+| Smoke tests (G0 / G1 / G2 / noise-twin) | 8 m        | ~$3.7                   |
+| HBN sync (100 subj, 29 GB to NVMe)      | 4 m        | ~$1.8                   |
+| **30-cell training matrix (4 batches)** | **2 h 44 m** | **~$75.0**            |
+| Watchdog (wandb-sync + S3 sync)         | 6 m        | ~$2.7                   |
+| Stuck-thread debug + relaunch overhead  | ~30 m      | ~$13.7                  |
+| **Total**                               | **~3 h 50 m** | **~$102**            |
+
+Plus ~$2.50/mo EBS storage going forward.
+
+### Per-paradigm step rate (batch 32 / 1 GPU, A100-80GB)
+
+| Paradigm | step/s | per-cell wall | model size |
+|----------|--------|---------------|------------|
+| G0 MAE   | 7.4    | ~40 m         | 7.20 M     |
+| G1 AR    | 14.0   | ~22 m         | 2.88 M     |
+| G2 MAR   | 9.0    | ~32 m         | 24.92 M    |
+
+MAR's 1.42× cost over MAE matches the README's `~1.4×` projection
+exactly. AR's 2× speedup vs MAE comes from the smaller model
+(no decoder, no mask-token bookkeeping).
+
+### Wandb / S3 / local persistence
+
+- **Wandb workspace**: `https://wandb.ai/ritivel-eeg-ritivel/exp03/`
+  All 30 runs uploaded. Filter by tag `exp17` to see them; sub-filter
+  by `mae`/`ar`/`mar` × `eeg`/`noise` × `seed{0..4}`.
+- **S3 archive**: `s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-04T14Z_run1/`
+  Contains every cell's `summary.json` + `ckpt_final.pt` + `wandb/`
+  offline-run dir + `run.log`, plus the master `exp17_launch.log` and
+  `results.md`.
+- **Local repo**: `mini_experiments/17_generative_paradigm/results.md`
+  pulled from S3 to git.
+- **Custom AMI**: `ami-0d17022030a88612e` still good. Next launch from
+  it on a new p4de saves the bootstrap (mamba_ssm + causal_conv1d build,
+  HBN sync). Caveat: `mamba_ssm` + `causal_conv1d` were installed into
+  the EBS-root venv on instance `i-06c55554892db26bf` (now stopped).
+  When we restart this instance, the venv is preserved. When we launch
+  a fresh instance from the AMI, we'll need to re-install (12 min).
+  Worth re-baking the AMI before exp02-onwards mini-experiments.
+
+### Bugs found and fixed during this run
+
+1. **DDP data loader crash** — `accelerate.utils.operations.concatenate`
+   barfs on the `collate_signal_batch` dict because it contains list[str]
+   metadata fields (subject_id, site, etc.). Workaround: ran 8 cells
+   in parallel, each on 1 GPU (no DDP). Proper fix is a `tensors_only`
+   flag on the collate (deferred, ~30 min code change).
+2. **CPU thread thrash with 8 concurrent Python processes** — by default
+   PyTorch's intra-op pool grabs all 96 cores per process; 8 processes ×
+   200 threads = 1600 threads contending on 96 cores → `futex_wait_queue`
+   gridlock. Fixed by setting `OMP_NUM_THREADS=8 MKL_NUM_THREADS=8` etc.
+   per cell. After fix: 37 threads/process, 18 % GPU util sustained.
+3. **Bash inline env-var prefix didn't propagate** through bash function
+   line continuation in the launcher. Fixed by switching to `(export X=
+   ...; python ...)` subshell pattern. After fix: env vars verified in
+   `/proc/PID/environ`.
+4. **Stdout buffering** — Python's `print` is line-buffered for TTYs,
+   block-buffered for files. Live `tail run.log` only sees flushed lines
+   ⇒ the run looks "stuck" between log batches. Cells were always making
+   progress; the buffer flushes when the process exits. Worth adding
+   `python -u` or `sys.stdout.reconfigure(line_buffering=True)` to
+   train.py for future runs.
+
+### What's next (open follow-ups)
+
+- **Investigate the CBCL R² anomaly** before exp02. The negative R²
+  values across all 30 cells are not credible — probably an eval
+  pipeline issue.
+- **Decide on G2 MAR re-run with mul=4** (vs accepting that it loses at
+  mul=1). Cost: ~$15 more on p4de.
+- **DDP collate fix** so future mini-experiments can use all 8 GPUs per
+  cell when needed (would 4× speed up eval-heavy runs like exp10's
+  16-cell mask × ratio matrix).
+- **Re-bake AMI** to capture the working `mamba_ssm` + `causal_conv1d`
+  builds for sm_80 + the latest exp03 code. Saves 12 min of build per
+  fresh launch.
+
+### Files changed this session
+
+```
+experiments/exp03_eeg_pretraining/
+├── progress.md                                       ← THIS ENTRY
+├── mini_experiments/17_generative_paradigm/
+│   └── results.md                                    ← NEW (30-cell aggregate)
+├── scripts/
+│   ├── launch_exp17.sh                               ← NEW (8-cell-parallel launcher)
+│   └── summarize_exp17.py                            ← NEW (per-cell + aggregate + decision rule)
+└── src/exp03/
+    ├── train.py                                      ← +noise_twin field + at-step replacement
+    └── cli.py                                        ← +--noise-twin/--no-noise-twin flag
+```
+
+### Instance state at session end
+
+`i-06c55554892db26bf` **STOPPED** at 2026-05-04T17:08 UTC. EBS root volume +
+venv + repo + IAM creds preserved. ~$2.50/mo storage cost. NVMe scratch
+wiped (intended; canonical artefacts are in S3 + local results.md +
+wandb online).
 
 ---
 

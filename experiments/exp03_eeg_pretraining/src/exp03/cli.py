@@ -664,7 +664,7 @@ def tuh_preprocess_cmd(
 @app.command("train")
 def train_cmd(
     paradigm: str = typer.Option("mae", "--paradigm",
-                                 help="Generative paradigm: 'mae' (G0), 'ar' (G1), 'mar' (G2)."),
+                                 help="Generative paradigm: 'mae' (G0), 'ar' (G1), 'mar' (G2), 'jepa' (G3, latent-prediction; v2)."),
     backbone_kind: str = typer.Option("mamba2", "--backbone-kind",
                                       help="Backbone: 'mamba2' (default) or 'transformer' (CPU/Mac fallback)"),
     backbone_layers: int = typer.Option(6, "--backbone-layers"),
@@ -707,6 +707,12 @@ def train_cmd(
     num_workers: int = typer.Option(2, "--num-workers",
                                     help="DataLoader workers. Set 0 for single-process dev "
                                          "(macOS, stdin scripts) or to debug worker errors."),
+    noise_twin: bool = typer.Option(False, "--noise-twin/--no-noise-twin",
+                                    help="§3 control: replace the EEG signal with torch.randn_like at "
+                                         "the model input. The matched-noise-twin cell of the §17 "
+                                         "control matrix. Pretraining still happens normally; "
+                                         "frozen-probe eval at end measures whether the encoder "
+                                         "developed downstream-useful structure on pure noise."),
     wandb_project: str = typer.Option("exp03", "--wandb-project"),
     wandb_run_name: str = typer.Option(None, "--wandb-run-name"),
     wandb_mode: str = typer.Option("online", "--wandb-mode",
@@ -773,6 +779,7 @@ def train_cmd(
         wandb_run_name=wandb_run_name,
         wandb_mode=wandb_mode,
         wandb_tags=tuple(t.strip() for t in wandb_tags.split(",") if t.strip()),
+        noise_twin=noise_twin,
     )
     console.print(f"[cyan]train cell[/cyan] paradigm={paradigm} seed={seed} "
                   f"steps={max_steps} batch={batch_size} -> {output_dir}")

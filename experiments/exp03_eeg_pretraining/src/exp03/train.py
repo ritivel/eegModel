@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -67,6 +68,16 @@ from torch.utils.data import DataLoader
 from . import data as data_mod
 from . import model as model_mod
 from . import storage as storage_mod
+
+# Force line-buffered stdout so per-step training prints flush to disk
+# immediately when invoked from a launcher script (e.g. tmux > tee > file).
+# Otherwise Python uses block buffering when stdout is not a TTY, which
+# made the 2026-05-04 first run look stuck between log boundaries.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):
+    pass
 
 
 # =============================================================================
@@ -105,6 +116,8 @@ class TrainConfig:
     data_root: Path | None = None                        # required at runtime
     max_windows_per_shard: int | None = None             # cap iid windows per parquet shard
     subject_filter: tuple[str, ...] | None = None        # train-split subjects (None = all)
+    noise_twin: bool = False                             # §3 control: replace x with torch.randn_like
+                                                         # (matched-noise twin per the README §17 control matrix)
 
     # --- optimisation ---------------------------------------------------
     max_steps: int = 1000
@@ -202,11 +215,13 @@ def _build_data_loader(t: TrainConfig, accelerator) -> Iterator[dict]:
         shuffle_within_shard=True,
         rng_seed=t.seed,
     )
+    # Tensor-only collate — DDP-safe (accelerate's `concatenate` can't cat
+    # list[str] across ranks, see data.collate_signal_batch_train docstring).
     loader = DataLoader(
         ds,
         batch_size=t.batch_size,
         num_workers=t.num_workers,
-        collate_fn=data_mod.collate_signal_batch,
+        collate_fn=data_mod.collate_signal_batch_train,
         pin_memory=t.num_workers > 0,
         drop_last=True,
     )
@@ -302,6 +317,15 @@ def train(t: TrainConfig) -> dict[str, Any]:
 
         x = batch["signal"]                                          # (B, T_samples) float32
 
+        # §3 noise-twin control: replace EEG signal with matched-statistics Gaussian
+        # noise BEFORE the model sees it. The data is already z-scored per-channel
+        # in `SPEC_MINIMAL`, so torch.randn_like is exactly statistics-matched
+        # (mean 0, std 1, no temporal structure). If a paradigm "wins" on the EEG
+        # cell but also "wins" on this noise twin, the gain is from augmentation
+        # / preprocessing, not from learning EEG content.
+        if t.noise_twin:
+            x = torch.randn_like(x)
+
         # MAR-specific: replicate each sample to get more noise levels per example
         if t.paradigm == "mar" and t.diffusion_batch_mul > 1:
             x = x.repeat(t.diffusion_batch_mul, 1)
@@ -319,6 +343,15 @@ def train(t: TrainConfig) -> dict[str, Any]:
                 accelerator.clip_grad_norm_(m.parameters(), t.grad_clip_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+        # G3 JEPA: momentum-update the target encoder after the optimizer step.
+        # No-op for other paradigms (they don't have an `update_target_encoder_from`
+        # method on their head).
+        if t.paradigm == "jepa":
+            unwrapped = accelerator.unwrap_model(m)
+            head = getattr(unwrapped, "paradigm", None)
+            if head is not None and hasattr(head, "update_target_encoder_from"):
+                head.update_target_encoder_from(unwrapped)
 
         losses_window.append(loss.item())
         if step % t.log_every == 0 or step == t.max_steps - 1:
