@@ -47,8 +47,13 @@ gpu = [
   "transformers>=4.51,<6",      # ships Mamba2Model + Trainer; v5 is the latest stable family
   "accelerate>=1.0,<2",         # mixed precision + multi-GPU runtime; lighter than full Trainer
   "einops>=0.8,<1",             # tensor reshape readability for masking + bidirectional Mamba
-  "scikit-learn>=1.5,<2",       # linear probe + k-NN for Check D
+  "scikit-learn>=1.5,<2",       # linear probe + k-NN
   "wandb>=0.18,<1",             # logging from step 1 (per Karpathy: monitor or you'll regret)
+
+  # eegfm_eval — downstream eval suite
+  "braindecode>=1.2",           # provides Labram/CBraMod/BIOT/EEGPT/REVE wrappers + from_pretrained
+  "eegdash>=0.6",               # NeurIPS 2025 HBN dataset loaders (EEG2025R*) + CCD trial extraction
+  "huggingface-hub>=0.24",      # fallback download path for CBraMod weights (HF Hub, not transformers)
 
   # Mamba-2 official kernel + its prerequisite depthwise-conv kernel.
   # Both are CUDA-built; installing them needs `--no-build-isolation` so

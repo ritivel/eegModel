@@ -100,9 +100,13 @@ def load_encoder(kind: EncoderKind, *, checkpoint: Path | str | None = None,
     if kind == "random_init":
         return _load_random_init(arch or "mamba2_d256_l6", device=device)
     if kind == "labram_base":
-        return _load_labram_base(Path(checkpoint), device=device)
+        return _load_labram_base(Path(checkpoint) if checkpoint else None, device=device)
     if kind == "cbramod":
-        return _load_cbramod(Path(checkpoint), device=device)
+        return _load_cbramod(Path(checkpoint) if checkpoint else None, device=device)
+    if kind == "biot":
+        return _load_biot(Path(checkpoint) if checkpoint else None, device=device)
+    if kind == "eegpt":
+        return _load_eegpt(Path(checkpoint) if checkpoint else None, device=device)
     raise NotImplementedError(f"encoder {kind!r} not yet wired (see adapter.py to add)")
 
 
@@ -202,76 +206,130 @@ def _load_random_init(arch: str, *, device: str) -> Encoder:
 
 
 # ---------------------------------------------------------------------------
-# labram_base — for reproduction tests
+# Third-party EEG-FMs — used to validate our harness via reproduction tests.
+#
+# We don't hand-port these models. `braindecode` (BSD, pip-install) already
+# ships clean PyTorch ports of LaBraM / CBraMod / BIOT / EEGPT with
+# `from_pretrained` factories pointing at the canonical HuggingFace mirrors.
+# Using a maintained scientific-Python library here is cleaner and lower-risk
+# than copy-paste vendoring; the `pip install braindecode` dep is the cost.
 # ---------------------------------------------------------------------------
 
 
-def _load_labram_base(checkpoint: Path, *, device: str) -> Encoder:
-    """Load LaBraM-Base from `labram-base.pth` (HuggingFace).
+def _load_labram_base(checkpoint: Path | None, *, device: str) -> Encoder:
+    """Load LaBraM-Base via braindecode (`braindecode/labram-pretrained` HF mirror).
 
-    This is a thin port — we re-implement just enough of LaBraM's `labram_base_patch200_200`
-    to load the official checkpoint and forward (B, C, T) → (B, D). See the
-    upstream reference implementation at
-    `https://github.com/935963004/LaBraM/blob/main/modeling_finetune.py`.
-
-    NOTE: implementation lives in `_labram.py` to keep this dispatcher small.
+    `checkpoint=None` ⇒ pull from HF; pass an explicit local `.pth` to override.
     """
-    from ._labram import LaBraMBase
-    model = LaBraMBase()
-    state = torch.load(checkpoint, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model" in state:
-        state = state["model"]
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print(f"[labram_base] load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected")
+    from braindecode.models import Labram                    # type: ignore[import-untyped]
+    if checkpoint is None or str(checkpoint) in ("hf", "auto"):
+        model = Labram.from_pretrained("braindecode/labram-pretrained")
+    else:
+        model = Labram()
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+        if isinstance(state, dict) and "model" in state:
+            state = state["model"]
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"[labram_base] load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected")
     model.to(device)
-
     spec = EncoderSpec(
         name="labram-base",
-        d_features=200,                      # LaBraM-Base hidden dim
+        d_features=200,
         sample_rate=200,
-        window_samples=2000,                  # 10 s for TUAB; some tasks use 1000 (5 s for TUEV)
-        expected_channels=None,               # LaBraM accepts any channel count
+        window_samples=2000,                  # 10 s for TUAB; tasks override (TUEV is 1000)
+        expected_channels=None,               # LaBraM accepts any channel set via electrode names
         n_params=sum(p.numel() for p in model.parameters()),
         pretraining="labram_vqcodebook",
     )
     enc = Encoder(model, spec)
-
-    def _forward(x: Tensor) -> Tensor:
-        return enc.model(x)
-    enc._forward = _forward                                   # type: ignore[method-assign]
+    enc._forward = lambda x: enc.model(x)                    # type: ignore[method-assign]
     return enc
 
 
-# ---------------------------------------------------------------------------
-# cbramod — for reproduction tests
-# ---------------------------------------------------------------------------
-
-
-def _load_cbramod(checkpoint: Path, *, device: str) -> Encoder:
-    """Load CBraMod from `pretrained_weights.pth` (HuggingFace).
-
-    Same pattern as LaBraM. Implementation in `_cbramod.py`.
-    """
-    from ._cbramod import CBraMod
-    model = CBraMod()
-    state = torch.load(checkpoint, map_location=device, weights_only=False)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print(f"[cbramod] load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected")
+def _load_cbramod(checkpoint: Path | None, *, device: str) -> Encoder:
+    """Load CBraMod via braindecode (or HF `weighting666/CBraMod`)."""
+    from braindecode.models import CBraMod as _CBraMod       # type: ignore[import-untyped]
+    if checkpoint is None or str(checkpoint) in ("hf", "auto"):
+        try:
+            model = _CBraMod.from_pretrained("weighting666/CBraMod")
+        except Exception:                                    # noqa: BLE001
+            # Fallback: download the .pth manually then load
+            from huggingface_hub import hf_hub_download
+            ckpt_path = hf_hub_download("weighting666/CBraMod",
+                                         "pretrained_weights/pretrained_weights.pth")
+            model = _CBraMod()
+            model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=False))
+    else:
+        model = _CBraMod()
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(state, strict=False)
     model.to(device)
     spec = EncoderSpec(
         name="cbramod",
         d_features=200,
         sample_rate=200,
-        window_samples=800,                   # 4 s @ 200 Hz; tasks may need longer
+        window_samples=800,                  # 4 s @ 200 Hz; tasks override
         expected_channels=None,
         n_params=sum(p.numel() for p in model.parameters()),
         pretraining="cbramod_mae",
     )
     enc = Encoder(model, spec)
+    enc._forward = lambda x: enc.model(x)                    # type: ignore[method-assign]
+    return enc
 
-    def _forward(x: Tensor) -> Tensor:
-        return enc.model(x)
-    enc._forward = _forward                                   # type: ignore[method-assign]
+
+def _load_biot(checkpoint: Path | None, *, device: str) -> Encoder:
+    """Load BIOT (six-dataset 18-channel) via braindecode."""
+    from braindecode.models import BIOT                      # type: ignore[import-untyped]
+    if checkpoint is None or str(checkpoint) in ("hf", "auto"):
+        model = BIOT.from_pretrained("braindecode/biot-pretrained-six-datasets-18chs")
+    else:
+        model = BIOT(n_chans=18, n_times=2000, sfreq=200, hop_length=100)
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+        if "model_state_dict" in state:
+            state = state["model_state_dict"]
+        model.load_state_dict(state, strict=False)
+    model.to(device)
+    spec = EncoderSpec(
+        name="biot",
+        d_features=256,
+        sample_rate=200,
+        window_samples=2000,
+        expected_channels=[
+            "FP1-F7", "F7-T7", "T7-P7", "P7-O1",
+            "FP2-F8", "F8-T8", "T8-P8", "P8-O2",
+            "FP1-F3", "F3-C3", "C3-P3", "P3-O1",
+            "FP2-F4", "F4-C4", "C4-P4", "P4-O2",
+            "C3-A2", "C4-A1",
+        ],
+        n_params=sum(p.numel() for p in model.parameters()),
+        pretraining="biot_six_datasets",
+    )
+    enc = Encoder(model, spec)
+    enc._forward = lambda x: enc.model(x)                    # type: ignore[method-assign]
+    return enc
+
+
+def _load_eegpt(checkpoint: Path | None, *, device: str) -> Encoder:
+    """Load EEGPT-Large (10M, 4-s @ 256Hz, 58-ch vocabulary) via braindecode."""
+    from braindecode.models import EEGPT                     # type: ignore[import-untyped]
+    if checkpoint is None or str(checkpoint) in ("hf", "auto"):
+        model = EEGPT.from_pretrained("braindecode/eegpt-pretrained")
+    else:
+        model = EEGPT()
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(state, strict=False)
+    model.to(device)
+    spec = EncoderSpec(
+        name="eegpt",
+        d_features=512,
+        sample_rate=256,
+        window_samples=1024,                  # 4 s @ 256 Hz
+        expected_channels=None,               # 58-channel vocab; pass channel names per-task
+        n_params=sum(p.numel() for p in model.parameters()),
+        pretraining="eegpt_mcae",
+    )
+    enc = Encoder(model, spec)
+    enc._forward = lambda x: enc.model(x)                    # type: ignore[method-assign]
     return enc
