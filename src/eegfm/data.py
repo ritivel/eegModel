@@ -305,6 +305,147 @@ def collate_signal_batch_train(rows: list[dict]) -> dict:
 
 
 # =============================================================================
+# G4 LeJEPA — multi-view augmentation collate
+# =============================================================================
+#
+# LeJEPA (Balestriero & LeCun, arXiv:2511.08544) requires V augmented views
+# per sample to compute its invariance loss. The original recipe is image
+# multi-crop (2 global + 6 local). For EEG, image augmentations don't apply
+# — instead we use a small, EEG-validated set of stochastic augmentations
+# whose composition produces V different views of the same 4-second window:
+#
+#   1. Random temporal masking — zero out a random contiguous span of length
+#      `mask_span_frac * T` samples. EEG2Rep (KDD 2024 best paper) showed
+#      that "preserving 50% of EEG recordings" is the sweet spot, so we
+#      default to mask_frac=0.5 with random span placement per view.
+#
+#   2. Gaussian noise injection — add iid N(0, sigma_noise) noise. Defaults
+#      to sigma=0.05 in the z-scored space; just enough to produce view
+#      variability without dominating the signal.
+#
+#   3. Random sign flip — multiply by ±1 with probability 0.5. EEG polarity
+#      is reference-dependent; many augmentation libraries (BENDR, EEG2Rep)
+#      include this as a free invariance-inducing transform.
+#
+# All views have the SAME length T (no global/local crop-size split) so they
+# tensor-stack cleanly into (B, V, T) without requiring multi-resolution
+# encoder forward passes. The "global vs local" notion from LeJEPA's image
+# recipe is approximated here by varying the mask fraction across views: the
+# first n_views_global views use mask_frac_global (lighter), the remaining
+# n_views_local views use mask_frac_local (heavier).
+# =============================================================================
+
+
+@dataclass
+class MultiViewConfig:
+    """Knobs for :class:`MultiViewCollate`. Defaults follow EEG2Rep + LeJEPA."""
+
+    n_views_global: int = 2
+    n_views_local: int = 4
+
+    mask_frac_global: float = 0.30        # fraction of timesteps to zero in global views
+    mask_frac_local: float = 0.60         # fraction in local views (heavier mask)
+    mask_n_spans: int = 2                 # number of contiguous spans per view (rest of mask is split)
+
+    sigma_noise: float = 0.05             # iid Gaussian noise std (z-scored space)
+    sign_flip_prob: float = 0.5           # per-view probability of multiplying by -1
+
+    seed: int = 0                         # for reproducibility of view sampling
+
+
+class MultiViewCollate:
+    """Collate fn that emits (B, V, T) multi-view batches for G4 LeJEPA.
+
+    Drop-in replacement for :func:`collate_signal_batch_train` when training
+    paradigm == "lejepa". Each input row's signal of shape (T,) is expanded
+    into V augmented views of shape (T,), stacked to (V, T), and the per-row
+    (V, T) tensors are stacked across the batch into (B, V, T). The trainer
+    then passes ``batch["signal"]`` of shape (B, V, T) to the model, which
+    reshapes to (B*V, T) for the encoder and (V, B, D) for the LeJEPA head.
+
+    Augmentations are stochastic per-view per-sample; the same source signal
+    produces V different views. We use a per-batch torch.Generator seeded
+    deterministically by ``cfg.seed + global_step`` so that runs with the
+    same seed are reproducible (matters for the noise-twin diagnostic).
+    """
+
+    def __init__(self, cfg: MultiViewConfig | None = None):
+        self.cfg = cfg if cfg is not None else MultiViewConfig()
+        self.n_views = self.cfg.n_views_global + self.cfg.n_views_local
+        if self.n_views < 2:
+            raise ValueError(
+                f"LeJEPA needs at least 2 views per sample; "
+                f"got n_views_global+n_views_local = {self.n_views}."
+            )
+        self._step = 0  # for view-augmentation seeding; advances per call
+
+    def _sample_one_view(
+        self,
+        signal: torch.Tensor,                       # (T,)
+        mask_frac: float,
+        gen: torch.Generator,
+    ) -> torch.Tensor:
+        """Apply one stochastic augmentation: time-mask + noise + sign flip."""
+        T = signal.size(0)
+        view = signal.clone()
+
+        # 1) Random temporal mask: split mask_frac*T samples into n_spans
+        #    contiguous spans at random positions.
+        n_mask_total = int(round(mask_frac * T))
+        if n_mask_total > 0:
+            n_spans = max(1, self.cfg.mask_n_spans)
+            span_len = max(1, n_mask_total // n_spans)
+            for _ in range(n_spans):
+                if span_len >= T:
+                    view.zero_()
+                    break
+                start = int(torch.randint(0, T - span_len + 1, (1,), generator=gen).item())
+                view[start : start + span_len] = 0.0
+
+        # 2) Gaussian noise injection (iid in z-scored space)
+        if self.cfg.sigma_noise > 0:
+            noise = torch.randn(T, generator=gen) * self.cfg.sigma_noise
+            view = view + noise
+
+        # 3) Random sign flip (EEG polarity invariance)
+        if self.cfg.sign_flip_prob > 0:
+            if float(torch.rand(1, generator=gen).item()) < self.cfg.sign_flip_prob:
+                view = -view
+
+        return view
+
+    def __call__(self, rows: list[dict]) -> dict:
+        # Per-call generator so view sampling is deterministic given (cfg.seed, _step).
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(self.cfg.seed + self._step)
+        self._step += 1
+
+        per_sample_views: list[torch.Tensor] = []
+        for row in rows:
+            signal = row["signal"]                             # (T,)
+            views = []
+            for _ in range(self.cfg.n_views_global):
+                views.append(self._sample_one_view(signal, self.cfg.mask_frac_global, gen))
+            for _ in range(self.cfg.n_views_local):
+                views.append(self._sample_one_view(signal, self.cfg.mask_frac_local, gen))
+            per_sample_views.append(torch.stack(views, dim=0))  # (V, T)
+
+        signals = torch.stack(per_sample_views, dim=0)          # (B, V, T)
+
+        # Match collate_signal_batch_train's tensor-only contract: keep
+        # the per-sample int/float metadata so accelerate's DDP-cat works.
+        keys_int = ["task_label", "channel_idx", "window_idx", "n_samples"]
+        keys_float = ["window_start_s", "p_factor", "attention",
+                      "internalizing", "externalizing", "age"]
+        out: dict[str, torch.Tensor] = {"signal": signals}
+        for k in keys_int:
+            out[k] = torch.tensor([r[k] for r in rows], dtype=torch.long)
+        for k in keys_float:
+            out[k] = torch.tensor([r[k] for r in rows], dtype=torch.float32)
+        return out
+
+
+# =============================================================================
 # Single-recording overfit batch (Check C)
 # =============================================================================
 

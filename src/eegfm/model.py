@@ -72,7 +72,7 @@ BackboneKind = Literal["transformer", "mamba2", "lru", "hybrid_mamba_attn", "fgn
 DecoderKind = Literal["mamba2", "transformer", "unet_samba"]
 MaskKind = Literal["random_patch", "wav2vec_span", "multi_block", "tube"]
 PosEmbKind = Literal["sinusoidal", "learned", "rope", "nope", "fourier_4d"]
-ParadigmKind = Literal["mae", "ar", "mar", "jepa"]
+ParadigmKind = Literal["mae", "ar", "mar", "jepa", "lejepa"]
 TargetKind = Literal["raw", "raw_per_patch_norm", "latent_jepa", "fsq_codec", "kmeans_cluster"]
 
 
@@ -137,6 +137,20 @@ class ParadigmConfig:
     kind: ParadigmKind = "mae"
     causal: bool = False                       # only meaningful for ar
     diffusion_head: bool = False               # only meaningful for mar
+    # G4 LeJEPA-only knobs (Balestriero & LeCun 2025, vendor/lejepa/).
+    # All ignored unless `kind == "lejepa"`. Defaults match the LeJEPA
+    # MINIMAL.md reference recipe (ImageNet ViT-S/8); for EEG these are
+    # starting points — see Notion experiment 21 for tuning notes.
+    lejepa_proj_hidden: int = 2048
+    lejepa_proj_dim: int = 128
+    lejepa_proj_layers: int = 3
+    lejepa_proj_norm: str = "batchnorm"        # batchnorm | layernorm | none
+    lejepa_sigreg_num_slices: int = 1024
+    lejepa_sigreg_t_max: float = 3.0
+    lejepa_sigreg_n_points: int = 17
+    lejepa_lambda_sigreg: float = 0.02         # weight on SIGReg vs invariance
+    lejepa_n_views_global: int = 2             # full-window views per sample
+    lejepa_n_views_local: int = 4              # short-crop views per sample
 
 
 @dataclass(frozen=True)
@@ -703,7 +717,7 @@ class EEGSSLModel(nn.Module):
         if self._paradigm_kind in ("mae", "mar", "jepa"):
             self.mask_module = build_mask(cfg.mask)
         else:
-            self.mask_module = None                   # G1 AR: no masking
+            self.mask_module = None                   # G1 AR / G4 LeJEPA: no masking
 
         if self._paradigm_kind == "mae":
             self.decoder_pos_emb = build_pos_emb(cfg.pos_emb, cfg.decoder.d_model)
@@ -748,6 +762,39 @@ class EEGSSLModel(nn.Module):
                 target_encoder=target_encoder,
                 target_frontend=target_frontend,
                 target_pos_emb=target_pos_emb,
+            )
+        elif self._paradigm_kind == "lejepa":
+            # G4 LeJEPA (Balestriero & LeCun 2025) — encoder + projector MLP +
+            # SIGReg loss. No decoder, no mask, no target encoder, no
+            # stop-gradient — that is the whole pitch of the paper. Multiple
+            # augmented views per sample come in via MultiViewCollate; the
+            # forward path encodes (B*V, T) -> mean-pool -> (V, B, D) and
+            # hands off to LeJEPAHead which applies the projector + SIGReg +
+            # invariance loss. Knobs (proj_dim, num_slices, lambda) are
+            # threaded through the build_paradigm factory.
+            self.decoder_pos_emb = None
+            self.mask_token = None
+            self.decoder = None
+            self.recon_head = None
+            self.paradigm = paradigms.build_paradigm(
+                cfg.paradigm,
+                d_model=cfg.backbone.d_model,
+                patch_samples=cfg.patch_samples,
+                decoder_module=None,
+                decoder_pos_emb=None,
+                mask_token=None,
+                recon_head=None,
+                # LeJEPA-specific knobs come from the cfg.paradigm extra
+                # fields (we keep ParadigmConfig as the single source of
+                # truth; defaults are reasonable per the LeJEPA MINIMAL.md).
+                lejepa_proj_hidden=getattr(cfg.paradigm, "lejepa_proj_hidden", 2048),
+                lejepa_proj_dim=getattr(cfg.paradigm, "lejepa_proj_dim", 128),
+                lejepa_proj_layers=getattr(cfg.paradigm, "lejepa_proj_layers", 3),
+                lejepa_proj_norm=getattr(cfg.paradigm, "lejepa_proj_norm", "batchnorm"),
+                lejepa_sigreg_num_slices=getattr(cfg.paradigm, "lejepa_sigreg_num_slices", 1024),
+                lejepa_sigreg_t_max=getattr(cfg.paradigm, "lejepa_sigreg_t_max", 3.0),
+                lejepa_sigreg_n_points=getattr(cfg.paradigm, "lejepa_sigreg_n_points", 17),
+                lejepa_lambda_sigreg=getattr(cfg.paradigm, "lejepa_lambda_sigreg", 0.02),
             )
         else:
             # G1 AR / G2 MAR — no MAE decoder block, no MAE mask token,
@@ -840,6 +887,41 @@ class EEGSSLModel(nn.Module):
           (it's just ``"loss"`` then). Use ``encode_features(x)`` for the
           frozen-probe path, *not* this method's output.
         """
+        # G4 LeJEPA — multi-view input path.
+        # Trainer + MultiViewCollate emit x of shape (B, V, T_samples) where
+        # V = n_views_global + n_views_local. We encode all B*V views in one
+        # pass, mean-pool over time, reshape to (V, B, D), and dispatch to
+        # the LeJEPAHead which applies projector + SIGReg + invariance loss.
+        # No masking, no decoder, no target encoder — that's the LeJEPA pitch.
+        if self._paradigm_kind == "lejepa":
+            if x.dim() != 3:
+                raise ValueError(
+                    "LeJEPA paradigm expects multi-view input of shape (B, V, T_samples) "
+                    f"from MultiViewCollate; got x.shape={tuple(x.shape)}. "
+                    "Did the trainer wire `data.MultiViewCollate` for paradigm='lejepa'?"
+                )
+            B, V, T_samples = x.shape
+            x_flat = x.reshape(B * V, 1, T_samples)        # (B*V, 1, T)
+            tokens = self.frontend(x_flat)                  # (B*V, T_tokens, D)
+            if zero_token_content:
+                tokens = torch.zeros_like(tokens)
+            tokens = self.encoder_pos_emb(tokens)
+            encoded_full = self.encoder(tokens)             # (B*V, T_tokens, D)
+            pooled = encoded_full.mean(dim=1)               # (B*V, D)
+            D = pooled.size(-1)
+            # Reshape (B*V, D) -> (B, V, D) -> (V, B, D) for LeJEPA head.
+            encoded_views = pooled.reshape(B, V, D).transpose(0, 1).contiguous()
+            out: dict[str, torch.Tensor] = {
+                "encoder_features": pooled,                 # (B*V, D) for any callers wanting flat
+                "encoded_views": encoded_views,             # (V, B, D)
+            }
+            if compute_loss:
+                head_out = self.paradigm(encoded_views=encoded_views)
+                out["loss"] = head_out["loss"]
+                out["components"] = head_out["components"]
+                out["projections"] = head_out["projections"]    # (V, B, P)
+            return out
+
         if x.dim() == 2:
             x = x.unsqueeze(1)
 

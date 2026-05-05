@@ -1,0 +1,3 @@
+[submodule "vendor/lejepa"]
+	path = vendor/lejepa
+	url = https://github.com/ritivel/lejepa.git

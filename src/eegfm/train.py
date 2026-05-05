@@ -112,6 +112,25 @@ class TrainConfig:
     num_diffusion_steps: int = 1000
     diffusion_batch_mul: int = 1                         # MAR's batch-replication trick
 
+    # --- LeJEPA-specific knobs (ignored for other paradigms) ------------
+    # Defaults follow the LeJEPA MINIMAL.md reference + EEG2Rep best-paper
+    # SSP masking (preserve 50% of EEG); see paradigms.LeJEPAHead docstring.
+    lejepa_n_views_global: int = 2
+    lejepa_n_views_local: int = 4
+    lejepa_mask_frac_global: float = 0.30
+    lejepa_mask_frac_local: float = 0.60
+    lejepa_mask_n_spans: int = 2
+    lejepa_sigma_noise: float = 0.05
+    lejepa_sign_flip_prob: float = 0.5
+    lejepa_proj_hidden: int = 2048
+    lejepa_proj_dim: int = 128
+    lejepa_proj_layers: int = 3
+    lejepa_proj_norm: str = "batchnorm"
+    lejepa_sigreg_num_slices: int = 1024
+    lejepa_sigreg_t_max: float = 3.0
+    lejepa_sigreg_n_points: int = 17
+    lejepa_lambda_sigreg: float = 0.02
+
     # --- data ------------------------------------------------------------
     data_root: Path | None = None                        # required at runtime
     max_windows_per_shard: int | None = None             # cap iid windows per parquet shard
@@ -176,7 +195,19 @@ def _build_model_config(t: TrainConfig) -> model_mod.ModelConfig:
             d_model=t.backbone_d_model,
         ),
         mask=model_mod.MaskConfig(mask_ratio=t.mask_ratio),
-        paradigm=model_mod.ParadigmConfig(kind=t.paradigm),
+        paradigm=model_mod.ParadigmConfig(
+            kind=t.paradigm,
+            lejepa_proj_hidden=t.lejepa_proj_hidden,
+            lejepa_proj_dim=t.lejepa_proj_dim,
+            lejepa_proj_layers=t.lejepa_proj_layers,
+            lejepa_proj_norm=t.lejepa_proj_norm,
+            lejepa_sigreg_num_slices=t.lejepa_sigreg_num_slices,
+            lejepa_sigreg_t_max=t.lejepa_sigreg_t_max,
+            lejepa_sigreg_n_points=t.lejepa_sigreg_n_points,
+            lejepa_lambda_sigreg=t.lejepa_lambda_sigreg,
+            lejepa_n_views_global=t.lejepa_n_views_global,
+            lejepa_n_views_local=t.lejepa_n_views_local,
+        ),
         target=model_mod.TargetConfig(kind="raw"),
         window_samples=t.window_samples,
     )
@@ -212,13 +243,29 @@ def _build_data_loader(t: TrainConfig, accelerator) -> Iterator[dict]:
         shuffle_within_shard=True,
         rng_seed=t.seed,
     )
-    # Tensor-only collate — DDP-safe (accelerate's `concatenate` can't cat
-    # list[str] across ranks, see data.collate_signal_batch_train docstring).
+    # Branch on paradigm: LeJEPA needs (B, V, T) multi-view batches via
+    # MultiViewCollate (one source signal -> V augmented views). Other
+    # paradigms get the standard tensor-only collate (B, T). Both are
+    # DDP-safe (no list[str] in the batch dict).
+    if t.paradigm == "lejepa":
+        mv_cfg = data_mod.MultiViewConfig(
+            n_views_global=t.lejepa_n_views_global,
+            n_views_local=t.lejepa_n_views_local,
+            mask_frac_global=t.lejepa_mask_frac_global,
+            mask_frac_local=t.lejepa_mask_frac_local,
+            mask_n_spans=t.lejepa_mask_n_spans,
+            sigma_noise=t.lejepa_sigma_noise,
+            sign_flip_prob=t.lejepa_sign_flip_prob,
+            seed=t.seed,
+        )
+        collate = data_mod.MultiViewCollate(mv_cfg)
+    else:
+        collate = data_mod.collate_signal_batch_train
     loader = DataLoader(
         ds,
         batch_size=t.batch_size,
         num_workers=t.num_workers,
-        collate_fn=data_mod.collate_signal_batch_train,
+        collate_fn=collate,
         pin_memory=t.num_workers > 0,
         drop_last=True,
     )
@@ -312,14 +359,19 @@ def train(t: TrainConfig) -> dict[str, Any]:
             data_iter = iter(loader)                                # rewind IterableDataset
             batch = next(data_iter)
 
-        x = batch["signal"]                                          # (B, T_samples) float32
+        # Shape contract per paradigm:
+        #   * mae / ar / mar / jepa: (B, T_samples) — single window per sample
+        #   * lejepa:                (B, V, T_samples) — V augmented views per
+        #     sample, courtesy of MultiViewCollate. Model.forward dispatches
+        #     on x.dim() == 3 to the LeJEPA path.
+        x = batch["signal"]
 
         # §3 noise-twin control: replace EEG signal with matched-statistics Gaussian
         # noise BEFORE the model sees it. The data is already z-scored per-channel
         # in `SPEC_MINIMAL`, so torch.randn_like is exactly statistics-matched
         # (mean 0, std 1, no temporal structure). If a paradigm "wins" on the EEG
         # cell but also "wins" on this noise twin, the gain is from augmentation
-        # / preprocessing, not from learning EEG content.
+        # / preprocessing, not from learning EEG content. Works for any rank.
         if t.noise_twin:
             x = torch.randn_like(x)
 

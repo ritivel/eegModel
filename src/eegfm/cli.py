@@ -664,7 +664,11 @@ def tuh_preprocess_cmd(
 @app.command("train")
 def train_cmd(
     paradigm: str = typer.Option("mae", "--paradigm",
-                                 help="Generative paradigm: 'mae' (G0), 'ar' (G1), 'mar' (G2), 'jepa' (G3, latent-prediction; v2)."),
+                                 help="SSL paradigm: 'mae' (G0), 'ar' (G1), 'mar' (G2), "
+                                      "'jepa' (G3, masked latent prediction with EMA target), "
+                                      "'lejepa' (G4, LeJEPA — Balestriero & LeCun 2025; "
+                                      "multi-view + SIGReg + invariance, no EMA, vendored "
+                                      "at vendor/lejepa/)."),
     backbone_kind: str = typer.Option("mamba2", "--backbone-kind",
                                       help="Backbone: 'mamba2' (default) or 'transformer' (CPU/Mac fallback)"),
     backbone_layers: int = typer.Option(6, "--backbone-layers"),
@@ -711,6 +715,31 @@ def train_cmd(
                                          "control matrix. Pretraining still happens normally; "
                                          "frozen-probe eval at end measures whether the encoder "
                                          "developed downstream-useful structure on pure noise."),
+    # G4 LeJEPA-only knobs (ignored unless --paradigm lejepa).
+    # Defaults follow the LeJEPA MINIMAL.md reference + EEG2Rep best-paper
+    # masking; see paradigms.LeJEPAHead docstring + Notion experiment 21.
+    lejepa_n_views_global: int = typer.Option(2, "--lejepa-n-views-global",
+        help="LeJEPA: number of full-window (lighter-mask) views per sample. Default 2."),
+    lejepa_n_views_local: int = typer.Option(4, "--lejepa-n-views-local",
+        help="LeJEPA: number of heavier-mask local views per sample. Default 4. "
+             "Total V = global + local; effective batch is V*B per encoder pass."),
+    lejepa_mask_frac_global: float = typer.Option(0.30, "--lejepa-mask-frac-global"),
+    lejepa_mask_frac_local: float = typer.Option(0.60, "--lejepa-mask-frac-local"),
+    lejepa_mask_n_spans: int = typer.Option(2, "--lejepa-mask-n-spans"),
+    lejepa_sigma_noise: float = typer.Option(0.05, "--lejepa-sigma-noise"),
+    lejepa_sign_flip_prob: float = typer.Option(0.5, "--lejepa-sign-flip-prob"),
+    lejepa_proj_hidden: int = typer.Option(2048, "--lejepa-proj-hidden"),
+    lejepa_proj_dim: int = typer.Option(128, "--lejepa-proj-dim"),
+    lejepa_proj_layers: int = typer.Option(3, "--lejepa-proj-layers"),
+    lejepa_proj_norm: str = typer.Option("batchnorm", "--lejepa-proj-norm",
+        help="Projector normalisation: batchnorm | layernorm | none. "
+             "LeJEPA's MINIMAL.md uses BatchNorm; LayerNorm is an EEG ablation knob."),
+    lejepa_sigreg_num_slices: int = typer.Option(1024, "--lejepa-sigreg-num-slices"),
+    lejepa_sigreg_t_max: float = typer.Option(3.0, "--lejepa-sigreg-t-max"),
+    lejepa_sigreg_n_points: int = typer.Option(17, "--lejepa-sigreg-n-points"),
+    lejepa_lambda_sigreg: float = typer.Option(0.02, "--lejepa-lambda-sigreg",
+        help="LeJEPA single hyperparameter λ. total = λ·SIGReg + (1-λ)·invariance. "
+             "Reference recipe: 0.02 (98%% invariance, 2%% SIGReg)."),
     wandb_project: str = typer.Option("eegfm", "--wandb-project"),
     wandb_run_name: str = typer.Option(None, "--wandb-run-name"),
     wandb_mode: str = typer.Option("online", "--wandb-mode",
@@ -736,6 +765,15 @@ def train_cmd(
         # Forward-only Mamba AR pretraining (G1)
         eegfm train --paradigm ar --steps 17500 --batch-size 32 \\
             --wandb-run-name exp17-g1-seed0 --wandb-tags exp17,g1,ar
+
+    \b
+        # G4 LeJEPA on full HBN — Balestriero & LeCun 2025 recipe (no EMA,
+        # no stop-gradient, no teacher-student). Effective per-step batch is
+        # batch_size × n_views (here 64 × 6 = 384). λ=0.02 per MINIMAL.md.
+        eegfm train --paradigm lejepa --steps 25000 --batch-size 64 \\
+            --lejepa-lambda-sigreg 0.02 --blr 5e-4 \\
+            --wandb-project eegfm --wandb-tags 21_lejepa_eeg,lejepa,headline \\
+            --wandb-run-name 21_lejepa_eeg__hbn_500h__seed0
     """
     from . import train as train_mod
 
@@ -771,6 +809,22 @@ def train_cmd(
         log_every=log_every,
         ckpt_every=ckpt_every,
         num_workers=num_workers,
+        # G4 LeJEPA knobs (ignored when paradigm != "lejepa")
+        lejepa_n_views_global=lejepa_n_views_global,
+        lejepa_n_views_local=lejepa_n_views_local,
+        lejepa_mask_frac_global=lejepa_mask_frac_global,
+        lejepa_mask_frac_local=lejepa_mask_frac_local,
+        lejepa_mask_n_spans=lejepa_mask_n_spans,
+        lejepa_sigma_noise=lejepa_sigma_noise,
+        lejepa_sign_flip_prob=lejepa_sign_flip_prob,
+        lejepa_proj_hidden=lejepa_proj_hidden,
+        lejepa_proj_dim=lejepa_proj_dim,
+        lejepa_proj_layers=lejepa_proj_layers,
+        lejepa_proj_norm=lejepa_proj_norm,
+        lejepa_sigreg_num_slices=lejepa_sigreg_num_slices,
+        lejepa_sigreg_t_max=lejepa_sigreg_t_max,
+        lejepa_sigreg_n_points=lejepa_sigreg_n_points,
+        lejepa_lambda_sigreg=lejepa_lambda_sigreg,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
         wandb_mode=wandb_mode,

@@ -805,6 +805,194 @@ class LatentJEPAHead(ParadigmHead):
 
 
 # ---------------------------------------------------------------------------
+# G4 — LeJEPA (Balestriero & LeCun, arXiv:2511.08544, Nov 2025)
+# Vendored at vendor/lejepa/ (rbalestr-lab/lejepa, CC BY-NC 4.0).
+# ---------------------------------------------------------------------------
+
+
+class LeJEPAHead(ParadigmHead):
+    """G4 paradigm head: LeJEPA's heuristics-free joint-embedding recipe.
+
+    Despite the "JEPA" name shared with G3, this is a fundamentally
+    different recipe from I-JEPA / EEG2Rep / our :class:`LatentJEPAHead`:
+    no masking, no EMA target encoder, no stop-gradient, no predictor
+    over masked positions. The only "predictive" element is an
+    invariance loss between projections of multiple augmented views of
+    the same input.
+
+    The architecture is:
+
+    * **Encoder**: shared with the rest of the model (``EEGSSLModel.encoder``)
+      — runs over the FULL input window for every view. No masking.
+    * **Projector**: a 3-layer MLP (BatchNorm + GELU) mapping the
+      mean-pooled encoder output to a low-dim ``proj_dim``. Following
+      the LeJEPA ``MINIMAL.md`` recipe.
+    * **Multi-view input**: the trainer constructs ``V`` augmented views
+      per sample via :class:`eegfm.data.MultiViewCollate`. The encoder
+      processes all ``B*V`` views in one forward pass, then the head
+      reshapes to ``(V, B, proj_dim)`` for loss computation.
+    * **Loss** = ``λ * SIGReg(proj) + (1 - λ) * invariance(proj)``
+      where:
+
+      - ``invariance = ((proj.mean(0) - proj) ** 2).mean()`` — pulls all
+        view projections toward their per-sample mean, like BYOL/DINO's
+        consistency loss but **without** stop-gradients or a teacher.
+      - ``SIGReg`` = Sketched Isotropic Gaussian Regularization — the
+        statistical-test-based anti-collapse term from
+        :mod:`lejepa.multivariate`. Concretely
+        ``SlicingUnivariateTest(EppsPulley(...), num_slices=...)``
+        applied to the flattened ``(V*B, proj_dim)`` projections.
+
+    LeJEPA's pitch: a *single* trade-off hyperparameter ``λ`` (default
+    0.02 per the reference recipe) replaces the dozen heuristics
+    (momentum schedule, temperature schedule, stop-gradient, teacher
+    update rule, etc.) that other SSL methods rely on. Empirically on
+    ImageNet the same recipe matches or beats I-JEPA at 3x fewer epochs
+    (`README.md` benchmark table). On EEG it is unvalidated — see
+    Notion experiment 21 for our pre-registered hypothesis.
+
+    References:
+
+    * **LeJEPA paper** (Balestriero & LeCun, Nov 2025):
+      https://arxiv.org/abs/2511.08544
+    * **Repo** (CC BY-NC 4.0): https://github.com/rbalestr-lab/lejepa
+      Vendored at ``vendor/lejepa/``.
+    * **Minimal example** (130-line ViT-S/8 + Imagenette reference):
+      ``vendor/lejepa/MINIMAL.md``.
+
+    Inputs (from a refactored :meth:`EEGSSLModel.forward` for ``lejepa``):
+
+        encoded_views   (V, B, D)   mean-pooled encoder output, one row per view
+
+    Outputs:
+
+        loss            scalar              total LeJEPA loss
+        components      dict[str, float]    sigreg / invariance / lambda for wandb
+
+    Implementation note: per LeJEPA's ``MINIMAL.md``, the projector
+    must use BatchNorm (not LayerNorm) — the stats-based collapse
+    prevention assumes BatchNorm's batch-level standardisation. We
+    expose the choice via a flag for ablation, but BatchNorm is the
+    default-and-recommended setting.
+    """
+
+    def __init__(
+        self,
+        cfg: Any,
+        *,
+        d_model: int,
+        proj_hidden: int = 2048,
+        proj_dim: int = 128,
+        proj_layers: int = 3,
+        proj_norm: str = "batchnorm",
+        sigreg_num_slices: int = 1024,
+        sigreg_t_max: float = 3.0,
+        sigreg_n_points: int = 17,
+        sigreg_clip_value: float | None = None,
+        lambda_sigreg: float = 0.02,
+    ):
+        super().__init__(cfg)
+        self.d_model = d_model
+        self.proj_dim = proj_dim
+        self.lambda_sigreg = lambda_sigreg
+
+        # Build the projector MLP. Per LeJEPA `MINIMAL.md`:
+        #     proj = MLP(d_model, [proj_hidden]*(proj_layers-1) + [proj_dim],
+        #                norm_layer=BatchNorm1d)
+        # We hand-roll it (vs torchvision.ops.MLP) to keep the einops/torch
+        # dep surface minimal and to make the BN/LN swap explicit for ablation.
+        if proj_norm == "batchnorm":
+            norm_cls: Any = lambda d: nn.BatchNorm1d(d)
+        elif proj_norm == "layernorm":
+            norm_cls = lambda d: nn.LayerNorm(d)
+        elif proj_norm == "none":
+            norm_cls = lambda d: nn.Identity()
+        else:
+            raise ValueError(f"proj_norm must be batchnorm|layernorm|none, got {proj_norm!r}")
+
+        layers: list[nn.Module] = []
+        in_dim = d_model
+        for _ in range(max(proj_layers - 1, 0)):
+            layers.append(nn.Linear(in_dim, proj_hidden))
+            layers.append(norm_cls(proj_hidden))
+            layers.append(nn.GELU())
+            in_dim = proj_hidden
+        layers.append(nn.Linear(in_dim, proj_dim))
+        self.projector = nn.Sequential(*layers)
+
+        # Build the SIGReg loss using the vendored lejepa package.
+        # Lazy import so the rest of `paradigms` still works on a CPU
+        # box without `vendor/lejepa` installed (e.g. unit tests of
+        # MAEHead / ARNextPatchHead don't need lejepa).
+        try:
+            import lejepa  # noqa: F401
+            from lejepa.univariate import EppsPulley
+            from lejepa.multivariate import SlicingUnivariateTest
+        except ImportError as exc:
+            raise ImportError(
+                "LeJEPA paradigm requires the `lejepa` package. Install "
+                "the vendored submodule: `pip install -e vendor/lejepa` "
+                "(or `uv pip install -e vendor/lejepa`). Submodule lives "
+                "at vendor/lejepa/ — pinned to a specific commit of "
+                "rbalestr-lab/lejepa (CC BY-NC 4.0)."
+            ) from exc
+
+        self.sigreg = SlicingUnivariateTest(
+            univariate_test=EppsPulley(t_max=sigreg_t_max, n_points=sigreg_n_points),
+            num_slices=sigreg_num_slices,
+            reduction="mean",
+            sampler="gaussian",
+            clip_value=sigreg_clip_value,
+        )
+
+    def forward(
+        self,
+        *,
+        encoded_views: torch.Tensor,            # (V, B, D)
+    ) -> dict[str, Any]:
+        """Compute LeJEPA's λ-weighted invariance + SIGReg loss.
+
+        encoded_views is the mean-pooled encoder output for each view,
+        already reshaped to (V, B, D) by :meth:`EEGSSLModel.forward`.
+        We project to (V, B, proj_dim), compute invariance (variance of
+        view projections around their per-sample mean), then SIGReg on
+        the flattened (V*B, proj_dim) projections to enforce isotropic
+        Gaussian distribution. Total loss is the convex combination
+        ``λ·sigreg + (1-λ)·invariance``.
+        """
+        V, B, D = encoded_views.shape
+        # Flatten (V, B, D) -> (V*B, D), project, reshape back.
+        emb_flat = encoded_views.reshape(V * B, D)
+        proj_flat = self.projector(emb_flat)            # (V*B, proj_dim)
+        proj = proj_flat.reshape(V, B, self.proj_dim)   # (V, B, P)
+
+        # Invariance: views of the same sample should have similar projections.
+        # Per LeJEPA MINIMAL.md: `inv_loss = (proj.mean(0) - proj).square().mean()`
+        # where the mean(0) is over the V views per sample.
+        inv_loss = (proj.mean(dim=0, keepdim=True) - proj).square().mean()
+
+        # SIGReg: all (V*B, proj_dim) projections together should follow
+        # an isotropic Gaussian distribution. Anti-collapse without EMA
+        # / stop-gradient.
+        sigreg_loss = self.sigreg(proj_flat)
+
+        loss = sigreg_loss * self.lambda_sigreg + inv_loss * (1.0 - self.lambda_sigreg)
+
+        return {
+            "loss": loss,
+            "components": {
+                "lejepa_total": float(loss.detach().item()),
+                "lejepa_sigreg": float(sigreg_loss.detach().item()),
+                "lejepa_invariance": float(inv_loss.detach().item()),
+                "lejepa_lambda_sigreg": float(self.lambda_sigreg),
+                "lejepa_proj_norm_mean": float(proj_flat.norm(dim=-1).mean().detach().item()),
+            },
+            "projections": proj,
+            "embeddings": encoded_views,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -829,6 +1017,15 @@ def build_paradigm(
     ema_momentum: float = 0.996,
     predictor_hidden: int = 1024,
     predictor_layers: int = 2,
+    # G4 LeJEPA-only knobs (set up by EEGSSLModel.__init__ when paradigm.kind == "lejepa")
+    lejepa_proj_hidden: int = 2048,
+    lejepa_proj_dim: int = 128,
+    lejepa_proj_layers: int = 3,
+    lejepa_proj_norm: str = "batchnorm",
+    lejepa_sigreg_num_slices: int = 1024,
+    lejepa_sigreg_t_max: float = 3.0,
+    lejepa_sigreg_n_points: int = 17,
+    lejepa_lambda_sigreg: float = 0.02,
 ) -> ParadigmHead:
     """Build the paradigm head matching ``paradigm_cfg.kind``.
 
@@ -886,5 +1083,18 @@ def build_paradigm(
             ema_momentum=ema_momentum,
             predictor_hidden=predictor_hidden,
             predictor_layers=predictor_layers,
+        )
+    if kind == "lejepa":
+        return LeJEPAHead(
+            paradigm_cfg,
+            d_model=d_model,
+            proj_hidden=lejepa_proj_hidden,
+            proj_dim=lejepa_proj_dim,
+            proj_layers=lejepa_proj_layers,
+            proj_norm=lejepa_proj_norm,
+            sigreg_num_slices=lejepa_sigreg_num_slices,
+            sigreg_t_max=lejepa_sigreg_t_max,
+            sigreg_n_points=lejepa_sigreg_n_points,
+            lambda_sigreg=lejepa_lambda_sigreg,
         )
     raise ValueError(f"unknown paradigm kind: {kind!r}")

@@ -36,6 +36,12 @@ uv pip install -e .
 uv pip install -e ".[gpu]"
 uv pip install --no-build-isolation mamba-ssm causal-conv1d
 
+# (Optional, only needed for --paradigm lejepa, experiment 21)
+# Init the vendored LeJEPA submodule and install it editable.
+# Upstream: rbalestr-lab/lejepa (CC BY-NC 4.0 — non-commercial use only).
+git submodule update --init --recursive
+uv pip install -e vendor/lejepa
+
 # Discover the CLI
 eegfm --help
 
