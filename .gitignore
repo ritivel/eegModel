@@ -20,7 +20,7 @@ venv/
 *.swp
 .DS_Store
 
-# Experiment artifacts (anything under EXP01_DATA_ROOT)
+# Run artifacts (anything under $EEG_DATA_ROOT mirrored locally)
 data/
 *.pt
 *.parquet
@@ -30,6 +30,3 @@ wandb/
 .env
 .env.*
 .envrc
-
-# Standups: presentation drafts, working scratch, never committed
-standups/

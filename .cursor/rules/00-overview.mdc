@@ -1,0 +1,28 @@
+---
+description: Project overview and where to find things
+alwaysApply: true
+---
+
+# eegModel — overview
+
+This repo trains **EEG foundation models** (self-supervised pretraining). Read [`AGENTS.md`](mdc:AGENTS.md) once at the start of a session and [`BEST_PRACTICES.md`](mdc:BEST_PRACTICES.md) before designing or reviewing any experiment.
+
+## Where things live
+
+- **Code**: `src/eegfm/` (training package), `packages/eeg_common`, `packages/eeg_ops`.
+- **Per-experiment config + slim README**: `experiments/NN_<name>/`. Each folder's README links to Notion.
+- **Run metrics**: WandB project `eegfm`.
+- **Artifacts**: S3 `s3://eegmodel-warehouse/runs/<group>/<run_id>/`.
+- **Knowledge** (designs, results, findings, standups, decisions): Notion under "EEG Foundation Models — Operations Hub" (`357939fbcda4813fab4bc5fe0d84ea2c`).
+
+## Hard rules
+
+- **Do not create new prose markdown** in the repo for narrative content (progress logs, results, findings, methodology). Notion holds those. The only durable engineering docs in the repo are `AGENTS.md`, `BEST_PRACTICES.md`, and these `.cursor/rules/`.
+- **For latest project state** (active runs, recent findings, what's next), use the Notion MCP — don't ask the user.
+- **Experiment IDs (01–20) are stable**; never renumber.
+
+## When in doubt
+
+- Need to know what an experiment is about? `notion-search` for "NN — <short name>".
+- Need to know what's currently running? Query the Runs DB in Notion or `wandb` directly.
+- Need to log a decision or finding? Use `eeg-ops events log` or `eeg-ops findings add` — these write to Notion automatically.

@@ -1,0 +1,36 @@
+---
+description: Conventions when working in the experiments/ folder
+globs: experiments/**
+alwaysApply: false
+---
+
+# Per-experiment conventions
+
+Each `experiments/NN_<name>/` folder is **one experiment**. Folders are slim by design — they hold only code-adjacent artifacts. The narrative (hypothesis, methodology, results) lives in Notion.
+
+## What belongs here
+
+- `README.md` (~15 lines): Notion link + WandB group + how to run. Do not expand this into a design doc.
+- `config.yaml` (when needed): the diff vs the §4.2 default config in `BEST_PRACTICES.md`. Only the config knobs that vary for this experiment.
+- `launch.sh` (when needed): non-trivial launch logic specific to this experiment.
+- `sweep.yaml` (when needed): WandB sweep config for hyperparameter scans.
+
+## What does NOT belong here
+
+- ❌ Long design specs, hypothesis prose, methodology — those live in the Notion Experiments DB row body.
+- ❌ `results.md`, `findings.md`, `progress.md` — results live in WandB; findings live in Notion's Findings DB.
+- ❌ Per-run output files — those go to S3 (`s3://eegmodel-warehouse/runs/<group>/<run_id>/`) via `eegfm.storage`.
+
+## Adding a new experiment
+
+1. Create the folder `experiments/NN_<short_name>/` (next ID).
+2. Add a slim README pointing to its Notion page (create the row in the Experiments DB first if it doesn't exist).
+3. Add `config.yaml` if there's a meaningful diff vs the default.
+4. Run training via `eegfm train ... --wandb-project eegfm --wandb-tags NN_short_name --wandb-run-name NN_short_name__<config>__seed{n}`.
+
+## WandB conventions
+
+- Project: `eegfm` (always)
+- Group: same as experiment folder name (e.g. `02_frontend_ablation`)
+- Run name: `<group>__<config_short>__seed{n}` (e.g. `17_generative_paradigm__mar_eeg__seed0`)
+- Tags: experiment folder name + paradigm + dataset + purpose (e.g. `17_generative_paradigm`, `mar`, `hbn`, `headline`)

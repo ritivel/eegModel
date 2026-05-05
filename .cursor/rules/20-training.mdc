@@ -1,0 +1,37 @@
+---
+description: Conventions for the eegfm training package
+globs: src/eegfm/**
+alwaysApply: false
+---
+
+# Training package conventions
+
+`src/eegfm/` is the foundation-model training package. Single-stage SSL pretraining (no teacher / no EMA-only / no two-stage tokenizer training — see `BEST_PRACTICES.md` §6 for the rationale).
+
+## Code organization
+
+- `cli.py` — Typer entrypoint (`eegfm` command). All operational flows go through here.
+- `data.py` — parquet shard loaders, DDP-safe collate, iid-channel expansion.
+- `model.py` — frontend / backbone / decoder / mask building blocks; `EEGSSLModel` ties them together.
+- `paradigms.py` — generative paradigm wrappers (G0 MAE, G1 AR, G2 MAR, G3 latent-prediction).
+- `losses.py` — Barron, Itakura-Saito, MR-STFT, bispectral, etc.
+- `train.py` — single-cell trainer with WandB + accelerate.
+- `eval.py` — Protocol A frozen-probing + Protocol B fine-tuning eval suites.
+- `sanity.py` — Phase-1 checks (loss-at-init, input-independent, one-batch overfit, random-init floor, shape audit).
+- `storage.py` — `Storage.from_env()` — all paths and S3 prefixes resolve through this. Don't hardcode.
+- `hbn.py`, `tuh.py` — corpus-specific data utilities.
+
+## Mandatory training-loop conventions
+
+- **WandB**: `wandb.init(project="eegfm", group=<experiment_folder_name>, name=<run_name>, tags=[...])`. Don't change project name — Notion's Runs DB filters on it.
+- **Numerical stability**: Mamba-2's `segsum` primitive can NaN under bf16 / fp16 — use the official Triton kernel and prefer fp32 for sanity runs (see `BEST_PRACTICES.md` §6.2).
+- **Storage**: write checkpoints + metrics to `Storage.from_env().run_dir(experiment, run_id)` and rsync to S3 at job end via `eeg-ops cluster down` or the watchdog.
+- **Eval**: every cell runs the Protocol A frozen-probing suite at end-of-training. Don't skip — it's how downstream experiments discover whether yours moved the needle.
+- **Logging milestones**: when a run completes / dies / produces a notable result, the launcher should call `eeg-ops events log` so Notion's Events feed stays current.
+
+## Things to avoid
+
+- Don't add new top-level modules without a clear single purpose.
+- Don't write run metadata to a local `progress.md` or similar — use `eeg-ops events log` or `eeg-ops findings add` instead, which writes to Notion automatically.
+- Don't bypass `accelerate` for multi-GPU launches; the data collate is DDP-safe.
+- Don't `import exp03` — the package was renamed to `eegfm` (May 2026).

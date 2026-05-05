@@ -1,0 +1,47 @@
+---
+description: How and when to consult / write to Notion
+alwaysApply: true
+---
+
+# Notion discipline
+
+Notion is the **single source of latest project state**. The repo is code-only. When you need narrative context (what an experiment is about, what's been decided, what's running, what was learned), reach into Notion via the MCP — do not ask the user, and do not look for it in markdown files in the repo (there are none, by design).
+
+## Workspace structure
+
+Top-level page: **EEG Foundation Models — Operations Hub** (`357939fbcda4813fab4bc5fe0d84ea2c`).
+
+Under it, six databases:
+
+| DB | Use it for |
+|---|---|
+| **Experiments** (`c30098f0-e2ea-4d38-b678-0e16442c77bf`) | One row per experiment (01–20). Hypothesis, methodology, status, tags, started/completed dates, outcome. Page body = full design spec. |
+| **Runs** (`e63827be-4630-4d40-8ddb-725f8583081c`) | One row per training run, linked to a wandb run name + S3 checkpoint URI. |
+| **Findings** (`4218525f-a4e9-437d-9bb4-3e7e9d59fb68`) | Synthesized insights / decisions / negative results. Each cites the experiment and run that produced it. |
+| **Sessions** (`60c96c05-0c4f-4864-b6f9-21ea1556ba04`) | Long-running units: GPU rental window, training run, chat thread. |
+| **Events** (`5a05968e-ca13-4952-b4c7-df3e6062f89b`) | Append-only log of cluster up/down, run start/end, ckpt saves, errors. Mostly auto-written by `eeg-ops`. |
+| **Standups** (`2e2259f2-65b2-461f-8084-bb7db7f5ed5a`) | One row per daily standup. Highlights, blockers, links to relevant Experiments / Runs / Findings. Open the page during standup. |
+
+## Read patterns
+
+- **"What's experiment NN about?"** → `notion-search` with the data-source URL filtered to the Experiments DB and a query like the experiment name, then `notion-fetch` the page.
+- **"What was decided about X?"** → search the Findings DB.
+- **"What's running right now?"** → search the Runs DB or Sessions DB.
+
+## Write patterns
+
+- **A finding emerged from a run** (insight, negative result, decision) → `eeg-ops findings add --experiment NN --title "..." --tags ...`. Falls back to `notion-create-pages` against the Findings DB.
+- **A consequential manual decision** → `eeg-ops events log --type decision --title "..." --notes "..."`.
+- **An experiment's row needs status / outcome update** → `notion-update-page` with the row's page_id; properties include `Status`, `Outcome`, `Completed`.
+- **Daily standup** → create a row in the Standups DB with `Date`, `Highlights`, `Blockers`, and relations into Experiments / Runs / Findings.
+
+## What stays out of Notion
+
+- Source code, configs, launch scripts (those are in this repo).
+- Run metrics / plots / system metrics (those are in WandB, project `eegfm`).
+- Run artifacts (those are in S3).
+
+## Don't
+
+- Don't paste long markdown narrative into the repo "for completeness". It belongs in Notion.
+- Don't fork the schema (add new properties to Experiments DB, etc.) without explicit user approval — `eeg-ops` writes against this schema and breaking it breaks the CLI.
