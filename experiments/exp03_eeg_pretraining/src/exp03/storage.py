@@ -185,6 +185,19 @@ def from_env(env_var: str = "EXP03_DATA_ROOT", default: str = DEFAULT_DATA_ROOT)
 
     Lookup happens at call time, not import time, so tests / scripts can set
     the env var before constructing.
+
+    The S3 bucket + region default to the canonical us-west-2 warehouse but
+    can be overridden via ``EXP03_S3_BUCKET`` / ``EXP03_S3_REGION``. This is
+    how the AWS Mumbai capacity-block week (and any future regional cache)
+    points the GPU box at an in-region mirror — set both env vars in the
+    instance bootstrap and ``sync-derived-down`` automatically pulls from
+    the regional cache rather than crossing regions for every shard.
     """
     raw = os.environ.get(env_var, default)
-    return Storage(data_root=Path(raw).expanduser().resolve())
+    bucket = os.environ.get("EXP03_S3_BUCKET", S3_WAREHOUSE_BUCKET)
+    region = os.environ.get("EXP03_S3_REGION", S3_WAREHOUSE_REGION)
+    return Storage(
+        data_root=Path(raw).expanduser().resolve(),
+        s3_bucket=bucket,
+        s3_region=region,
+    )
