@@ -15,9 +15,9 @@ Built on:
   and config provenance. The ``WANDB_DISABLED=true`` env var disables
   it (useful for smoke tests).
 
-* :mod:`eegfm.eval` ``run_protocol_a`` for the end-of-training frozen-
-  probe metrics (HBN 6-task BAC + WF1 + k-NN top-1 + CBCL R²), which
-  get logged to wandb under ``eval/*``.
+* Downstream eval lives in the `eegfm_eval` package and runs as a separate
+  post-pretraining step (`eegfm-eval --checkpoint ... --profile ...`).
+  This decoupling keeps pretraining lean and lets eval evolve independently.
 
 Recipe references:
 
@@ -136,9 +136,6 @@ class TrainConfig:
     output_dir: Path | None = None                        # required at runtime
     log_every: int = 20
     ckpt_every: int = 0                                   # 0 = checkpoint at end only
-    eval_at_end: bool = True
-    eval_max_subjects: int = 50
-    eval_max_windows_per_shard: int = 20
     num_workers: int = 2                                  # DataLoader workers (set 0 for macOS dev / stdin scripts)
 
     # --- wandb -----------------------------------------------------------
@@ -392,36 +389,12 @@ def train(t: TrainConfig) -> dict[str, Any]:
         final_state["ckpt"] = str(ckpt_path)
         print(f"[train] final checkpoint -> {ckpt_path}")
 
-    # ---- end-of-training eval (Protocol A frozen-probe) ----------------
-    metrics_a: dict[str, Any] = {}
-    if t.eval_at_end and t.data_root is not None and accelerator.is_main_process:
-        from . import eval as eval_mod
-        unwrapped = accelerator.unwrap_model(m).eval()
-        try:
-            extracted = eval_mod.extract_features(
-                unwrapped, Path(t.data_root),
-                max_subjects=t.eval_max_subjects,
-                max_windows_per_shard=t.eval_max_windows_per_shard,
-                seed=t.seed,
-                device=accelerator.device.type,
-            )
-            metrics_a = eval_mod.run_protocol_a(extracted, seed=t.seed)
-            wandb_metrics: dict[str, float] = {}
-            for name, sub in metrics_a.items():
-                if isinstance(sub, dict) and "point" in sub:
-                    wandb_metrics[f"eval/{name}/point"] = float(sub["point"])
-                    if "ci_low_95" in sub:
-                        wandb_metrics[f"eval/{name}/ci_low_95"] = float(sub["ci_low_95"])
-                        wandb_metrics[f"eval/{name}/ci_high_95"] = float(sub["ci_high_95"])
-            log(wandb_metrics, step)
-            print("[train] eval/Protocol A:")
-            for k, v in metrics_a.items():
-                print(f"  {k}: {v}")
-        except Exception as e:                                     # noqa: BLE001
-            print(f"[train] eval-at-end failed: {e}")
-            metrics_a = {"error": str(e)}
-
     # ---- write summary -------------------------------------------------
+    # Eval is a separate post-pretraining step. After this script writes
+    # the checkpoint, run downstream evals via:
+    #   eegfm-eval --checkpoint <output_dir>/ckpt_final.pt --profile <name>
+    # See `eegfm_eval` package for the harness; we deliberately don't couple
+    # train and eval anymore — eval lives, runs, and reports independently.
     if accelerator.is_main_process:
         summary = {
             "config": t.to_dict(),
@@ -429,7 +402,6 @@ def train(t: TrainConfig) -> dict[str, Any]:
             "elapsed_s": elapsed,
             "step_per_s": step / max(elapsed, 1e-3),
             "final_state": final_state,
-            "eval_protocol_a": metrics_a,
         }
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         print(f"[train] summary -> {output_dir/'summary.json'}")
@@ -437,5 +409,4 @@ def train(t: TrainConfig) -> dict[str, Any]:
     if wandb is not None:
         wandb.finish()
 
-    return {"step": step, "elapsed_s": elapsed, "metrics": metrics_a,
-            "output_dir": str(output_dir)}
+    return {"step": step, "elapsed_s": elapsed, "output_dir": str(output_dir)}

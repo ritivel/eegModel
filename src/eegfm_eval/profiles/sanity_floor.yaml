@@ -1,0 +1,10 @@
+# Random-init floor on every task (linear probe only — fast).
+# Use:  eegfm-eval --random-init --profile sanity_floor
+tasks:
+  - tuab
+  - tuev
+  - physionet_mi
+  - hbn_externalizing
+  - faced
+strategies:
+  - lp

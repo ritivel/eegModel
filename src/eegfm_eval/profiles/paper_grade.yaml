@@ -1,0 +1,16 @@
+# Full eval suite — what we run for milestone checkpoints (v2 launch, paper).
+# ~6-8 hours on 1 A100. Covers every task family the EEG-FM literature reports on.
+tasks:
+  - tuab            # clinical anomaly  (LaBraM 0.814, CBraMod 0.829, REVE 0.832 AUROC)
+  - tuev            # event classification  (LaBraM 0.641, CBraMod 0.667, REVE 0.676 κ)
+  - physionet_mi    # motor imagery  (LaBraM 0.491, CBraMod 0.522 κ)
+  - faced           # 9-class emotion  (LaBraM 0.470, CBraMod 0.504 κ)
+  - seed_v          # 5-class emotion  (LaBraM 0.239, CBraMod 0.257 κ)
+  - isruc           # sleep staging  (CBraMod ~0.78 BAC)
+  - mumtaz          # depression binary  (REVE 0.96 AUROC LP)
+  - eegmat          # mental arithmetic binary  (CBraMod 0.889 BAC)
+  - hbn_ccd_rt      # NeurIPS 2025 Challenge 1  (KU Leuven 0.887 nRMSE)
+  - hbn_externalizing  # NeurIPS 2025 Challenge 2  (JLShen 0.978 nRMSE)
+strategies:
+  - lp
+  - ft

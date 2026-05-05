@@ -767,52 +767,33 @@ def check_d_random_init_probe(
     cfg: ModelConfig | None = None,
     *,
     derived_root: Path | None = None,
-    max_subjects: int = 50,
-    max_windows_per_shard: int = 20,
-    seed: int = 0,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    derived_root_tuab: Path | None = None,
-    derived_root_tuev: Path | None = None,
-    tuh_max_subjects: int = 100,
+    **_unused,
 ) -> CheckResult:
-    """Frozen-feature linear probe + k-NN on the random-init encoder.
+    """Random-init floor — moved to the standalone eval harness.
 
-    Records the floor numbers (HBN Protocol A — externalizing R²/MAE;
-    attention R²/MAE; attention-binary AUROC; 6-task BAC/WF1; k-NN top-1)
-    with 95 % bootstrap CIs. Every subsequent pretrained encoder must
-    clearly beat these.
+    The bespoke "Protocol A" probe (HBN CBCL R² + 6-task BAC + k-NN top-1)
+    was retired on 2026-05-05 because it was not literature-comparable and
+    the metrics it tracked were either trivially solvable (k-NN top-1 on
+    in-distribution subjects) or essentially unsolvable at any encoder
+    scale (HBN CBCL regression — see NeurIPS 2025 EEG Challenge: 1180/1183
+    teams scored ≥ 0.99 nRMSE).
 
-    Optional Protocol A.4 secondary eval: pass ``derived_root_tuab``
-    and/or ``derived_root_tuev`` to also produce TUAB binary AUROC and/or
-    TUEV 6-class BAC + WF1 + k-NN top-1 floor numbers from the same
-    random-init encoder. Both default to None (skip A.4).
+    The replacement is `eegfm-eval`, a separate package that runs every
+    standard EEG-FM benchmark (TUAB/TUEV/PhysioNet-MI/FACED/HBN-CCD/...)
+    against any checkpoint — including a random-init "checkpoint" for the
+    floor row this check used to fill.
+
+        # Random-init floor on TUAB:
+        eegfm-eval --random-init --task tuab --strategy lp
+
+        # Or, the full sanity profile in one call:
+        eegfm-eval --random-init --profile sanity_floor
     """
-    print(f"\n{'='*70}\nCheck D — Random-init linear-probe floor\n{'='*70}")
-    cfg = cfg or ModelConfig()
-    if derived_root is None or not Path(derived_root).exists():
-        return CheckResult(
-            name="D_random_init_probe",
-            status="SKIPPED",
-            details={"reason": f"derived_root={derived_root} not provided / missing"},
-            notes="run with --derived-root pointing at synced parquet shards",
-        )
-    try:
-        from . import eval as eval_mod
-    except ImportError:
-        return CheckResult(
-            name="D_random_init_probe",
-            status="SKIPPED",
-            details={"reason": "eegfm.eval not importable"},
-            notes="ensure scikit-learn is installed (uv pip install -e '.[gpu]')",
-        )
-    return eval_mod.run_random_init_probe(
-        cfg, derived_root=derived_root,
-        max_subjects=max_subjects,
-        max_windows_per_shard=max_windows_per_shard,
-        seed=seed, device=device,
-        derived_root_tuab=derived_root_tuab,
-        derived_root_tuev=derived_root_tuev,
-        tuh_max_subjects=tuh_max_subjects,
+    return CheckResult(
+        name="D_random_init_probe",
+        status="SKIPPED",
+        details={"reason": "moved to `eegfm-eval` package; see docstring."},
+        notes="run `eegfm-eval --random-init --profile sanity_floor` instead",
     )
 
 

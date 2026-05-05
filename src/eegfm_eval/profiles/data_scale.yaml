@@ -1,0 +1,9 @@
+# Cheap eval profile for the data-scale sweep.
+# Two literature anchors (TUAB, HBN externalizing) under linear probe only,
+# ~10 minutes total on 1 A100. Pick this for any cell where you mostly want
+# "did the encoder learn anything?" not "is it paper-publishable?".
+tasks:
+  - tuab
+  - hbn_externalizing
+strategies:
+  - lp

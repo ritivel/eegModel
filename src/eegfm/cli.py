@@ -702,8 +702,6 @@ def train_cmd(
     log_every: int = typer.Option(20, "--log-every"),
     ckpt_every: int = typer.Option(0, "--ckpt-every",
                                    help="0 = checkpoint at end only. Otherwise every N steps."),
-    eval_at_end: bool = typer.Option(True, "--eval-at-end/--no-eval-at-end"),
-    eval_max_subjects: int = typer.Option(50, "--eval-max-subjects"),
     num_workers: int = typer.Option(2, "--num-workers",
                                     help="DataLoader workers. Set 0 for single-process dev "
                                          "(macOS, stdin scripts) or to debug worker errors."),
@@ -772,8 +770,6 @@ def train_cmd(
         output_dir=output_dir,
         log_every=log_every,
         ckpt_every=ckpt_every,
-        eval_at_end=eval_at_end,
-        eval_max_subjects=eval_max_subjects,
         num_workers=num_workers,
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,

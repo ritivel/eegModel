@@ -1,0 +1,8 @@
+# NeurIPS 2025 EEG Foundation Challenge protocol only — for direct comparison
+# to the 1183-team leaderboard. Both challenges, fine-tune only (LP under-
+# estimates regression performance).
+tasks:
+  - hbn_ccd_rt
+  - hbn_externalizing
+strategies:
+  - ft
