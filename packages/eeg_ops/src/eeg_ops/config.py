@@ -132,6 +132,14 @@ class State:
     cluster_name: str | None = None
     """The current SkyPilot cluster name (if any)."""
 
+    notion_chat_session_id: str | None = None
+    """Page ID of the currently-open Notion chat Session row, if the AI
+    assistant has opened one. Set by ``eeg-ops session open --type chat``."""
+
+    notion_rental_session_id: str | None = None
+    """Page ID of the currently-open Notion gpu_rental Session row, if any.
+    Auto-set by ``eeg-ops capacity buy`` and cleared by ``cluster down``."""
+
     capacities: dict[str, CapacityState] = field(default_factory=dict)
     """All known reservations by ID. Lifecycle is append-only; we never delete
     rows, just mark expired ones via state='expired'."""
@@ -182,6 +190,10 @@ def _render_toml(s: State) -> str:
         lines.append(f'active_reservation_id = "{s.active_reservation_id}"')
     if s.cluster_name:
         lines.append(f'cluster_name = "{s.cluster_name}"')
+    if s.notion_chat_session_id:
+        lines.append(f'notion_chat_session_id = "{s.notion_chat_session_id}"')
+    if s.notion_rental_session_id:
+        lines.append(f'notion_rental_session_id = "{s.notion_rental_session_id}"')
     lines.append("")
     for cid, c in sorted(s.capacities.items()):
         lines.append(f"[capacities.{cid}]")

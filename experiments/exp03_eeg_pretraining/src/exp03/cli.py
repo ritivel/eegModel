@@ -732,6 +732,21 @@ def train_cmd(
     s3_ckpt_resume: bool = typer.Option(True, "--s3-ckpt-resume/--no-s3-ckpt-resume",
                                         help="On train start, resume accelerate state from "
                                              "s3://<bucket>/<prefix>/accelerate/ if it exists."),
+    use_dcp: bool = typer.Option(False, "--use-dcp/--no-use-dcp",
+                                  help="Use PyTorch Distributed Checkpoint (DCP) for sharded "
+                                       "multi-rank ckpt writes via s3torchconnector. Recommended "
+                                       "for 8-way FSDP/DDP runs; equivalent to single-file save "
+                                       "for single-rank training."),
+    notion_experiment_id: str = typer.Option(None, "--notion-experiment-id",
+                                              help="Notion page ID of the parent Experiment row "
+                                                   "(seen via `eeg-ops config` or by opening the "
+                                                   "Operations Hub). Used to relate the Run row "
+                                                   "to its Experiment."),
+    notion_session_id: str = typer.Option(None, "--notion-session-id",
+                                           help="Notion page ID of the gpu_rental Session this "
+                                                "run belongs to. Defaults to the active rental "
+                                                "session if you've previously run "
+                                                "`eeg-ops capacity buy`."),
 ):
     """Run one SSL pretraining cell.
 
@@ -797,11 +812,29 @@ def train_cmd(
         s3_ckpt_prefix=s3_ckpt_prefix,
         s3_ckpt_region=s3_ckpt_region,
         s3_ckpt_resume=s3_ckpt_resume,
+        use_dcp=use_dcp,
+        notion_experiment_id=notion_experiment_id,
+        notion_session_id=notion_session_id or _resolve_active_rental_session(),
     )
     console.print(f"[cyan]train cell[/cyan] paradigm={paradigm} seed={seed} "
                   f"steps={max_steps} batch={batch_size} -> {output_dir}")
-    result = train_mod.train(cfg)
+    # Use the lifecycle-aware wrapper so Notion gets a run_crashed event on
+    # exception. ``train_mod.train`` is still the pure entry point for tests.
+    result = train_mod.train_with_lifecycle(cfg)
     console.print(f"[green]done[/green]: {result}")
+
+
+def _resolve_active_rental_session() -> str | None:
+    """Look up the active gpu_rental Session ID from ~/.config/eeg-ops/state.toml.
+
+    Returns None if eeg_ops isn't installed or the state file is missing —
+    every code path that uses this is best-effort.
+    """
+    try:
+        from eeg_ops.config import State
+        return State.load().notion_rental_session_id
+    except Exception:                                                       # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------

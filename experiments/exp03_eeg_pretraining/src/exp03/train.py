@@ -57,6 +57,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -159,6 +160,22 @@ class TrainConfig:
     s3_ckpt_region: str = "us-west-2"                     # warehouse region
     s3_ckpt_resume: bool = True                           # resume-from-S3 on start if prefix exists
 
+    # When True, single-rank torch.save is replaced by PyTorch Distributed
+    # Checkpoint (DCP) via ``eeg_ops.checkpoint.S3DCPCheckpointSink``. DCP is
+    # the right choice for multi-rank FSDP/DDP runs (one shard per rank,
+    # parallel writes); on single-rank training the single-file path is
+    # equivalent and slightly cheaper, so this defaults to False.
+    use_dcp: bool = False
+
+    # --- notion ops-hub lifecycle (recorded per-run) ---------------------
+    # If ``notion_experiment_id`` is set, train() inserts a Run row at start
+    # and updates it at end. Each ckpt write also logs a ckpt_saved Event.
+    # Set NOTION_API_KEY in env to actually transmit; without it the calls
+    # are no-ops and never block training.
+    notion_experiment_id: str | None = None               # Notion page ID of the parent Experiment
+    notion_session_id: str | None = None                  # gpu_rental Session to relate runs to
+    notion_run_id: str | None = None                      # populated by train() at run start
+
     def to_dict(self) -> dict:
         d = asdict(self)
         for k, v in list(d.items()):
@@ -198,14 +215,20 @@ def _build_model_config(t: TrainConfig) -> model_mod.ModelConfig:
 
 
 def _mirror_ckpt_to_s3(accelerator, ckpt_path: Path, bucket: str, prefix: str,
-                       region: str, output_dir: Path, *, final: bool = False) -> None:
+                       region: str, output_dir: Path, *,
+                       final: bool = False, use_dcp: bool = False) -> None:
     """Push a torch-save checkpoint + accelerate state to S3.
 
     Two artifacts per call:
-        1. ``ckpt_path`` (single .pt file) → ``s3://bucket/prefix/<filename>``
-           via :class:`eeg_ops.checkpoint.S3CheckpointSink` — uses the AWS
-           Common Runtime under the hood for ~40 % faster writes than
-           saving locally then ``aws s3 cp``.
+        1. The model state — either as a single .pt at ``s3://bucket/prefix/<filename>``
+           (default; via :class:`eeg_ops.checkpoint.S3CheckpointSink`) or, with
+           ``use_dcp=True``, as a DCP shard set under ``s3://bucket/prefix/step_{N}/``
+           (via :class:`eeg_ops.checkpoint.S3DCPCheckpointSink`). Both sinks use
+           the AWS S3 Connector for PyTorch under the hood, which routes through
+           the AWS Common Runtime for ~40 % faster writes than EBS+sync. The
+           DCP path is the right choice for multi-rank FSDP/DDP runs because
+           each rank writes its own shard in parallel; on single-rank training
+           the two paths are equivalent.
         2. ``accelerator.save_state(<accel_dir>)`` → ``s3://bucket/prefix/accelerate/``
            — the resumable optimizer + RNG state, synced via
            :func:`eeg_ops.checkpoint.accelerate_save_state_to_s3`.
@@ -216,22 +239,37 @@ def _mirror_ckpt_to_s3(accelerator, ckpt_path: Path, bucket: str, prefix: str,
     try:
         from eeg_ops.checkpoint import (
             S3CheckpointSink,
+            S3DCPCheckpointSink,
             accelerate_save_state_to_s3,
         )
     except ImportError as e:
         print(f"[train] s3 ckpt mirror skipped ({e}); install eeg-ops[checkpoint]")
         return
 
+    step_num = -1 if final else int(ckpt_path.stem.split("step")[-1])
+
     try:
-        # Single-file mirror via s3torchconnector (rank-0 path; the connector
-        # itself handles the byte stream via the AWS CRT).
-        if accelerator.is_main_process:
+        if use_dcp:
+            # Distributed Checkpoint: every rank participates; the writer
+            # dispatches per-rank .distcp shards into step_{N}/ in parallel.
+            sink_dcp = S3DCPCheckpointSink(bucket=bucket, prefix=prefix, region=region)
+            unwrapped = accelerator.unwrap_model(
+                accelerator.unwrap_model.__self__
+            ) if hasattr(accelerator.unwrap_model, "__self__") else None
+            # accelerator.get_state_dict gathers a sharded state on each rank;
+            # DCP.save consumes that directly.
+            state_dict = accelerator.get_state_dict(
+                unwrapped if unwrapped is not None else accelerator._models[0]
+            )
+            sink_dcp.save(state_dict, step=step_num)
+        elif accelerator.is_main_process:
+            # Single-file mirror via s3torchconnector (rank-0 path).
             sink = S3CheckpointSink(bucket=bucket, prefix=prefix, region=region)
-            sink.save(torch.load(ckpt_path, map_location="cpu", weights_only=False),
-                      step=-1 if final else int(ckpt_path.stem.split("step")[-1]),
-                      name=ckpt_path.name)
-        # Resumable accelerate state — directory; one save_state call across
-        # all ranks then rank-0 syncs.
+            sink.save(
+                torch.load(ckpt_path, map_location="cpu", weights_only=False),
+                step=step_num, name=ckpt_path.name,
+            )
+        # Resumable accelerate state — one save_state across ranks; rank-0 syncs.
         accel_dir = output_dir / "accelerate"
         accelerate_save_state_to_s3(
             accelerator,
@@ -317,6 +355,28 @@ def train(t: TrainConfig) -> dict[str, Any]:
     s3_ckpt_prefix = t.s3_ckpt_prefix
     if t.s3_ckpt_bucket is not None and s3_ckpt_prefix is None:
         s3_ckpt_prefix = f"runs/exp03/{t.wandb_run_name or output_dir.name}"
+
+    # ---- notion ops-hub: open a Run row (best-effort) -------------------
+    # Only on rank 0; calls are no-ops when NOTION_API_KEY isn't set.
+    if accelerator.is_main_process:
+        try:
+            from eeg_ops import notion as _notion
+            run_name = t.wandb_run_name or output_dir.name
+            s3_uri = (f"s3://{t.s3_ckpt_bucket}/{s3_ckpt_prefix}"
+                      if t.s3_ckpt_bucket else None)
+            t.notion_run_id = _notion.create_run(
+                run_name=run_name,
+                paradigm=t.paradigm,
+                region=os.environ.get("AWS_REGION", "ap-south-1"),
+                experiment_id=t.notion_experiment_id,
+                s3_ckpt_uri=s3_uri,
+                wandb_url=None,                          # filled in once wandb starts
+                notes=f"steps={t.max_steps} batch={t.batch_size} "
+                      f"backbone={t.backbone_kind}@{t.backbone_d_model} "
+                      f"dcp={t.use_dcp}",
+            )
+        except Exception as _e:                          # noqa: BLE001
+            print(f"[train] notion run-row insert failed: {_e}")
 
     # ---- wandb (rank 0 only) -------------------------------------------
     wandb = None
@@ -469,7 +529,21 @@ def train(t: TrainConfig) -> dict[str, Any]:
             # Mirror the ckpt + accelerate state to S3 if configured.
             if t.s3_ckpt_bucket is not None:
                 _mirror_ckpt_to_s3(accelerator, ckpt_path, t.s3_ckpt_bucket,
-                                   s3_ckpt_prefix, t.s3_ckpt_region, output_dir)
+                                   s3_ckpt_prefix, t.s3_ckpt_region, output_dir,
+                                   use_dcp=t.use_dcp)
+            # Best-effort Notion event for this checkpoint.
+            try:
+                from eeg_ops import notion as _notion
+                _notion.log_event(
+                    title=f"ckpt step {step} \u2192 s3://{t.s3_ckpt_bucket}/{s3_ckpt_prefix}",
+                    type="ckpt_saved", severity="info", source="exp03/train",
+                    resource=str(ckpt_path), run_id=t.notion_run_id,
+                    session_id=t.notion_session_id,
+                    notes=f"loss={float(loss.item()):.4f} step_per_s="
+                          f"{(step + 1) / max(time.time() - start, 1e-3):.2f}",
+                )
+            except Exception:                            # noqa: BLE001
+                pass
 
         step += 1
 
@@ -490,10 +564,37 @@ def train(t: TrainConfig) -> dict[str, Any]:
         if t.s3_ckpt_bucket is not None:
             _mirror_ckpt_to_s3(accelerator, ckpt_path, t.s3_ckpt_bucket,
                                s3_ckpt_prefix, t.s3_ckpt_region, output_dir,
-                               final=True)
+                               final=True, use_dcp=t.use_dcp)
             final_state["s3_uri"] = (
                 f"s3://{t.s3_ckpt_bucket}/{s3_ckpt_prefix}/{ckpt_path.name}"
             )
+
+        # Best-effort Notion run-end + run_ended event.
+        try:
+            from datetime import datetime, timezone
+            from eeg_ops import notion as _notion
+            final_loss_value = (
+                float(losses_window[-1]) if losses_window else None
+            )
+            _notion.update_run(
+                run_id=t.notion_run_id,
+                status="complete",
+                steps_completed=step,
+                final_loss=final_loss_value,
+                s3_ckpt_uri=final_state.get("s3_uri"),
+                ended=datetime.now(timezone.utc),
+                notes=f"elapsed={elapsed:.1f}s",
+            ) if t.notion_run_id else None
+            _notion.log_event(
+                title=f"Run ended: {t.wandb_run_name or output_dir.name}",
+                type="run_ended", severity="success", source="exp03/train",
+                resource=str(ckpt_path), run_id=t.notion_run_id,
+                session_id=t.notion_session_id,
+                notes=f"step={step} elapsed={elapsed:.1f}s "
+                      f"final_loss={final_loss_value!s}",
+            )
+        except Exception as _e:                                              # noqa: BLE001
+            print(f"[train] notion run-end failed: {_e}")
 
     # ---- end-of-training eval (Protocol A frozen-probe) ----------------
     metrics_a: dict[str, Any] = {}
@@ -542,3 +643,31 @@ def train(t: TrainConfig) -> dict[str, Any]:
 
     return {"step": step, "elapsed_s": elapsed, "metrics": metrics_a,
             "output_dir": str(output_dir)}
+
+
+def train_with_lifecycle(t: TrainConfig) -> dict[str, Any]:
+    """Wrapper around :func:`train` that catches exceptions and reports the
+    crash to the Notion ops hub before re-raising.
+
+    The plain ``train()`` function is left unchanged for callers that don't
+    want the wrapping (tests, smoke checks). The CLI uses this wrapper.
+    """
+    try:
+        return train(t)
+    except BaseException as e:                                              # noqa: BLE001
+        try:
+            from eeg_ops import notion as _notion
+            tb = traceback.format_exc(limit=10)[:1500]
+            if t.notion_run_id:
+                _notion.update_run(run_id=t.notion_run_id, status="crashed",
+                                   notes=f"{type(e).__name__}: {e}")
+            _notion.log_event(
+                title=f"Run crashed: {t.wandb_run_name or 'unnamed'}",
+                type="run_crashed", severity="error", source="exp03/train",
+                run_id=t.notion_run_id, session_id=t.notion_session_id,
+                resource=str(t.output_dir),
+                notes=f"{type(e).__name__}: {e}\n\n{tb}",
+            )
+        except Exception:                                                   # noqa: BLE001
+            pass
+        raise

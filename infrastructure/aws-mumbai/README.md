@@ -3,125 +3,92 @@
 Runbook for the **8× H100 80GB** AWS Capacity Block reserved in `ap-south-1` from
 **2026-05-05 17:00 IST → 2026-05-12 17:00 IST**.
 
-> **The shell scripts in this directory are deprecated.** They worked, but
-> we rebuilt the lifecycle as a proper Python package: see
-> [`packages/eeg_ops`](../../packages/eeg_ops/). The scripts remain for
-> reference and as a fallback if SkyPilot ever has an outage.
+The full lifecycle is driven by the [`eeg-ops`](../../packages/eeg_ops/) Python
+CLI; this directory keeps the SkyPilot task YAML and this runbook. There are no
+shell scripts anymore — everything lives in `packages/eeg_ops` with proper
+typer commands, type hints, and tests.
 
-## What we use now
+## Architecture
 
-| Concern | Tool | Why |
+| Concern | Tool | Notes |
 |---|---|---|
-| Buy / monitor capacity blocks | `eeg-ops capacity find/buy/status` | Boto3-direct, with state.toml memo and PURCHASE-typed gate. |
-| Launch / SSH / re-attach the cluster | **SkyPilot** ([`eeg.sky.yaml`](./eeg.sky.yaml), invoked via `eeg-ops cluster up`) | Native AWS Capacity Block support since v0.7. `--retry-until-up` waits for the reservation to flip from `payment-pending` → `active` automatically; no need to babysit. Falls back across regions if the reservation expires. |
-| Pre-warm in-region S3 mirror | `eeg-ops data prewarm --region ap-south-1` | Idempotent server-side `aws s3 sync` from `eegmodel-warehouse` (us-west-2) to `eeg-mumbai-139156132535` (ap-south-1) so the GPU box pulls in-region. |
-| Box → S3 credentials | IAM instance profile, created via `eeg-ops iam create --region ap-south-1` | Box has S3 RW + CloudWatch via instance role; no `~/.aws/credentials` copy. |
-| Cost backstop | CloudWatch billing alarm via `eeg-ops alarm create --daily-budget-usd 800` | Alerts if estimated charges blow past the budget. |
-| Checkpoint durability across NVMe wipe | [`s3torchconnector`](https://github.com/awslabs/s3-connector-for-pytorch) via `eeg_ops.checkpoint` + `--s3-ckpt-bucket` flag on `exp03 train` | Each ckpt written direct-to-S3 with the AWS CRT (~40 % faster than EBS+sync); on resume, training transparently restores Accelerate state from S3. EndDate force-stop is now recoverable. |
-| Run-history sync at end of week | `eeg-ops cluster down --sync-runs` (calls `eeg-ops checkpoint sync-runs` on the box) | NVMe → warehouse before terminate. |
+| Capacity block lifecycle | `eeg-ops capacity find/buy/status` | Boto3-direct, with `state.toml` memo. Hard-fails if the upfront fee drifts. |
+| Cluster launch / SSH / terminate | `eeg-ops cluster up/status/exec/down` | Defaults to `--via boto3` (deterministic, ~3 min). `--via skypilot` available for non-restricted networks. |
+| Bootstrap on the GPU box | cloud-init user-data emitted by `eeg_ops.launcher` | Mirrors the SkyPilot YAML's `setup` block: uv venv → editable installs → `s3torchconnector[dcp]` → rclone of derived shards from the in-region mirror. |
+| In-region S3 mirror | `eeg-ops data prewarm` | Idempotent server-side `aws s3 sync` from `eegmodel-warehouse` (us-west-2) to `eeg-mumbai-139156132535` (ap-south-1). |
+| Box ↔ S3 auth | IAM instance profile via `eeg-ops iam create` | Box assumes role; no `~/.aws/credentials` copy. |
+| Spend backstop | CloudWatch alarm via `eeg-ops alarm create --daily-budget-usd 800` | AWS billing metrics in us-east-1. |
+| Checkpoint durability | `s3torchconnector` (single-file *or* DCP) via `eeg_ops.checkpoint` | `--use-dcp` for multi-rank FSDP/DDP runs. Resume from S3 is automatic when `--s3-ckpt-resume`. |
+| Operations Hub log | Notion via `eeg_ops.notion` | Every CLI action and every training event lands in the Events database under the [Operations Hub](https://www.notion.so/357939fbcda4813fab4bc5fe0d84ea2c). |
 
 ## Lifecycle, end-to-end
 
 ```bash
 # Local Mac, once per rental
-eeg-ops capacity find  --region ap-south-1 --gpus H100:8 --duration-hours 168
+eeg-ops capacity find  --region ap-south-1 --duration-hours 168
 eeg-ops capacity buy   cb-xxx --region ap-south-1 --expected-fee 5285.95
 eeg-ops iam create     --region ap-south-1
 eeg-ops alarm create   --region ap-south-1 --daily-budget-usd 800
-eeg-ops data prewarm   --region ap-south-1                # ~30 min for 800 GB
+eeg-ops data prewarm   --region ap-south-1                     # ~30 min for 800 GB
 
-# Local Mac, at reservation start time (or any time during the window)
-eeg-ops cluster up    --yaml infrastructure/aws-mumbai/eeg.sky.yaml \
-                      --name eeg-mumbai-2026w19
+# Local Mac, at reservation start time
+export WANDB_API_KEY=...
+export HF_TOKEN=...
+export NOTION_API_KEY=...      # optional but recommended
+eeg-ops cluster up
 
-# After cluster is up, run training jobs
+# Run training; uses the existing exp03 CLI
 eeg-ops cluster exec 'exp03 train --paradigm mar --steps 17500 \
-                       --wandb-run-name exp17-g2-seed0 \
-                       --s3-ckpt-bucket eegmodel-warehouse \
-                       --s3-ckpt-prefix runs/exp03/exp17-g2-seed0'
+    --wandb-run-name exp17-g2-seed0 \
+    --s3-ckpt-bucket eegmodel-warehouse \
+    --s3-ckpt-prefix runs/exp03/exp17-g2-seed0 \
+    --use-dcp \
+    --notion-experiment-id 357939fb-cda4-81e8-9639-f3635c218199'
 
-# Set a calendar reminder for T+167h
-eeg-ops cluster down  --name eeg-mumbai-2026w19 --sync-runs
+# End of week
+eeg-ops cluster down --sync-runs
 ```
 
-## What the SkyPilot task YAML does
+## What `eeg.sky.yaml` is for
 
-[`eeg.sky.yaml`](./eeg.sky.yaml) describes the full cluster:
+[`eeg.sky.yaml`](./eeg.sky.yaml) is the SkyPilot task spec used when `eeg-ops
+cluster up --via skypilot` runs. The default `--via boto3` path doesn't need
+it; the YAML stays for two reasons:
 
-- **`resources`** — `p5.48xlarge` in `ap-south-1`, the right DLAMI, the IAM
-  instance profile.
-- **`workdir: ../..`** — your local repo gets rsync'd to
-  `/home/ubuntu/sky_workdir` on the box. Edit on Mac, `sky exec` to apply.
-- **`file_mounts`** — `/mnt/s3-mumbai` is the regional cache bucket exposed
-  via Mountpoint for S3 (POSIX read-through cache; alternative to copying
-  parquet to NVMe).
-- **`envs`** — `WANDB_API_KEY` and `HF_TOKEN` are forwarded from your local
-  shell at launch time.
-- **`setup`** — runs once per cluster lifetime. Installs uv, the venv,
-  editable installs of all four packages (`eeg_common`, `eeg_ops`,
-  `exp01-03`), `mamba-ssm`, `s3torchconnector[dcp]`, `wandb`, `accelerate`.
-  Then `rclone copy`s the in-region S3 mirror to NVMe at full bandwidth.
-- **`run`** — keeps the cluster up so you can `sky exec` into it for
-  interactive runs, or push managed jobs.
+1. **Multi-cloud failover later.** The same YAML can target `lambda`, `gcp`,
+   or `aws/<other-region>` by changing `infra:`. SkyPilot's `--retry-until-up`
+   waits for the reservation to flip from `payment-pending` to `active`.
+2. **Self-documenting bootstrap.** The `setup:` block is the canonical
+   description of what a GPU box needs to land in our work environment;
+   `eeg_ops.launcher` mirrors it as cloud-init user-data.
 
-## Storage diagram (final, as deployed)
+## Storage diagram (as deployed)
 
 ```
 local Mac
-  ~/.config/eeg-ops/state.toml              ← reservation IDs, cluster name
-  ~/.ssh/eeg-mumbai-2026w19.pem             ← (legacy fallback if you bypass sky)
-  ~/.sky/config.yaml                        ← aws.specific_reservations: [cr-…]
-  /Users/.../eegModel                       ← the repo
+  ~/.config/eeg-ops/state.toml              ← reservation IDs, cluster name, Notion sessions
+  ~/.ssh/eeg-mumbai-2026w19.pem
+  ~/.sky/config.yaml                        ← aws.specific_reservations + remote_identity
 
-       ↓ sky launch (workdir rsync) + IAM instance profile
+       ↓ ec2:RunInstances + IAM instance profile
 
 GPU box (p5.48xlarge in ap-south-1a)
-  /home/ubuntu/sky_workdir/                 ← editable repo
-  /home/ubuntu/sky_workdir/.venv/           ← editable installs
+  /home/ubuntu/eegModel/                    ← repo + venv (editable installs)
   /opt/dlami/nvme/eeg/                      ← 30 TB local NVMe
     derived/<pipeline>/                     ← rcloned from Mumbai mirror
     runs/<exp>/<id>/                        ← live training outputs
-  /mnt/s3-mumbai/                           ← Mountpoint of S3 (alt POSIX path)
+                                              (mirrored to S3 every ckpt_every steps)
 
-       ↓ s3torchconnector during training (every ckpt_every steps)
-       ↓ rclone at end of week (cluster down --sync-runs)
+       ↓ s3torchconnector during training (single-file or DCP per --use-dcp)
+       ↓ rclone copy at end of week (eeg-ops cluster down --sync-runs)
 
 S3 (us-west-2 — durable warehouse)
   s3://eegmodel-warehouse/
     derived/<pipeline>/                     ← canonical preprocessed shards
-    runs/exp03/<run_id>/                    ← all checkpoints for this run
-      ckpt_step{N}.pt                       ← single-file mirror via S3CheckpointSink
-      accelerate/                           ← resume-state synced via accelerate hook
+    runs/exp03/<run_id>/                    ← every checkpoint + accelerate state
     models/hf_cache/
 
 S3 (ap-south-1 — this-week regional cache)
   s3://eeg-mumbai-139156132535/
     derived/<pipeline>/                     ← refreshed by `eeg-ops data prewarm`
-                                              (one shot per rental)
 ```
-
-## Reproducing the week's outcomes after the cluster terminates
-
-Everything that matters is in `s3://eegmodel-warehouse/runs/exp03/`. If a
-future cluster has the same `s3-ckpt-bucket`/`s3-ckpt-prefix`,
-`exp03 train` will resume mid-step from S3. To re-launch on a different
-provider, change `infra:` in `eeg.sky.yaml` (e.g. `lambda` or `gcp`),
-re-run `eeg-ops cluster up`, and SkyPilot brings you up there with the
-same code and same data.
-
-## Files in this directory
-
-| File | Purpose | Status |
-|---|---|---|
-| `README.md` | this file | live |
-| `eeg.sky.yaml` | SkyPilot task spec | live (canonical entrypoint) |
-| `.env`, `.env.example` | per-region IDs (legacy; superseded by `state.toml`) | reference |
-| `purchase-capacity-block.sh` | shell version of `eeg-ops capacity buy` | deprecated |
-| `prewarm-data.sh` | shell version of `eeg-ops data prewarm` | deprecated |
-| `launch-instance.sh` | shell version of `eeg-ops cluster up` | deprecated |
-| `bootstrap.sh` | shell version of the SkyPilot YAML's `setup` block | deprecated |
-| `monitor.sh` | shell version of `eeg-ops capacity status` | deprecated |
-| `teardown.sh` | shell version of `eeg-ops cluster down --sync-runs` | deprecated |
-
-The shell scripts will be deleted once the SkyPilot path has been exercised
-end-to-end on a real run.

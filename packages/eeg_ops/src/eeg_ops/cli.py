@@ -3,11 +3,15 @@
 Subcommand groups:
 
 * ``capacity`` — find / buy / status of AWS Capacity Blocks
-* ``cluster``  — up / status / exec / down (delegates to SkyPilot)
+* ``cluster``  — up / status / exec / down (delegates to SkyPilot or boto3)
 * ``data``     — pre-warm a regional S3 mirror of preprocessed shards
 * ``iam``      — create the instance profile the box uses for S3 RW + CW
 * ``alarm``    — create the CloudWatch billing alarm for runaway spend
 * ``checkpoint`` — list / sync the runs/ tree to/from S3
+* ``notion``   — Operations Hub status / ping
+* ``events``   — append manual entries to the Events log
+* ``session``  — open / close Sessions (chat, gpu_rental, training_run, …)
+* ``finding``  — add Findings (synthesized insights)
 * ``config``   — print the resolved state, paths, and IDs
 """
 
@@ -22,6 +26,7 @@ from rich.table import Table
 
 from . import aws as aws_mod
 from . import launcher as launcher_mod
+from . import notion as notion_mod
 from . import prewarm
 from . import sky as sky_mod
 from .config import (
@@ -140,6 +145,29 @@ def capacity_buy(
 
     # Wire SkyPilot to use this reservation automatically.
     sky_mod.register_capacity_reservation(cap.reservation_id)
+
+    # Open a gpu_rental Session in Notion + log the capacity_buy event,
+    # so the lifecycle of *this reservation* is one row to follow.
+    rental_sid = notion_mod.open_session(
+        name=f"AWS {region} capacity-block ({cap.reservation_id})",
+        type="gpu_rental",
+        resource=f"{cap.reservation_id} / {cap.instance_type} / {cap.az}",
+        cost_usd=cap.upfront_fee_usd,
+        outcome=f"Purchased {cap.reservation_id} — starts {cap.start_date}.",
+    )
+    if rental_sid:
+        state.notion_rental_session_id = rental_sid
+        state.save()
+    notion_mod.log_event(
+        title=f"Capacity block reserved — {cap.reservation_id}",
+        type="capacity_buy",
+        severity="success",
+        source="eeg-ops",
+        resource=f"{cap.reservation_id} / {cap.instance_type} / {cap.az}",
+        notes=f"${cap.upfront_fee_usd:,.2f} upfront, {cap.duration_hours}h, "
+              f"{cap.start_date} → {cap.end_date}",
+        session_id=rental_sid,
+    )
 
     console.print(f"[green]✓[/green] purchased [cyan]{cap.reservation_id}[/cyan]")
     console.print(f"  state:    {cap.state}")
@@ -265,6 +293,16 @@ def cluster_up(
         launcher_mod.remember_launch(
             state, cluster_name=cluster_name,
             instance_id=result.instance_id, public_ip=result.public_ip,
+        )
+        notion_mod.log_event(
+            title=f"Cluster up — {result.instance_id} @ {result.public_ip}",
+            type="cluster_up",
+            severity="success",
+            source="eeg-ops",
+            resource=f"{result.instance_id} / {result.public_ip} / {result.az}",
+            notes=f"Reservation {active.reservation_id}; "
+                  f"AMI {rc.dlami_pytorch_ami}; cluster_tag={cluster_name}",
+            session_id=state.notion_rental_session_id,
         )
         console.print(f"[green]✓[/green] instance: [cyan]{result.instance_id}[/cyan]")
         console.print(f"[green]✓[/green] public IP: [cyan]{result.public_ip}[/cyan]")
@@ -404,6 +442,24 @@ def cluster_down(
         rc = 0
 
     if rc == 0:
+        # Log the teardown before clearing state, so the rental Session ID
+        # is still available for the relation.
+        notion_mod.log_event(
+            title=f"Cluster down — {cluster_tag}",
+            type="cluster_down", severity="success", source="eeg-ops",
+            resource=cluster_tag,
+            notes=("Terminated and runs/ synced to warehouse" if sync_runs
+                   else "Terminated; runs/ NOT synced (--no-sync)"),
+            session_id=state.notion_rental_session_id,
+        )
+        if state.notion_rental_session_id:
+            notion_mod.close_session(
+                session_id=state.notion_rental_session_id,
+                outcome=f"Terminated {cluster_tag}; reservation "
+                        f"{active.reservation_id} consumed.",
+                status="closed",
+            )
+            state.notion_rental_session_id = None
         if active is not None:
             sky_mod.unregister_capacity_reservation(active.reservation_id)
         state.cluster_name = None
@@ -435,8 +491,25 @@ def data_prewarm(
     console.print(f"[cyan]pre-warming[/cyan] {WAREHOUSE_BUCKET} ({WAREHOUSE_REGION}) "
                   f"→ {bucket} ({region})")
     pls = [p.strip() for p in pipelines.split(",") if p.strip()]
+    state = State.load()
+    notion_mod.log_event(
+        title=f"S3 prewarm started — {len(pls)} pipeline(s) → {bucket}",
+        type="prewarm_start", severity="info", source="eeg-ops",
+        resource=f"s3://{bucket}/derived/",
+        notes=f"Pipelines: {', '.join(pls)}",
+        session_id=state.notion_rental_session_id,
+    )
     rc_code = prewarm.sync_pipelines(region_cfg=rc, pipelines=pls, dry_run=dry_run)
     n_obj, total = prewarm.measure_cache_size(region_cfg=rc)
+    notion_mod.log_event(
+        title=f"S3 prewarm done — {n_obj:,} objects, {total/2**30:.1f} GiB",
+        type="prewarm_done",
+        severity="success" if rc_code == 0 else "warning",
+        source="eeg-ops",
+        resource=f"s3://{bucket}/derived/",
+        notes=f"Pipelines: {', '.join(pls)}; rc={rc_code}",
+        session_id=state.notion_rental_session_id,
+    )
     console.print(f"[green]done[/green]: {n_obj:,} objects, {total / 2**30:.1f} GiB in cache")
     raise typer.Exit(rc_code)
 
@@ -468,6 +541,12 @@ def iam_create(
     # Plumb the role into ~/.sky/config.yaml so `sky launch` attaches it.
     sky_mod.set_remote_identity(arns["role_arn"])
     console.print("[green]✓[/green] ~/.sky/config.yaml updated: aws.remote_identity")
+    notion_mod.log_event(
+        title=f"IAM instance profile created — {rc.instance_profile_name}",
+        type="iam_create", severity="success", source="eeg-ops",
+        resource=arns["instance_profile_arn"],
+        notes=f"Role grants S3 RW on {', '.join(buckets)} + CloudWatch logs/metrics.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +572,12 @@ def alarm_create(
         daily_budget_usd=daily_budget_usd, sns_topic_arn=sns_topic_arn,
     )
     console.print(f"[green]✓[/green] alarm '{out['alarm']}' threshold ${out['threshold']}/day")
+    notion_mod.log_event(
+        title=f"CloudWatch billing alarm armed — {alarm_name} @ ${daily_budget_usd}/day",
+        type="alarm_create", severity="info", source="eeg-ops",
+        resource=f"alarm:{alarm_name} (us-east-1)",
+        notes="AWS/Billing EstimatedCharges metric, 6h period.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +645,182 @@ def config_show(
     t2.add_row("cluster_name", str(state.cluster_name))
     t2.add_row("known_reservations", ", ".join(state.capacities) or "—")
     console.print(t2)
+
+
+# ---------------------------------------------------------------------------
+# notion / events / session / finding — Operations Hub interaction
+# ---------------------------------------------------------------------------
+
+notion_app = typer.Typer(no_args_is_help=True,
+                         help="Operations Hub interaction (Notion-backed).")
+app.add_typer(notion_app, name="notion")
+events_app = typer.Typer(no_args_is_help=True, help="Append entries to the Events log.")
+app.add_typer(events_app, name="events")
+session_app = typer.Typer(no_args_is_help=True, help="Open / close Sessions.")
+app.add_typer(session_app, name="session")
+finding_app = typer.Typer(no_args_is_help=True, help="Add Findings.")
+app.add_typer(finding_app, name="finding")
+
+
+@notion_app.command("status")
+def notion_status():
+    """Show whether the Notion integration is reachable and which IDs are wired."""
+    enabled = notion_mod.is_enabled()
+    state = State.load()
+    hub = notion_mod.hub_ids()
+    t = Table(title="Notion ops hub")
+    t.add_column("key", style="cyan")
+    t.add_column("value")
+    t.add_row("token in env (NOTION_API_KEY)", "yes" if enabled else "no")
+    t.add_row("hub page", hub.workspace_url(hub.hub_page_id))
+    t.add_row("events db", hub.events_db_id)
+    t.add_row("sessions db", hub.sessions_db_id)
+    t.add_row("runs db", hub.runs_db_id)
+    t.add_row("experiments db", hub.experiments_db_id)
+    t.add_row("findings db", hub.findings_db_id)
+    t.add_row("active chat session", state.notion_chat_session_id or "—")
+    t.add_row("active rental session", state.notion_rental_session_id or "—")
+    console.print(t)
+    if not enabled:
+        console.print("\n[yellow]NOTION_API_KEY not set[/yellow]: `eeg-ops` will print events to "
+                      "stderr but skip the Notion write. To enable, create an internal "
+                      "integration at https://www.notion.so/profile/integrations, share the "
+                      "Operations Hub page with it, and `export NOTION_API_KEY=secret_…`.")
+
+
+@notion_app.command("ping")
+def notion_ping():
+    """Insert an info event into the Events log to verify end-to-end."""
+    pid = notion_mod.log_event(
+        title="ping from eeg-ops",
+        type="info", severity="info", source="eeg-ops",
+        notes="`eeg-ops notion ping` smoke test.",
+    )
+    if pid:
+        console.print(f"[green]✓[/green] event logged: {pid}")
+    else:
+        console.print("[yellow]Notion is disabled or the call failed; nothing written.[/yellow]")
+        raise typer.Exit(1)
+
+
+@events_app.command("log")
+def events_log(
+    title: str = typer.Argument(..., help="Short headline for the event."),
+    type: str = typer.Option("info", "--type",
+                             help=f"One of {', '.join(notion_mod.EVENT_TYPES)}"),
+    severity: str = typer.Option("info", "--severity",
+                                  help="info / success / warning / error"),
+    source: str = typer.Option("manual", "--source",
+                                help="eeg-ops / exp03/train / exp03/cli / agent / manual"),
+    resource: str = typer.Option(None, "--resource"),
+    notes: str = typer.Option(None, "--notes"),
+    session: str = typer.Option(None, "--session",
+                                 help="Page ID (or URL) of the Session this belongs to."),
+    run: str = typer.Option(None, "--run",
+                             help="Page ID (or URL) of the Run this belongs to."),
+):
+    """Manually append a row to the Events log."""
+    pid = notion_mod.log_event(
+        title=title, type=type, severity=severity, source=source,
+        resource=resource, notes=notes,
+        session_id=session, run_id=run,
+    )
+    if pid:
+        console.print(f"[green]✓[/green] {pid}")
+    else:
+        console.print("[yellow]Notion is disabled; nothing written.[/yellow]")
+
+
+@session_app.command("open")
+def session_open(
+    name: str = typer.Argument(..., help="Title for the new session row."),
+    type: str = typer.Option("chat", "--type",
+                             help=f"One of {', '.join(notion_mod.SESSION_TYPES)}"),
+    resource: str = typer.Option(None, "--resource"),
+    cost_usd: float = typer.Option(None, "--cost"),
+    set_active: bool = typer.Option(True, "--set-active/--no-set-active",
+                                    help="If type=chat or gpu_rental, save the new "
+                                         "session ID into state.toml so subsequent "
+                                         "events auto-relate to it."),
+):
+    """Create a new Session row with status=open."""
+    pid = notion_mod.open_session(
+        name=name, type=type, resource=resource, cost_usd=cost_usd,
+        source="agent" if type == "chat" else "eeg-ops",
+    )
+    if pid is None:
+        console.print("[yellow]Notion disabled or call failed.[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"[green]✓[/green] session opened: {pid}")
+    if set_active:
+        s = State.load()
+        if type == "chat":
+            s.notion_chat_session_id = pid
+        elif type == "gpu_rental":
+            s.notion_rental_session_id = pid
+        s.save()
+        console.print("[dim]state.toml updated[/dim]")
+
+
+@session_app.command("close")
+def session_close(
+    session_id: str = typer.Argument(None,
+        help="Session page ID. Default: the active chat session in state.toml."),
+    outcome: str = typer.Option(None, "--outcome",
+        help="One-paragraph summary written into the Outcome column."),
+    status: str = typer.Option("closed", "--status",
+        help=f"One of {', '.join(notion_mod.SESSION_STATUSES)}"),
+):
+    """Close a Session (chat / gpu_rental / training_run / data_pipeline / manual)."""
+    state = State.load()
+    sid = session_id or state.notion_chat_session_id
+    if sid is None:
+        console.print("[red]no session_id passed and no active chat session in state.toml[/red]")
+        raise typer.Exit(1)
+    notion_mod.close_session(session_id=sid, outcome=outcome, status=status)
+    if state.notion_chat_session_id == sid:
+        state.notion_chat_session_id = None
+    if state.notion_rental_session_id == sid:
+        state.notion_rental_session_id = None
+    state.save()
+    console.print(f"[green]✓[/green] session {status}")
+
+
+@finding_app.command("add")
+def finding_add(
+    title: str = typer.Argument(...),
+    summary: str = typer.Option(..., "--summary",
+                                 help="Multi-sentence claim with the evidence."),
+    tags: str = typer.Option("", "--tags",
+                              help="Comma-separated subset of "
+                                   "[positive_result, negative_result, bug_or_artifact, "
+                                   "optimization, decision, methodology, data_quality]"),
+    confidence: str = typer.Option("medium", "--confidence",
+                                    help="high / medium / low / tentative"),
+    experiment: str = typer.Option(None, "--experiment",
+                                    help="Experiment page ID."),
+    run: str = typer.Option(None, "--run",
+                             help="Run page ID."),
+    implication: str = typer.Option(None, "--implication"),
+    action_items: str = typer.Option(None, "--action-items"),
+):
+    """Add a Findings row + a 'finding' Event in the log."""
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    pid = notion_mod.log_finding(
+        title=title, summary=summary, tags=tag_list, confidence=confidence,
+        experiment_id=experiment, run_id=run,
+        implication=implication, action_items=action_items,
+    )
+    if pid:
+        console.print(f"[green]✓[/green] finding: {pid}")
+    else:
+        console.print("[yellow]Notion disabled or call failed.[/yellow]")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
