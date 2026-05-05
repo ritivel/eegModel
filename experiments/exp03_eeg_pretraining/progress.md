@@ -3,7 +3,117 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-05 ~07:00 IST / 01:30 UTC
+> **Last refreshed:** 2026-05-05 ~07:15 IST / 01:45 UTC
+
+---
+
+## 2026-05-05T01:45 UTC (07:15 IST) — exp17 v1.5 MAR-mul=4 sanity-check launched on Lambda
+
+**TL;DR.** Pure cross-cloud pivot session. Tried to restart the
+us-west-2a p4de instance to do the v2 GPU work — `InsufficientInstance
+Capacity` across all 4 us-west-2 AZs for both p4de and p4d. Pivoted to
+**Lambda Cloud 1× A100-40GB in us-east-1** ($1.99/hr, vs AWS p4de
+$27.45/hr per-GPU-hour). 30-minute bootstrap (uv venv + torch 2.8+cu128
++ mamba_ssm/causal_conv1d sm_80 build + 50-subject HBN sync from S3 +
+new ssh key registered with Lambda API). Smoke test passed cleanly,
+**10 step/s steady state at batch=32 / mul=4**.
+
+This run was started before the v2 plan landed in the previous progress
+entry. **It is now framed as v1.5 — a sanity check on whether the
+canonical MAR paper recipe (`diffusion_batch_mul=4`) alone changes
+v1's MAR-loses-to-MAE verdict, plus a validation pass for the new
+`RidgeCV` CBCL probe.** Per the literature dive, none of the four v1
+failure modes are addressed by mul=4, so the expected outcome is that
+MAR mul=4 still ties or loses; the value of the run is (a) we now have
+a real RidgeCV-based externalizing R² number for any cell, and (b) we
+verify the diffusion-loss head training is healthy at the canonical
+recipe.
+
+### Lambda setup
+
+- **Instance**: `ec4e1556faac4ca1872aea2ae1916505` at `158.101.125.107`,
+  Lambda 1× A100-SXM4-40GB, us-east-1, $1.99/hr.
+- **SSH key**: `~/.ssh/id_ed25519_lambda` (new dedicated key, registered
+  with Lambda via API as `eeg-lambda-mar`). Kept separate from the
+  `~/.ssh/id_ed25519` default + the AWS / NEDC keys for independent
+  rotation.
+- **AWS S3 access**: `eegmodel-instance` IAM keys copied to
+  `~/.aws/credentials` on the Lambda box for HBN parquet sync.
+- **Bootstrap timing**: 30 sec uv install + 35 sec uv venv + torch
+  install + 14 min 15 sec mamba_ssm + causal_conv1d build for sm_80
+  (from-source, with `MAX_JOBS=12 TORCH_CUDA_ARCH_LIST=8.0`) + 5 min
+  50-subject HBN sync from `s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`
+  at ~50 MB/s cross-region (us-west-2 → us-east-1). Total ~25 min,
+  $0.83 of compute.
+
+### Smoke test (G2 MAR mul=4, 30 steps batch=32 on A100-40GB)
+
+```
+[train] paradigm=mar backbone=mamba2 d_model=256 bidir=True
+[train] params: total=24,915,112
+{"step": 0, "diff_mse": 1.000519, "n_masked_positions": 16000.0}
+{"step": 5, "diff_mse": 0.918}
+{"step": 10, "diff_mse": 0.737}
+{"step": 25, "diff_mse": 0.374}
+[train] done: 30 steps in 93.8s
+```
+
+First-step cuDNN/Mamba-2 autotune ≈ 91 sec; remaining 29 steps in 2.9
+sec → **~10 step/s steady state**. Cleanly outperforms the v1
+extrapolation (mul=1 was ~9 step/s; mul=4 should have been 4× slower
+but A100's diffusion-MLP throughput at batch=128 effective is
+near-identical thanks to better MLP utilisation). Per-cell estimate:
+~30–42 min wall-clock.
+
+### Run in flight
+
+- Launched `bash scripts/launch_exp17_lambda.sh mar` at `01:34:46 UTC`
+  inside tmux session `exp17b`.
+- 10 cells (5 mar_eeg + 5 mar_noise) × 17500 steps × batch 32 ×
+  diffusion_batch_mul=4, all sequential on GPU 0.
+- ETA full completion: ~07:00 UTC (~5–7 h wall-clock from launch).
+- Expected total compute cost: ~$10–14 on Lambda.
+- Wandb online mode this time (key was on the box at launch); runs
+  appear at `https://wandb.ai/ritivel-eeg-ritivel/exp03/` filterable by
+  tag `exp17b` or `exp17_mar_mul4`.
+- Post-run watchdog (`/tmp/post_run_watchdog.sh`, pid `10081`) waits
+  for `ALL 10 CELLS COMPLETE`, then runs the summarizer, syncs to
+  `s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-05T01Z_mar_mul4/`,
+  and touches `/tmp/POST_DONE`.
+
+### Caveat — v2 supersedes this run
+
+Per the previous progress entry's literature dive, the v2 plan (10×
+data + JEPA paradigm + FT eval + TUAB metric) is the path forward. v1.5
+runs in parallel only because (a) it was already kicked off when the
+literature review concluded, (b) Lambda compute is cheap, and (c) the
+RidgeCV verification is genuinely useful. **If MAR mul=4 wins here it
+would be a surprise; if it ties / loses (predicted), it's a clean
+falsification of "MAR just needs more diffusion noise levels" as the v1
+fix and reinforces the v2 case.**
+
+### AWS state
+
+- `i-06c55554892db26bf` still stopped (us-west-2a). One restart attempt
+  this morning at ~07:00 IST: `InsufficientInstanceCapacity`. Retried
+  fresh launches in 2b/2c/2d for both p4de and p4d — all the same.
+  Will retry every 30 min in the background and resume when capacity
+  returns; AMI re-bake + v2 GPU run still pending on AWS capacity.
+- 192-vCPU quota request still `CASE_OPENED` (filed 2026-04-30, day 5).
+  Once approved, p5.48xlarge (8× H100) becomes an option.
+
+### Files changed this session
+
+```
+experiments/exp03_eeg_pretraining/
+├── progress.md                                  ← THIS ENTRY
+└── scripts/
+    └── launch_exp17_lambda.sh                   ← NEW (single-GPU sequential)
+```
+
+(The eval/data/train/cli/paradigms/model code changes from the
+previous entry's literature-dive session are already on `main` as
+commits `b3b2380` + `03dbf69`.)
 
 ---
 
@@ -23,29 +133,26 @@ MAR re-run. AMI re-bake deferred until v2 is ready to launch.
 ### Code fixes that landed (all Mac-side, py_compile passes)
 
 - **CBCL R² anomaly** (`src/exp03/eval.py`): replaced unregularized
-  `LinearRegression()` → `RidgeCV(alphas=(0.01, 0.1, 1.0, 10.0, 100.0,
-  1_000.0, 10_000.0), cv=5)` for both externalizing and attention
-  regression. Per-cell selected α now logged. Diagnosis: the original
-  unregularized linear regression overfit subject-specific patterns in the
-  train split that didn't generalize across LNSO subjects, producing
-  systematically wrong predictions on held-out subjects (range -0.10 to
-  -1.05 vs Track A floor -0.05). v1 R² numbers in `results.md` should be
-  treated as artefacts of the unregularized probe, not real signal that
-  pretraining made representations worse. The BAC / WF1 / k-NN / AUROC
-  numbers are correct (LogisticRegression and KNN are both regularized
-  by default).
-
+`LinearRegression()` → `RidgeCV(alphas=(0.01, 0.1, 1.0, 10.0, 100.0, 1_000.0, 10_000.0), cv=5)` for both externalizing and attention
+regression. Per-cell selected α now logged. Diagnosis: the original
+unregularized linear regression overfit subject-specific patterns in the
+train split that didn't generalize across LNSO subjects, producing
+systematically wrong predictions on held-out subjects (range -0.10 to
+-1.05 vs Track A floor -0.05). v1 R² numbers in `results.md` should be
+treated as artefacts of the unregularized probe, not real signal that
+pretraining made representations worse. The BAC / WF1 / k-NN / AUROC
+numbers are correct (LogisticRegression and KNN are both regularized
+by default).
 - **DDP collate fix** (`src/exp03/data.py`): added
-  `collate_signal_batch_train` (tensors-only — drops `subject_id`,
-  `site`, `recording_id`, `channel_name`, `sex` strings). Plus added
-  rank-aware shard sharding to `ParquetWindowDataset.__iter__` so each
-  DDP rank reads disjoint parquet shards. `train.py` now uses the
-  tensors-only collate. Future cells can use full 8-GPU DDP per cell.
-
+`collate_signal_batch_train` (tensors-only — drops `subject_id`,
+`site`, `recording_id`, `channel_name`, `sex` strings). Plus added
+rank-aware shard sharding to `ParquetWindowDataset.__iter`__ so each
+DDP rank reads disjoint parquet shards. `train.py` now uses the
+tensors-only collate. Future cells can use full 8-GPU DDP per cell.
 - **stdout buffering fix** (`src/exp03/train.py`): added
-  `sys.stdout.reconfigure(line_buffering=True)` at module import. Per-step
-  training prints flush to disk immediately when stdout is redirected to
-  a file; the v1 "stuck between log boundaries" cosmetic problem is gone.
+`sys.stdout.reconfigure(line_buffering=True)` at module import. Per-step
+training prints flush to disk immediately when stdout is redirected to
+a file; the v1 "stuck between log boundaries" cosmetic problem is gone.
 
 ### Literature dive — why v1 actually failed (the real story)
 
@@ -54,7 +161,7 @@ SSL papers. Strong, consistent finding: **v1 hit four well-documented
 compounding failure modes simultaneously.**
 
 1. **Below the data-scale "cliff" for biosignal SSL.** Speech wav2vec 2.0
-   needs >500 h unlabeled for any lift over supervised-from-scratch
+  needs >500 h unlabeled for any lift over supervised-from-scratch
    ([Berrebbi et al. 2022, arXiv 2402.13723](https://arxiv.org/abs/2402.13723));
    below that it actively *underperforms* (49 % WER vs 23 % supervised).
    LaBraM ([Jiang et al. ICLR 2024](https://arxiv.org/abs/2401.10278))
@@ -62,9 +169,8 @@ compounding failure modes simultaneously.**
    needs 60,000 h, 25,000 subjects to claim consistent linear-probe SOTA.
    We pretrained on 100 h, 100 subjects — 5–600× below empirically
    validated thresholds across speech, EEG, and wearable SSL.
-
 2. **Wrong pretext task family for low-SNR signals.** EEG SNR ≈ −20 dB on
-   raw single-channel windows; reconstruction loss is dominated by the
+  raw single-channel windows; reconstruction loss is dominated by the
    un-reconstructable noise component. Documented as the central problem
    in EEG2Rep ([Foumani et al. KDD 2024](https://arxiv.org/abs/2402.17772)),
    STELAR ([OpenReview ICLR 2026](https://openreview.net/pdf?id=ofwQZjoI4c)),
@@ -74,18 +180,16 @@ compounding failure modes simultaneously.**
    three of our v1 paradigms are input-space-prediction. We selected from
    a paradigm family the literature has documented as systematically wrong
    for EEG.
-
 3. **Downstream task is essentially unsolvable at our scale.** The HBN
-   externalizing-factor regression we used is *literally* the NeurIPS 2025
+  externalizing-factor regression we used is *literally* the NeurIPS 2025
    EEG Foundation Challenge — Challenge 2. Out of 1,183 teams competing,
    **only 3 broke the 0.99 NRMSE threshold** (predicting the mean). The
    combined-metric winner ([NeuroSned](https://github.com/sneddy/neurosned))
    used hand-engineered features + Ridge regression, NOT a foundation
    model. The HBN 6-task BAC headline at our scale sits at the 16.7%
    chance floor for almost everyone; LaBraM at 2.5 kh gets TUEV BAC = 0.67.
-
 4. **Linear probe under LNSO is the wrong eval.** [Dubois et al. ICML 2023
-   oral](https://proceedings.mlr.press/v202/dubois23a.html): in few-shot
+  oral]([https://proceedings.mlr.press/v202/dubois23a.html](https://proceedings.mlr.press/v202/dubois23a.html)): in few-shot
    probing regimes, "probe generalization error has become dominant".
    [Wortsman et al. ICML 2022 LP-FT](https://arxiv.org/abs/2202.10054):
    pure linear probe is the worst of {LP, FT, LP-FT} for OOD evaluation.
@@ -104,17 +208,18 @@ The full literature-grounded analysis with citations lives in
 
 `mini_experiments/17_generative_paradigm/results.md` rewritten as the
 canonical v1 record (10 sections):
+
 - §1 Per-cell numbers (all 30 cells)
 - §2 Aggregate by paradigm × control
 - §3 Decision rule applied (formal verdict: TIE ⇒ keep G0 MAE)
 - §4 Noise-twin diagnostic — and what it really says (MAR's 0.0005
-  EEG-vs-noise separation is the smoking gun for "encoder learned noise
-  structure not EEG content")
+EEG-vs-noise separation is the smoking gun for "encoder learned noise
+structure not EEG content")
 - §5 Why this happened — four compounding failure modes (with citations)
 - §6 What this means for the README's pre-registered hypothesis (literal
-  match to the README's anti-prediction, but **for the wrong reason**)
+match to the README's anti-prediction, but **for the wrong reason**)
 - §7 Operational verdict for downstream mini-experiments (anchor on G0
-  MAE, but flag as "anchoring-by-default-not-by-evidence" everywhere)
+MAE, but flag as "anchoring-by-default-not-by-evidence" everywhere)
 - §8 Throughput, bug fixes, CBCL R² bug investigation
 - §9 Cost summary
 - §10 v2 plan pointer
@@ -125,17 +230,17 @@ canonical v1 record (10 sections):
 design section (after the existing "What gets carried forward"). Four
 structural changes:
 
-1. **Scale up data ~10×** to ~1000 h HBN pretraining (~500 subjects;
-   already in S3 at `s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`).
+1. **Scale up data ~10×** to ~~1000 h HBN pretraining (~~500 subjects;
+  already in S3 at `s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`).
    Crosses LaBraM's plateau threshold.
 2. **Add G3 latent-prediction paradigm** (EEG2Rep / I-JEPA / ECG-JEPA
-   style): predict masked-patch *representations* via an EMA target
+  style): predict masked-patch *representations* via an EMA target
    encoder + small predictor MLP, smooth-L1 loss. The literature predicts
    this is the only paradigm in the set that should work at our scale.
 3. **Switch primary eval to fine-tuning**, with linear probe demoted to a
-   diagnostic. Plus LP-FT as a third reported eval for OOD robustness.
+  diagnostic. Plus LP-FT as a third reported eval for OOD robustness.
 4. **Switch headline downstream task to TUAB binary AUROC** (LaBraM
-   achieves 0.84 at 2.5 kh, floor 0.59 — there's known SSL signal there).
+  achieves 0.84 at 2.5 kh, floor 0.59 — there's known SSL signal there).
    HBN 6-task BAC + CBCL externalizing kept as secondary / stretch metrics.
 
 v2 cell count: 4 paradigms × 2 controls × 3 seeds = **24 cells** (down
@@ -147,17 +252,17 @@ Estimated cost: ~$200–300 on p4de. Estimated wall-clock: ~5–7 h.
 `src/exp03/paradigms.py` adds `LatentJEPAHead` (~150 LOC). Architecture:
 
 - Takes the existing online encoder (frontend + Mamba-2 stack) + a deep
-  copy as the EMA *target encoder* (momentum 0.996, BYOL default;
-  `requires_grad=False`).
+copy as the EMA *target encoder* (momentum 0.996, BYOL default;
+`requires_grad=False`).
 - Predictor: small MLP (default 2 layers, hidden 1024, GeLU activations)
-  that takes the visible-features-with-mask-tokens-restored-to-original-
-  order and predicts the target encoder's representation at every position.
+that takes the visible-features-with-mask-tokens-restored-to-original-
+order and predicts the target encoder's representation at every position.
 - Loss: smooth-L1 (Huber) per (sample, token, feature dim), averaged over
-  masked positions only.
+masked positions only.
 - `update_target_encoder_from(model)` momentum-updates the target
-  encoder + frontend + pos-emb after each optimizer step.
+encoder + frontend + pos-emb after each optimizer step.
 
-`build_paradigm("jepa", ...)` factory wired up. `EEGSSLModel.__init__`
+`build_paradigm("jepa", ...)` factory wired up. `EEGSSLModel.__init_`_
 extended to construct the deep-copied target modules when
 `cfg.paradigm.kind == "jepa"`. `EEGSSLModel.forward` extended to
 compute `target_full_features` under `torch.no_grad()` from the target
@@ -168,6 +273,7 @@ to expose `'jepa'` as a paradigm option. All files
 `python3 -m py_compile` clean.
 
 References for the G3 design:
+
 - [EEG2Rep (Foumani et al. KDD 2024, arXiv:2402.17772)](https://arxiv.org/abs/2402.17772)
 - [I-JEPA (Assran et al. CVPR 2023, arXiv:2301.08243)](https://arxiv.org/abs/2301.08243)
 - [ECG-JEPA (Kim 2024, arXiv:2410.04339)](https://arxiv.org/abs/2410.04339)
@@ -180,17 +286,17 @@ end of `run_protocol_a`). Three diagnostics that detect the v1 failure
 mechanisms:
 
 - **Subject-ID linear-probe accuracy** on frozen features. Per ContentVec
-  ICML 2022, HuBERT hits 81.4 % speaker-ID accuracy without trying —
-  evidence that the encoder dominantly encodes subject identity. Threshold:
+ICML 2022, HuBERT hits 81.4 % speaker-ID accuracy without trying —
+evidence that the encoder dominantly encodes subject identity. Threshold:
   > 60 % flags fingerprint dominance. We use a within-subject 70/30 split
-  (NOT LNSO) because we explicitly want to know if the encoder fingerprints
-  a subject.
+  > (NOT LNSO) because we explicitly want to know if the encoder fingerprints
+  > a subject.
 - **Effective rank** of the feature covariance (Roy & Vetterli 2007 entropy
-  rank) + ratio to embedding dim. Per Jing et al. ICLR 2022, dimensional
-  collapse manifests as a few large eigenvalues dominating; threshold:
-  rank_ratio < 0.5 indicates collapse.
+rank) + ratio to embedding dim. Per Jing et al. ICLR 2022, dimensional
+collapse manifests as a few large eigenvalues dominating; threshold:
+rank_ratio < 0.5 indicates collapse.
 - **Site-ID linear-probe accuracy** when multi-site data is present (CRCC
-  arXiv:2602.19138). Threshold: > 60 % flags site-fingerprint dominance.
+arXiv:2602.19138). Threshold: > 60 % flags site-fingerprint dominance.
 
 All three are cheap (sklearn + numpy, < 1 s per cell) and run alongside
 the existing Protocol A metrics.
@@ -198,41 +304,41 @@ the existing Protocol A metrics.
 ### What remains for the v2 GPU run
 
 - **Smoke test G3 on Mac transformer fallback.** mamba_ssm is CUDA-only
-  but we can swap `backbone_kind='transformer'` for a quick on-Mac
-  paradigm-head shape check before spending GPU.
+but we can swap `backbone_kind='transformer'` for a quick on-Mac
+paradigm-head shape check before spending GPU.
 - **Smoke test G3 on the GPU box.** A 50-step single-cell run to verify
-  the EMA update mechanics work and the loss decreases.
+the EMA update mechanics work and the loss decreases.
 - **Sync ~500 HBN subjects** to NVMe (~10 min on p4de from in-region S3).
 - **Implement fine-tune eval path** in `eval.py`. Currently only Protocol
-  A frozen-probe is implemented. Fine-tune eval needs:
+A frozen-probe is implemented. Fine-tune eval needs:
   - Load checkpoint, attach a downstream head (Linear for binary, MLP for
-    multi-class).
+  multi-class).
   - Train end-to-end on labeled downstream data with smaller LR.
   - Evaluate on held-out LNSO subjects.
   - Estimated 5 min per cell × 24 cells = 2 h additional GPU.
 - **Re-bake AMI** with the v2 codebase + the working mamba_ssm /
-  causal_conv1d builds for sm_80. Saves the 12-min compile on every fresh
-  p4de launch.
+causal_conv1d builds for sm_80. Saves the 12-min compile on every fresh
+p4de launch.
 
-Estimated total v2 GPU session: ~5–7 h training + ~2 h FT eval + ~1 h
-buffer ≈ **~10 h on p4de @ $27.45/h = ~$270**.
+Estimated total v2 GPU session: ~~5–7 h training + ~2 h FT eval + ~1 h
+buffer ≈ **~~10 h on p4de @ $27.45/h = ~$270**.
 
 ### Cost summary for this session
 
 - $0 — pure local Mac coding + research subagents.
 - The (stopped) GPU instance `i-06c55554892db26bf` continues to bill
-  ~$2.50/mo for EBS root. NVMe scratch already wiped on yesterday's stop.
+~$2.50/mo for EBS root. NVMe scratch already wiped on yesterday's stop.
 
 ### State at session end
 
 - v1 results.md is the canonical v1 record (10 sections, literature-grounded).
 - v2 design + G3 code + diagnostics are scaffolded and py_compile clean.
 - Instance `i-06c55554892db26bf` still stopped (verified earlier — 1
-  capacity-issue retry on restart, did not retry further).
+capacity-issue retry on restart, did not retry further).
 - Code changes NOT yet pushed to git; all sit in the working tree. User
-  will commit when ready.
-- Wandb runs from v1 still online at https://wandb.ai/ritivel-eeg-ritivel/exp03/
-  filterable by `tag:exp17`.
+will commit when ready.
+- Wandb runs from v1 still online at [https://wandb.ai/ritivel-eeg-ritivel/exp03/](https://wandb.ai/ritivel-eeg-ritivel/exp03/)
+filterable by `tag:exp17`.
 - v1 artefacts in S3 at `s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-04T14Z_run1/`.
 
 ---
@@ -249,15 +355,17 @@ does NOT transfer to 1D EEG at this scale.
 
 ### Headline numbers (HBN 6-task BAC, mean ± std across 5 seeds)
 
-| Variant            | n | task6_bac          | Δ vs G0  | Verdict                                |
-|--------------------|---|--------------------|----------|----------------------------------------|
-| **G0 MAE-EEG**     | 5 | **0.196 ± 0.017**  | —        | reference (default)                    |
-| **G1 AR-EEG**      | 5 | **0.196 ± 0.012**  | +0.000   | **TIE** ⇒ keep MAE                     |
-| **G2 MAR-EEG**     | 5 | **0.185 ± 0.011**  | −0.011   | **LOSS** ⇒ reject MAR                  |
-| MAE-noise (twin)   | 5 | 0.185 ± 0.006      | −        | EEG > noise by +0.011 (OK)             |
-| AR-noise (twin)    | 5 | 0.186 ± 0.006      | −        | EEG > noise by +0.010 (OK)             |
-| MAR-noise (twin)   | 5 | 0.185 ± 0.011      | −        | EEG ≈ noise (Δ=+0.0005, WARN)          |
-| _Track A floor_    | _ref_ | _0.20_         | _ref_    | random-init linear-probe baseline      |
+
+| Variant          | n     | task6_bac         | Δ vs G0 | Verdict                           |
+| ---------------- | ----- | ----------------- | ------- | --------------------------------- |
+| **G0 MAE-EEG**   | 5     | **0.196 ± 0.017** | —       | reference (default)               |
+| **G1 AR-EEG**    | 5     | **0.196 ± 0.012** | +0.000  | **TIE** ⇒ keep MAE                |
+| **G2 MAR-EEG**   | 5     | **0.185 ± 0.011** | −0.011  | **LOSS** ⇒ reject MAR             |
+| MAE-noise (twin) | 5     | 0.185 ± 0.006     | −       | EEG > noise by +0.011 (OK)        |
+| AR-noise (twin)  | 5     | 0.186 ± 0.006     | −       | EEG > noise by +0.010 (OK)        |
+| MAR-noise (twin) | 5     | 0.185 ± 0.011     | −       | EEG ≈ noise (Δ=+0.0005, WARN)     |
+| *Track A floor*  | *ref* | *0.20*            | *ref*   | random-init linear-probe baseline |
+
 
 **All three paradigms sit at the random-init floor of 0.20.** None of them
 meaningfully cracked the HBN 6-task headline at our 35M-token / 100-subject
@@ -270,52 +378,56 @@ need re-anchoring. Spec stays as written.
 ### Caveats before declaring this final
 
 1. **Sample size is small** vs the vision papers that motivated exp17.
-   MAP / AR-Mamba / MAR were trained on ImageNet-scale corpora with
+  MAP / AR-Mamba / MAR were trained on ImageNet-scale corpora with
    100M-1B+ tokens. We trained on 35M tokens × 100 HBN subjects. The
    MAP mechanism may transfer at 10× larger scale.
 2. **CBCL externalizing R² is wildly negative** (−0.10 to −1.05 across
-   paradigms). The random-init floor was −0.05 — pretrained models are
+  paradigms). The random-init floor was −0.05 — pretrained models are
    *worse* on regression than random init. Strong sign of an eval
    pipeline issue (probably a sklearn `LinearRegression` config) that
    needs investigating before the cell-level R² numbers can be trusted.
 3. **MAR-EEG ≈ MAR-noise** (Δ = +0.0005 — well below the +0.010
-   separation we see in MAE/AR). The MAR diffusion-loss head produces
+  separation we see in MAE/AR). The MAR diffusion-loss head produces
    essentially identical downstream features whether trained on EEG or
    Gaussian noise. This is *more* damning for MAR than just losing to
    MAE — it's positive evidence that MAR's diffusion-head is overfit to
    the noise / mode-following the loss, not learning EEG content.
 4. **Frontend is F0 vanilla strided conv** — the §4.2 default. exp02
-   has not yet picked F2 SincNet / F4 LEAF / F4 Gabor. If the §4.2
+  has not yet picked F2 SincNet / F4 LEAF / F4 Gabor. If the §4.2
    frontend handicaps generative paradigms (likely for MAR, per the
    README's risk table), exp17 should be re-run after exp02 picks a
    richer frontend.
 5. **Diffusion_batch_mul=1** in our run. The MAR paper's recipe uses
-   mul=4 (4× per-sample replication for noise-level coverage). Our
+  mul=4 (4× per-sample replication for noise-level coverage). Our
    compute budget didn't support mul=4 (would have been 4× more
    expensive). Re-running G2 MAR at mul=4 is the cleanest follow-up
    if we want to give MAR a fair shot.
 
 ### Wall-clock + cost
 
-| Phase                                   | Wall-clock | Cost (p4de @ $27.45/hr) |
-|-----------------------------------------|------------|-------------------------|
-| Bootstrap (mamba_ssm + causal_conv1d)   | 12 m 15 s  | ~$5.6                   |
-| Smoke tests (G0 / G1 / G2 / noise-twin) | 8 m        | ~$3.7                   |
-| HBN sync (100 subj, 29 GB to NVMe)      | 4 m        | ~$1.8                   |
-| **30-cell training matrix (4 batches)** | **2 h 44 m** | **~$75.0**            |
-| Watchdog (wandb-sync + S3 sync)         | 6 m        | ~$2.7                   |
-| Stuck-thread debug + relaunch overhead  | ~30 m      | ~$13.7                  |
-| **Total**                               | **~3 h 50 m** | **~$102**            |
+
+| Phase                                   | Wall-clock    | Cost (p4de @ $27.45/hr) |
+| --------------------------------------- | ------------- | ----------------------- |
+| Bootstrap (mamba_ssm + causal_conv1d)   | 12 m 15 s     | ~$5.6                   |
+| Smoke tests (G0 / G1 / G2 / noise-twin) | 8 m           | ~$3.7                   |
+| HBN sync (100 subj, 29 GB to NVMe)      | 4 m           | ~$1.8                   |
+| **30-cell training matrix (4 batches)** | **2 h 44 m**  | **~$75.0**              |
+| Watchdog (wandb-sync + S3 sync)         | 6 m           | ~$2.7                   |
+| Stuck-thread debug + relaunch overhead  | ~30 m         | ~$13.7                  |
+| **Total**                               | **~3 h 50 m** | **~$102**               |
+
 
 Plus ~$2.50/mo EBS storage going forward.
 
 ### Per-paradigm step rate (batch 32 / 1 GPU, A100-80GB)
 
+
 | Paradigm | step/s | per-cell wall | model size |
-|----------|--------|---------------|------------|
+| -------- | ------ | ------------- | ---------- |
 | G0 MAE   | 7.4    | ~40 m         | 7.20 M     |
 | G1 AR    | 14.0   | ~22 m         | 2.88 M     |
 | G2 MAR   | 9.0    | ~32 m         | 24.92 M    |
+
 
 MAR's 1.42× cost over MAE matches the README's `~1.4×` projection
 exactly. AR's 2× speedup vs MAE comes from the smaller model
@@ -324,40 +436,39 @@ exactly. AR's 2× speedup vs MAE comes from the smaller model
 ### Wandb / S3 / local persistence
 
 - **Wandb workspace**: `https://wandb.ai/ritivel-eeg-ritivel/exp03/`
-  All 30 runs uploaded. Filter by tag `exp17` to see them; sub-filter
-  by `mae`/`ar`/`mar` × `eeg`/`noise` × `seed{0..4}`.
+All 30 runs uploaded. Filter by tag `exp17` to see them; sub-filter
+by `mae`/`ar`/`mar` × `eeg`/`noise` × `seed{0..4}`.
 - **S3 archive**: `s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-04T14Z_run1/`
-  Contains every cell's `summary.json` + `ckpt_final.pt` + `wandb/`
-  offline-run dir + `run.log`, plus the master `exp17_launch.log` and
-  `results.md`.
+Contains every cell's `summary.json` + `ckpt_final.pt` + `wandb/`
+offline-run dir + `run.log`, plus the master `exp17_launch.log` and
+`results.md`.
 - **Local repo**: `mini_experiments/17_generative_paradigm/results.md`
-  pulled from S3 to git.
+pulled from S3 to git.
 - **Custom AMI**: `ami-0d17022030a88612e` still good. Next launch from
-  it on a new p4de saves the bootstrap (mamba_ssm + causal_conv1d build,
-  HBN sync). Caveat: `mamba_ssm` + `causal_conv1d` were installed into
-  the EBS-root venv on instance `i-06c55554892db26bf` (now stopped).
-  When we restart this instance, the venv is preserved. When we launch
-  a fresh instance from the AMI, we'll need to re-install (12 min).
-  Worth re-baking the AMI before exp02-onwards mini-experiments.
+it on a new p4de saves the bootstrap (mamba_ssm + causal_conv1d build,
+HBN sync). Caveat: `mamba_ssm` + `causal_conv1d` were installed into
+the EBS-root venv on instance `i-06c55554892db26bf` (now stopped).
+When we restart this instance, the venv is preserved. When we launch
+a fresh instance from the AMI, we'll need to re-install (12 min).
+Worth re-baking the AMI before exp02-onwards mini-experiments.
 
 ### Bugs found and fixed during this run
 
 1. **DDP data loader crash** — `accelerate.utils.operations.concatenate`
-   barfs on the `collate_signal_batch` dict because it contains list[str]
+  barfs on the `collate_signal_batch` dict because it contains list[str]
    metadata fields (subject_id, site, etc.). Workaround: ran 8 cells
    in parallel, each on 1 GPU (no DDP). Proper fix is a `tensors_only`
    flag on the collate (deferred, ~30 min code change).
 2. **CPU thread thrash with 8 concurrent Python processes** — by default
-   PyTorch's intra-op pool grabs all 96 cores per process; 8 processes ×
+  PyTorch's intra-op pool grabs all 96 cores per process; 8 processes ×
    200 threads = 1600 threads contending on 96 cores → `futex_wait_queue`
    gridlock. Fixed by setting `OMP_NUM_THREADS=8 MKL_NUM_THREADS=8` etc.
    per cell. After fix: 37 threads/process, 18 % GPU util sustained.
 3. **Bash inline env-var prefix didn't propagate** through bash function
-   line continuation in the launcher. Fixed by switching to `(export X=
-   ...; python ...)` subshell pattern. After fix: env vars verified in
+  line continuation in the launcher. Fixed by switching to `(export X=  ...; python ...)` subshell pattern. After fix: env vars verified in
    `/proc/PID/environ`.
 4. **Stdout buffering** — Python's `print` is line-buffered for TTYs,
-   block-buffered for files. Live `tail run.log` only sees flushed lines
+  block-buffered for files. Live `tail run.log` only sees flushed lines
    ⇒ the run looks "stuck" between log batches. Cells were always making
    progress; the buffer flushes when the process exits. Worth adding
    `python -u` or `sys.stdout.reconfigure(line_buffering=True)` to
@@ -366,16 +477,16 @@ exactly. AR's 2× speedup vs MAE comes from the smaller model
 ### What's next (open follow-ups)
 
 - **Investigate the CBCL R² anomaly** before exp02. The negative R²
-  values across all 30 cells are not credible — probably an eval
-  pipeline issue.
+values across all 30 cells are not credible — probably an eval
+pipeline issue.
 - **Decide on G2 MAR re-run with mul=4** (vs accepting that it loses at
-  mul=1). Cost: ~$15 more on p4de.
+mul=1). Cost: ~$15 more on p4de.
 - **DDP collate fix** so future mini-experiments can use all 8 GPUs per
-  cell when needed (would 4× speed up eval-heavy runs like exp10's
-  16-cell mask × ratio matrix).
+cell when needed (would 4× speed up eval-heavy runs like exp10's
+16-cell mask × ratio matrix).
 - **Re-bake AMI** to capture the working `mamba_ssm` + `causal_conv1d`
-  builds for sm_80 + the latest exp03 code. Saves 12 min of build per
-  fresh launch.
+builds for sm_80 + the latest exp03 code. Saves 12 min of build per
+fresh launch.
 
 ### Files changed this session
 
@@ -407,21 +518,23 @@ wandb online).
 plus one ~3-hour GPU run on `i-0b8ee8096fd9176c0` (g5.8xlarge):
 
 1. **Track A landed.** Mini-experiment 01's last open follow-up — the
-   Protocol A.4 (TUH) floor row — is filled in. ✅ GREEN.
+  Protocol A.4 (TUH) floor row — is filled in. ✅ GREEN.
 2. **exp17 paradigm code dropped.** Three generative-paradigm heads
-   (G0 MAE / G1 AR / G2 MAR + diffusion) plus a paradigm-agnostic
+  (G0 MAE / G1 AR / G2 MAR + diffusion) plus a paradigm-agnostic
    training loop (HF accelerate + wandb). Smoke-tested on Mac.
 
 ### Track A: Protocol A.4 floor numbers
 
 Random-init §4.2-default model, frozen, mean-pool encoder features:
 
-| metric                                | point    | 95 % CI          |
-|---------------------------------------|---------:|------------------|
-| TUAB binary AUROC                     | **0.591** | [0.562, 0.617]   |
-| TUEV 6-class BAC                      | **0.240** | [0.221, 0.261]   |
-| TUEV 6-class WF1                      | **0.676** | [0.659, 0.695]   |
-| TUEV k-NN top-1 (k=5, cosine, 6-task) | **0.660** | [0.643, 0.678]   |
+
+| metric                                | point     | 95 % CI        |
+| ------------------------------------- | --------- | -------------- |
+| TUAB binary AUROC                     | **0.591** | [0.562, 0.617] |
+| TUEV 6-class BAC                      | **0.240** | [0.221, 0.261] |
+| TUEV 6-class WF1                      | **0.676** | [0.659, 0.695] |
+| TUEV k-NN top-1 (k=5, cosine, 6-task) | **0.660** | [0.643, 0.678] |
+
 
 Filled into `mini_experiments/01_sanity_baselines/results.md` under the
 new "Check D extension — Protocol A.4 floor" section. Run JSON synced
@@ -430,25 +543,25 @@ to `s3://eegmodel-warehouse/runs/exp03/01_sanity_baselines/2026-05-04T09-58-21Z_
 ### Track A timeline (wall-clock)
 
 - 08:55 UTC — instance started, SSH chain bootstrapped (NEDC key
-  agent-forwarded; nedc-tuh alias added on box; host keys pinned)
+agent-forwarded; nedc-tuh alias added on box; host keys pinned)
 - 08:56 — pre-sync 80 HBN subjects (24 GB, 18 sec, ~1.3 GB/s S3-to-EC2)
 - 08:56–09:38 — rsync TUAB v3.0.1 from NEDC SFTP (62 GB at ~23 MB/s; 42 min)
 - 09:38–09:52 — rsync TUEV v2.0.1 (20 GB at ~24 MB/s; 14 min)
 - 09:52 — first preprocess attempt failed (`tuh.py` regex assumed
-  TUAB v2 deep layout `<subj>/<sess>/<recname>.edf`; v3.0.1 flattened
-  it to `<recname>.edf`; subject is now in the filename). Fixed
-  in commit `064aee7`.
+TUAB v2 deep layout `<subj>/<sess>/<recname>.edf`; v3.0.1 flattened
+it to `<recname>.edf`; subject is now in the filename). Fixed
+in commit `064aee7`.
 - 09:58–10:14 — TUAB preprocess (300 train + 276 eval shards via
-  `--n 300`; 16 min)
+`--n 300`; 16 min)
 - 10:14–10:26 — TUEV preprocess (440 shards; 12 min)
 - 10:26 — sync derived to S3 (~17 sec, small)
 - 10:26–10:33 — first probe run; TUAB hit `single-class train split`
-  because Linux `rglob` walked `train/normal/` before
-  `train/abnormal/` so all 300 train shards were label-0
+because Linux `rglob` walked `train/normal/` before
+`train/abnormal/` so all 300 train shards were label-0
 - 10:33–10:43 — `/tmp/balance_tuab.py` added 300 train-abnormal shards
-  (~10 min, 0.5 rec/s on single-thread CPU)
+(~10 min, 0.5 rec/s on single-thread CPU)
 - 10:43–10:55 — re-probe with `--tuh-max-subjects 300`; **all four
-  Protocol A.4 metrics landed cleanly**.
+Protocol A.4 metrics landed cleanly**.
 - 11:00 — instance stopped.
 
 **Total session GPU compute:** ~2 h × $2.45/hr ≈ $5. Plus ~1 h of CPU-
@@ -460,90 +573,90 @@ total (just the feature extraction inside the probe).
 ~1500 LOC across three new modules + extensions to model.py / cli.py:
 
 - `src/exp03/diffusion.py` — minimal cosine-schedule + ε-prediction
-  MSE loss (port of LTH14/mar's diffusion utility, simplified to
-  representation-only; no sampling / VLB / reverse process).
+MSE loss (port of LTH14/mar's diffusion utility, simplified to
+representation-only; no sampling / VLB / reverse process).
 - `src/exp03/paradigms.py` — three paradigm heads with shared interface:
-    - `MAEHead` — wraps the existing decoder + recon_head.
-    - `ARNextPatchHead` — forward-only encoder, per-token next-patch
-      L1+0.3·MR-STFT loss; ARM-style.
-    - `MARDiffLossHead` — bidirectional encoder + per-masked-token
-      `SimpleMLPAdaLN` diffusion MLP (depth=3, width=1024); port of
-      MAR's models/diffloss.py.
+  - `MAEHead` — wraps the existing decoder + recon_head.
+  - `ARNextPatchHead` — forward-only encoder, per-token next-patch
+  L1+0.3·MR-STFT loss; ARM-style.
+  - `MARDiffLossHead` — bidirectional encoder + per-masked-token
+  `SimpleMLPAdaLN` diffusion MLP (depth=3, width=1024); port of
+  MAR's models/diffloss.py.
 - `src/exp03/train.py` — paradigm-agnostic SSL training loop on
-  HuggingFace accelerate (DDP/multi-GPU readiness, mixed precision,
-  gradient accumulation) + wandb logging. Same recipe as
-  facebookresearch/mae's engine_pretrain.py: AdamW (β=(0.9,0.95),
-  wd=0.05), cosine LR with warmup, MAE-style absolute LR
-  (`lr = blr * eff_batch / 256`), gradient clip, periodic checkpoint,
-  end-of-train Protocol A frozen-probe eval auto-logged to wandb
-  under `eval/*`.
+HuggingFace accelerate (DDP/multi-GPU readiness, mixed precision,
+gradient accumulation) + wandb logging. Same recipe as
+facebookresearch/mae's engine_pretrain.py: AdamW (β=(0.9,0.95),
+wd=0.05), cosine LR with warmup, MAE-style absolute LR
+(`lr = blr * eff_batch / 256`), gradient clip, periodic checkpoint,
+end-of-train Protocol A frozen-probe eval auto-logged to wandb
+under `eval/*`.
 - `src/exp03/cli.py` — new `exp03 train --paradigm <mae|ar|mar> ...`
-  subcommand; --help has runnable examples for the smoke test, the
-  exp17 G2 cell at ~35M tokens-seen (the README's iso-data budget),
-  and the G1 cell.
+subcommand; --help has runnable examples for the smoke test, the
+exp17 G2 cell at ~35M tokens-seen (the README's iso-data budget),
+and the G1 cell.
 - `src/exp03/model.py` — `EEGSSLModel.__init__` now branches on
-  `paradigm.kind`; G1 drops mask + decoder + mask_token + recon_head;
-  G2 drops the Mamba decoder block (replaced by the diffusion MLP);
-  G0 keeps the existing pipeline. `forward(compute_loss=True)`
-  dispatches to the paradigm head; `compute_loss=False` preserves the
-  rich output dict that Check A's external losses iterate over
-  (backwards-compatible).
+`paradigm.kind`; G1 drops mask + decoder + mask_token + recon_head;
+G2 drops the Mamba decoder block (replaced by the diffusion MLP);
+G0 keeps the existing pipeline. `forward(compute_loss=True)`
+dispatches to the paradigm head; `compute_loss=False` preserves the
+rich output dict that Check A's external losses iterate over
+(backwards-compatible).
 
 Mac smoke tests (transformer backbone — Mamba-2 is CUDA-only):
 
 - G1 AR: 467K params, loss-at-init L1 = 0.80 (matches √(2/π) ≈ 0.798
-  theory), backprop OK.
+theory), backprop OK.
 - G2 MAR: 19.8M params (the diffusion MLP at 1024×3 is the bulk),
-  loss-at-init eps-MSE = 1.00 (matches noise variance), 50-step
-  single-batch overfit drops loss 50% (stability check passes).
+loss-at-init eps-MSE = 1.00 (matches noise variance), 50-step
+single-batch overfit drops loss 50% (stability check passes).
 - End-to-end `train.py` with synthetic parquet shards: data loader →
-  accelerate prepare → AR forward+loss+backward+step → cosine LR
-  schedule → final checkpoint → summary.json. All paths exercised.
+accelerate prepare → AR forward+loss+backward+step → cosine LR
+schedule → final checkpoint → summary.json. All paths exercised.
 - G0 MAE smoke-test deferred to GPU box (needs mamba_ssm).
 
 ### Library reuse (per the user's "use libraries" directive)
 
 - HuggingFace **accelerate** (Accelerator.prepare, accelerator.backward,
-  accelerator.clip_grad_norm_) — already in pyproject [gpu] extras.
+accelerator.clip_grad_norm_) — already in pyproject [gpu] extras.
 - HuggingFace **wandb integration** (mode=online/offline/disabled,
-  config from TrainConfig.to_dict()).
+config from TrainConfig.to_dict()).
 - **MAR** (LTH14/mar) — code-level port of models/diffloss.py.
 - **ARM** (OliverRensu/ARM) — recipe for forward-only AR-Mamba
-  pretraining; we follow their per-token next-patch loss pattern.
+pretraining; we follow their per-token next-patch loss pattern.
 - **MAE** (facebookresearch/mae) — engine_pretrain.py training-loop
-  recipe; AdamW betas, MAE-style absolute LR formula,
-  cosine-warmup-cosine-decay schedule.
+recipe; AdamW betas, MAE-style absolute LR formula,
+cosine-warmup-cosine-decay schedule.
 
 ### Track A code-side fix-ups committed
 
 - `7c20a51` — Track A code drop (tuh.py + paradigms scaffold + ...)
 - `d56c4d5` — exp17 paradigm code drop
 - `064aee7` — TUAB v3.0.1 path-regex fix (the `<subj>/<sess>/`
-  subtree is optional in v3.0.1; subject is now parsed from the
-  filename `<subj>_s###_t###.edf`)
+subtree is optional in v3.0.1; subject is now parsed from the
+filename `<subj>_s###_t###.edf`)
 
 ### Cost summary for this session
 
 - GPU box: ~2 hr × $2.45/hr = **$5** (most of that was rsync / CPU
-  preprocess time; the GPU was used ~10 min total for feature
-  extraction)
+preprocess time; the GPU was used ~10 min total for feature
+extraction)
 - AWS S3: negligible (the new derived/{tuab,tuev}_v2_clean_250hz/
-  prefixes added ~5 GB of parquet to the warehouse; ~$0.10/mo
-  steady-state)
+prefixes added ~5 GB of parquet to the warehouse; ~$0.10/mo
+steady-state)
 - Total: **~$5 of compute credits used** out of the $210k pool.
 - Mac coding: $0.
 
 ### State at session end
 
 - Instance `i-0b8ee8096fd9176c0` stopped 2026-05-04T11:00 UTC. EBS
-  root + venv + repo + IAM creds + new TUH preprocess code preserved.
-  NVMe scratch wiped on stop; the canonical preprocessed shards live
-  in S3 at `s3://eegmodel-warehouse/derived/{tuab,tuev}_v2_clean_250hz/`.
+root + venv + repo + IAM creds + new TUH preprocess code preserved.
+NVMe scratch wiped on stop; the canonical preprocessed shards live
+in S3 at `s3://eegmodel-warehouse/derived/{tuab,tuev}_v2_clean_250hz/`.
 - Mini-experiment 01 fully closed (5/5 GREEN + Protocol A.4 row).
 - exp17 (generative paradigm) code is GPU-ready. Next session needs a
-  multi-GPU node (recommended: p4de.24xlarge or g6.48xlarge) and
-  ~45 H100-hours of compute (= 30 cells × 1.5 H100-h, where cells =
-  3 paradigms × 2 controls × 5 seeds).
+multi-GPU node (recommended: p4de.24xlarge or g6.48xlarge) and
+~45 H100-hours of compute (= 30 cells × 1.5 H100-h, where cells =
+3 paradigms × 2 controls × 5 seeds).
 
 ---
 
@@ -556,152 +669,145 @@ authoring + smoke testing on the local Mac. Bill: $0.
 
 **What landed (per file):**
 
-- **`src/exp03/tuh.py`** (NEW, ~310 LOC) — TUH-EEG ingestion mirror of
-  `hbn.py`'s shape:
+- `**src/exp03/tuh.py`** (NEW, ~310 LOC) — TUH-EEG ingestion mirror of
+`hbn.py`'s shape:
   - Constants: TUAB_VERSION="v3.0.1", TUEV_VERSION="v2.0.1", remote
-    subdirectory map, `nedc-tuh` SSH alias, label name table per the
-    AAREADME (SPSW / GPED / PLED / EYEM / ARTF / BCKG; REC int 1..6
-    → 0-indexed class 0..5).
+  subdirectory map, `nedc-tuh` SSH alias, label name table per the
+  AAREADME (SPSW / GPED / PLED / EYEM / ARTF / BCKG; REC int 1..6
+  → 0-indexed class 0..5).
   - `Recording` dataclass with corpus-specific extras (split, montage,
-    `tuab_label` from path, optional `rec_path` for TUEV).
+  `tuab_label` from path, optional `rec_path` for TUEV).
   - `walk_corpus(local_root, corpus)` → walks the rsync'd local tree
-    and returns Recording's. Path regexes verified against the actual
-    NEDC layouts (TUAB: `edf/{train,eval}/{normal,abnormal}/01_tcp_ar/...`;
-    TUEV: `edf/{train,eval}/<subj>/<rec>.{edf,rec}` flat per-subject).
+  and returns Recording's. Path regexes verified against the actual
+  NEDC layouts (TUAB: `edf/{train,eval}/{normal,abnormal}/01_tcp_ar/...`;
+  TUEV: `edf/{train,eval}/<subj>/<rec>.{edf,rec}` flat per-subject).
   - `parse_rec(rec_path)` → list[RecEvent] from the canonical CSV-like
-    `channel,start_s,end_s,label_int` format. Smoke-tested on a real
-    NEDC sample (`aaaaaaar_00000001.rec`, 384 events, channels 0–21,
-    matches the AAREADME's TCP montage definition).
+  `channel,start_s,end_s,label_int` format. Smoke-tested on a real
+  NEDC sample (`aaaaaaar_00000001.rec`, 384 events, channels 0–21,
+  matches the AAREADME's TCP montage definition).
   - `tuev_window_label(events, win_start, win_seconds)` → int — the
-    per-window argmax-overlap-duration label across all channels. Falls
-    back to BCKG (5) if no events overlap the window. Verified:
-    window [24, 28) on the sample correctly returns EYEM (3) because
-    the lone [26.0, 27.0] EYEM annotation contributes 1.0 s of overlap
-    while no other event types overlap the window.
+  per-window argmax-overlap-duration label across all channels. Falls
+  back to BCKG (5) if no events overlap the window. Verified:
+  window [24, 28) on the sample correctly returns EYEM (3) because
+  the lone [26.0, 27.0] EYEM annotation contributes 1.0 s of overlap
+  while no other event types overlap the window.
   - `load_recording(edf_path, eeg_only=True)` → `(eeg, sr, channel_names)`
-    via MNE; default-filters to `EEG <site>-<REF|LE>` to drop ECG / EMG /
-    PHOTIC / etc. that TUH EDFs ship as extra channels.
+  via MNE; default-filters to `EEG <site>-<REF|LE>` to drop ECG / EMG /
+  PHOTIC / etc. that TUH EDFs ship as extra channels.
   - `rsync_corpus(corpus, local_root, ...)` → wraps `rsync -avL` into a
-    single-call helper used by the CLI's `tuh-rsync`.
-
-- **`src/exp03/storage.py`** (extended) — added:
+  single-call helper used by the CLI's `tuh-rsync`.
+- `**src/exp03/storage.py`** (extended) — added:
   - `raw_tuab` / `raw_tuev` properties pointing to
-    `$EXP03_DATA_ROOT/raw/{tuab,tuev}/`.
+  `$EXP03_DATA_ROOT/raw/{tuab,tuev}/`.
   - `PIPELINE_TUAB_V2_CLEAN = "tuab_v2_clean_250hz"` and
-    `PIPELINE_TUEV_V2_CLEAN = "tuev_v2_clean_250hz"` (both ride the
-    existing `SPEC_V2_CLEAN`).
+  `PIPELINE_TUEV_V2_CLEAN = "tuev_v2_clean_250hz"` (both ride the
+  existing `SPEC_V2_CLEAN`).
   - `ALL_PIPELINES` tuple for "all four" iteration in the CLI.
   - `ensure_dirs` extended to mkdir the new TUH paths.
   - Module docstring updated with a note: raw TUH is **not** mirrored
-    to our S3 warehouse (NEDC's per-application access agreement asks
-    each licensee to keep raw within their own systems and delete it
-    when done; preprocessed parquet is fine because the raw signal is
-    not clinically recoverable from z-scored 4-s float16 windows).
-
-- **`src/exp03/preprocess.py`** (extended) — schema additions, fully
-  backward-compatible with the 24,270 HBN parquet shards already in S3:
+  to our S3 warehouse (NEDC's per-application access agreement asks
+  each licensee to keep raw within their own systems and delete it
+  when done; preprocessed parquet is fine because the raw signal is
+  not clinically recoverable from z-scored 4-s float16 windows).
+- `**src/exp03/preprocess.py`** (extended) — schema additions, fully
+backward-compatible with the 24,270 HBN parquet shards already in S3:
   - New columns: `corpus` (string), `tuab_label` (int8), `tuev_label`
-    (int8), `tuh_split` (string).
+  (int8), `tuh_split` (string).
   - `_FIELD_DEFAULTS` map filled in by `rows_to_parquet_table` so HBN
-    code paths that don't know about TUH labels just leave them blank
-    and the writer drops the right sentinels.
+  code paths that don't know about TUH labels just leave them blank
+  and the writer drops the right sentinels.
   - HBN `cli.preprocess` updated to explicitly tag rows with
-    `corpus="hbn"` (cosmetic — the default would do the right thing,
-    but explicit matches the TUH side).
+  `corpus="hbn"` (cosmetic — the default would do the right thing,
+  but explicit matches the TUH side).
   - Module docstring rewritten with the new corpus-tagged schema layout.
-
-- **`src/exp03/cli.py`** (extended) — two new commands:
+- `**src/exp03/cli.py`** (extended) — two new commands:
   - `exp03 tuh-rsync <corpus> [--version] [--dry-run] [--extra-rsync-args]`
-    wraps `rsync` over the `nedc-tuh` SSH alias to mirror a NEDC corpus
-    version into local NVMe. Includes a sanity-check on the SSH chain
-    and a "use ssh-agent forwarding" note in the help text.
+  wraps `rsync` over the `nedc-tuh` SSH alias to mirror a NEDC corpus
+  version into local NVMe. Includes a sanity-check on the SSH chain
+  and a "use ssh-agent forwarding" note in the help text.
   - `exp03 tuh-preprocess <corpus> [--pipeline v2_clean] [--splits] [--n]`
-    applies `SPEC_V2_CLEAN` to the local TUH tree → parquet shards. Reads
-    `.rec` annotations on TUEV recordings to fill `tuev_label` per window
-    via the same argmax-overlap-duration rule. The `--splits` and `--n`
-    flags exist for smoke-testing on a small slice before the full ingest.
+  applies `SPEC_V2_CLEAN` to the local TUH tree → parquet shards. Reads
+  `.rec` annotations on TUEV recordings to fill `tuev_label` per window
+  via the same argmax-overlap-duration rule. The `--splits` and `--n`
+  flags exist for smoke-testing on a small slice before the full ingest.
   - `sync-derived-up`/`sync-derived-down` now accept four pipeline
-    groups: `all` / `hbn` / `tuh` (and individual names). Default stays
-    at `hbn` to match pre-2026-05-04 behaviour.
+  groups: `all` / `hbn` / `tuh` (and individual names). Default stays
+  at `hbn` to match pre-2026-05-04 behaviour.
   - `exp03 paths` updated to print all four `derived/<pipeline>/` paths
-    plus `raw_tuab` / `raw_tuev`.
-
-- **`src/exp03/eval.py`** (extended, ~330 LOC added) — Protocol A.4 path:
+  plus `raw_tuab` / `raw_tuev`.
+- `**src/exp03/eval.py**` (extended, ~330 LOC added) — Protocol A.4 path:
   - `ExtractedFeaturesTUH` dataclass mirroring `ExtractedFeatures` with
-    TUH-specific label slots (`tuab_label`, `tuev_label`, `tuh_split`).
+  TUH-specific label slots (`tuab_label`, `tuev_label`, `tuh_split`).
   - `extract_features_tuh(model, derived_root, corpus="tuab"|"tuev", ...)`
-    — same zero-copy ListArray signal-extraction path as the HBN
-    extractor (commit `1ef2036`); reads only the TUH-specific columns
-    from parquet so old HBN shards remain untouched.
+  — same zero-copy ListArray signal-extraction path as the HBN
+  extractor (commit `1ef2036`); reads only the TUH-specific columns
+  from parquet so old HBN shards remain untouched.
   - `_split_by_official_or_lnso` — prefers NEDC's official train/eval
-    split for direct literature comparability; LNSO fallback if the
-    official eval set has < 50 windows after subsampling.
+  split for direct literature comparability; LNSO fallback if the
+  official eval set has < 50 windows after subsampling.
   - `run_protocol_a4_tuab(extracted)` → `{tuab_binary_auroc: {point, ci_low_95, ci_high_95}, ...}`
-    via sklearn `LogisticRegression` + 200-bootstrap CI.
+  via sklearn `LogisticRegression` + 200-bootstrap CI.
   - `run_protocol_a4_tuev(extracted)` → 6-class BAC + WF1 (linear probe)
-    + k-NN top-1 (k=5, cosine) with bootstrap CIs.
+    - k-NN top-1 (k=5, cosine) with bootstrap CIs.
   - `run_random_init_probe(...)` (Check D entrypoint) extended with two
-    optional kwargs — `derived_root_tuab` and `derived_root_tuev`. When
-    supplied, runs the A.4 probe on top of the existing HBN A primary
-    and merges the metrics into `result.details["metrics_a4"]`.
-
-- **`src/exp03/sanity.py`** (extended) — Check D's `--derived-root-tuab`,
-  `--derived-root-tuev`, `--tuh-max-subjects`, `--output-json` CLI flags
-  added to the existing `sanity check-d` typer command. The HBN code
-  path is unchanged, so re-running `check-d` without the new flags
-  reproduces the existing 5/5-GREEN result.
-
-- **`scripts/track_a_run_on_gpu_box.sh`** (NEW) — single-command Track A
-  runner for the next GPU session:
+  optional kwargs — `derived_root_tuab` and `derived_root_tuev`. When
+  supplied, runs the A.4 probe on top of the existing HBN A primary
+  and merges the metrics into `result.details["metrics_a4"]`.
+- `**src/exp03/sanity.py**` (extended) — Check D's `--derived-root-tuab`,
+`--derived-root-tuev`, `--tuh-max-subjects`, `--output-json` CLI flags
+added to the existing `sanity check-d` typer command. The HBN code
+path is unchanged, so re-running `check-d` without the new flags
+reproduces the existing 5/5-GREEN result.
+- `**scripts/track_a_run_on_gpu_box.sh**` (NEW) — single-command Track A
+runner for the next GPU session:
   1. SSH access smoke test (rsync TEST file).
   2. `exp03 tuh-rsync tuab` + `tuh-rsync tuev`.
   3. `exp03 tuh-preprocess tuab` + `tuh-preprocess tuev` (v2_clean).
   4. `exp03 sync-derived-up --pipeline tuh`.
   5. `python -m exp03.sanity check-d --derived-root-tuab ... --derived-root-tuev ... --output-json ...`
   6. Renders the populated A.4 floor row to stdout (markdown table) +
-     keeps the full JSON for the audit trail.
+    keeps the full JSON for the audit trail.
   7. Optional S3 sync of the run JSON.
   Idempotent at every step (rsync re-uses, preprocess skips, rclone copy
   is no-op-on-match). Knobs: `TRACK_A_TUH_MAX_SUBJECTS`,
   `TRACK_A_TUH_MAX_PER_SPLIT`, `TRACK_A_SKIP_{RSYNC,PREPROCESS,SYNC}`.
-
-- **`mini_experiments/01_sanity_baselines/results.md`** (extended) —
-  added the "Check D extension — Protocol A.4 floor (secondary, TUH
-  literature-comparable)" section with the experimental setup, the
-  per-window TUEV labelling rationale, an empty results table to be
-  populated by the GPU run, and an anticipated-band comment (TUAB
-  ~ 0.50 chance, TUEV BAC ~ 0.17 chance). Headline summary table got a
-  new row "D.4 — Protocol A.4 floor (TUH secondary): 🟡 PENDING". The
-  open follow-up "Append TUH Protocol A.4 floor numbers when NEDC SFTP
-  host arrives" is now strikethrough'd with a pointer to the new
-  section + the runner script.
+- `**mini_experiments/01_sanity_baselines/results.md**` (extended) —
+added the "Check D extension — Protocol A.4 floor (secondary, TUH
+literature-comparable)" section with the experimental setup, the
+per-window TUEV labelling rationale, an empty results table to be
+populated by the GPU run, and an anticipated-band comment (TUAB
+~ 0.50 chance, TUEV BAC ~ 0.17 chance). Headline summary table got a
+new row "D.4 — Protocol A.4 floor (TUH secondary): 🟡 PENDING". The
+open follow-up "Append TUH Protocol A.4 floor numbers when NEDC SFTP
+host arrives" is now strikethrough'd with a pointer to the new
+section + the runner script.
 
 **Smoke tests passed locally on Mac:**
 
 1. `python -m py_compile` on all 7 touched modules → all OK.
 2. ReadLints on the same 7 files → no errors.
 3. `parse_rec` against the real NEDC sample (`aaaaaaar_00000001.rec`,
-   pulled this morning via the SSH smoke test) → 384 events parsed,
+  pulled this morning via the SSH smoke test) → 384 events parsed,
    class distribution {ARTF: 204, BCKG: 172, EYEM: 8} consistent with
    a typical TUEV recording, channel indices in range 0..21 matching
    the AAREADME's TCP-montage definition.
 4. `tuev_window_label` on the same events → per-window argmax-overlap
-   labelling correctly identifies the EYEM-dominant window at [24, 28)
+  labelling correctly identifies the EYEM-dominant window at [24, 28)
    (one [26.0, 27.0] EYEM annotation, 1 s of overlap, no other event
    types overlap → EYEM wins).
 5. `exp03 paths` → prints all four pipeline directories + raw_tuab/tuev.
 6. `exp03 tuh-rsync --help` and `tuh-preprocess --help` → render with
-   the documented arg / option lists.
+  the documented arg / option lists.
 7. `exp03 sync-derived-up --pipeline {all,hbn,tuh,tuab,tuev}` →
-   resolves to the right pipeline groups.
+  resolves to the right pipeline groups.
 8. Schema round-trip: a TUEV row + an HBN row (HBN row missing the new
-   TUH fields entirely) written to a single parquet via
+  TUH fields entirely) written to a single parquet via
    `rows_to_parquet_table` → reads back with `corpus = ["tuev", "hbn"]`,
    `tuev_label = [5, -1]`, `tuh_split = ["train", ""]`. Old HBN parquet
    shards in S3 remain readable because `extract_features` still
    requests only the original column subset.
 9. `python -m exp03.sanity check-d --help` → surfaces the new
-   `--derived-root-tuab` / `--derived-root-tuev` / `--tuh-max-subjects`
+  `--derived-root-tuab` / `--derived-root-tuev` / `--tuh-max-subjects`
    / `--output-json` flags.
 10. `bash -n scripts/track_a_run_on_gpu_box.sh` → syntax OK.
 
@@ -745,10 +851,11 @@ experiments/exp03_eeg_pretraining/
 ```
 
 Local SSH state (durable, paid for once on 2026-05-04):
+
 - `~/.ssh/config` aliased `nedc-tuh` → `nedc-tuh-eeg@www.isip.piconepress.com`
-  via `~/.ssh/id_ed25519_nedc` (`IdentitiesOnly yes`).
+via `~/.ssh/id_ed25519_nedc` (`IdentitiesOnly yes`).
 - `~/.ssh/known_hosts` pinned with NEDC's ed25519/rsa/ecdsa keys
-  (server is OpenSSH 8.0). First-use prompts no longer fire.
+(server is OpenSSH 8.0). First-use prompts no longer fire.
 
 ---
 
@@ -765,15 +872,17 @@ nedc-tuh-eeg.") pulled cleanly, and a non-recursive listing confirms all
 **seven NEDC TUH-EEG corpora** are exposed to our key (sizes are
 directory entry counts at depth 1, not recording counts):
 
-| corpus path                     | latest version | use in this project              |
-|---------------------------------|----------------|----------------------------------|
-| `data/tuh_eeg/tuh_eeg/`         | v2.0.1         | full TUEG (~26k recordings) — secondary pretraining if HBN→TUH cross-corpus probe is ever wanted |
-| `data/tuh_eeg/tuh_eeg_abnormal/`| v3.0.1         | **TUAB** — Protocol A.4a primary (binary normal/abnormal AUROC) |
-| `data/tuh_eeg/tuh_eeg_events/`  | v2.0.1         | **TUEV** — Protocol A.4b primary (6-class BAC + weighted F1) |
-| `data/tuh_eeg/tuh_eeg_artifact/`|  —             | reference (artifact-detection corpus, not used as eval slot) |
-| `data/tuh_eeg/tuh_eeg_epilepsy/`|  —             | reference (epilepsy detection, not used as eval slot) |
-| `data/tuh_eeg/tuh_eeg_seizure/` |  —             | reference (seizure, not used as eval slot) |
-| `data/tuh_eeg/tuh_eeg_slowing/` |  —             | reference (slowing, not used as eval slot) |
+
+| corpus path                      | latest version | use in this project                                                                              |
+| -------------------------------- | -------------- | ------------------------------------------------------------------------------------------------ |
+| `data/tuh_eeg/tuh_eeg/`          | v2.0.1         | full TUEG (~26k recordings) — secondary pretraining if HBN→TUH cross-corpus probe is ever wanted |
+| `data/tuh_eeg/tuh_eeg_abnormal/` | v3.0.1         | **TUAB** — Protocol A.4a primary (binary normal/abnormal AUROC)                                  |
+| `data/tuh_eeg/tuh_eeg_events/`   | v2.0.1         | **TUEV** — Protocol A.4b primary (6-class BAC + weighted F1)                                     |
+| `data/tuh_eeg/tuh_eeg_artifact/` | —              | reference (artifact-detection corpus, not used as eval slot)                                     |
+| `data/tuh_eeg/tuh_eeg_epilepsy/` | —              | reference (epilepsy detection, not used as eval slot)                                            |
+| `data/tuh_eeg/tuh_eeg_seizure/`  | —              | reference (seizure, not used as eval slot)                                                       |
+| `data/tuh_eeg/tuh_eeg_slowing/`  | —              | reference (slowing, not used as eval slot)                                                       |
+
 
 This unblocks **mini-experiment 01's last open follow-up** ("Append TUH
 Protocol A.4 floor numbers when NEDC SFTP host arrives") and the **§4.3
@@ -783,19 +892,19 @@ the literature-comparable cell vs BENDR / LaBraM / CBraMod / REVE.
 **Local-side changes made this session** (all on the Mac, no GPU spin-up):
 
 1. **SSH config entry** added to `~/.ssh/config` for host alias `nedc-tuh`
-   routing to `nedc-tuh-eeg@www.isip.piconepress.com` via the dedicated
+  routing to `nedc-tuh-eeg@www.isip.piconepress.com` via the dedicated
    `~/.ssh/id_ed25519_nedc` keypair (with `IdentitiesOnly yes` so the
    default `id_ed25519` is never offered). Backup of the prior config at
    `~/.ssh/config.bak.2026-05-04`.
 2. **Host keys pinned** in `~/.ssh/known_hosts` via `ssh-keyscan -t
-   ed25519,rsa,ecdsa www.isip.piconepress.com` (server runs OpenSSH 8.0;
+  ed25519,rsa,ecdsa [[www.isip.piconepress.com`](http://www.isip.piconepress.com`)](http://www.isip.piconepress.com`](http://www.isip.piconepress.com`)) (server runs OpenSSH 8.0;
    ed25519 fingerprint `AAAAC3NzaC1lZDI1NTE5AAAAIBvD55DL9Rlsl9sj3NA86HIke3eHTg2IfsPEUlCDWl+c`).
    Strict host checking now succeeds on first connection without prompts.
 3. **Smoke test**: `rsync -auvxL nedc-tuh:data/tuh_eeg/TEST /tmp/nedc_smoke/`
-   → `sent 42 bytes  received 201 bytes  2430000 bytes/sec`, exit 0.
+  → `sent 42 bytes  received 201 bytes  2430000 bytes/sec`, exit 0.
 4. **Top-level corpus inventory** via `rsync -d --list-only` (above table).
 5. **Reply sent in-thread** (Gmail msg `19df2113fe53d2a7`, thread
-   `19df0fb0965e253e`) confirming the test passed and listing the seven
+  `19df0fb0965e253e`) confirming the test passed and listing the seven
    visible corpora — closes the loop on Joe's "Let us know if there are
    problems" ask.
 
@@ -809,24 +918,24 @@ invisible to future commands — `rsync … nedc-tuh:…` Just Works.
 **Now unblocked (sequenced for the next GPU session):**
 
 1. **Copy the private key** `~/.ssh/id_ed25519_nedc` to the GPU box (or
-   `ssh-add` it locally and use agent-forwarding via `ForwardAgent yes`
+  `ssh-add` it locally and use agent-forwarding via `ForwardAgent yes`
    in the GPU box's SSH config entry — agent-forwarding avoids leaving a
    long-lived private key on a remote NVMe that gets wiped on stop).
    **Recommended: agent-forwarding** so the key never lives on the box;
    if the box is ever compromised, NEDC access is not impacted.
 2. **Pull TUAB v3.0.1** to `/opt/dlami/nvme/eeg/raw/tuab/`:
-   ```bash
+  ```bash
    rsync -avL nedc-tuh:data/tuh_eeg/tuh_eeg_abnormal/v3.0.1/ /opt/dlami/nvme/eeg/raw/tuab/
-   ```
+  ```
    ~50 GB raw, ~25 min on the g5/g6 instance's typical 30-50 MB/s
    download rate.
 3. **Pull TUEV v2.0.1** to `/opt/dlami/nvme/eeg/raw/tuev/`:
-   ```bash
+  ```bash
    rsync -avL nedc-tuh:data/tuh_eeg/tuh_eeg_events/v2.0.1/ /opt/dlami/nvme/eeg/raw/tuev/
-   ```
+  ```
    ~30 GB raw, ~15 min.
 4. **Run the canonical `SPEC_V2_CLEAN`** pipeline (60 Hz notch +
-   0.5–100 Hz Butterworth bandpass + 500→250 Hz polyphase resample +
+  0.5–100 Hz Butterworth bandpass + 500→250 Hz polyphase resample +
    per-channel z-score + ±5σ clip + 4-s windowing + iid expansion). This
    is the literature-comparable preprocessing matching BENDR / LaBraM /
    CBraMod / REVE — **not** `SPEC_MINIMAL` like HBN, because Protocol A.4
@@ -837,9 +946,9 @@ invisible to future commands — `rsync … nedc-tuh:…` Just Works.
    session/recording) — needs a small `src/exp03/tuh.py` ingestion module
    parallel to `hbn.py`.
 5. **Sync derived parquet** to `s3://eegmodel-warehouse/derived/v2_clean_tuh/`
-   (sibling to the existing `derived/hbn_minimal_500hz/` prefix).
+  (sibling to the existing `derived/hbn_minimal_500hz/` prefix).
 6. **Run Check D's frozen-probe pipeline** on TUAB-binary + TUEV-6-class
-   to fill in the secondary "Protocol A.4 floor" row in
+  to fill in the secondary "Protocol A.4 floor" row in
    `mini_experiments/01_sanity_baselines/results.md`. Expected to take
    ~15 min on the g5.8xlarge given the same feature-extraction code path
    as the HBN floor (just different label fields). Closes the only
@@ -866,77 +975,78 @@ proceed with mini-experiment 02 onwards. Full writeup at
 **Headline numbers:**
 
 - **Check A — Loss-at-init**: GREEN. L1=0.81 (theory 0.80, +1.2%), L2=1.02
-  (theory 1.00, +1.9%), InfoNCE=2.08 (theory log(8)=2.08, +0.2%). All
-  within 2% of theory after applying the MAE 2022 zero-init for the
-  reconstruction head.
+(theory 1.00, +1.9%), InfoNCE=2.08 (theory log(8)=2.08, +0.2%). All
+within 2% of theory after applying the MAE 2022 zero-init for the
+reconstruction head.
 - **Check B — Input-independent baseline**: GREEN (multi-seed). 5-seed
-  CI for L1-raw rel improvement = [−20.81%, −6.00%] (mean −13.41%) —
-  entirely below 0, opposite of leak. Single-seed +2.1% from the first
-  run was within optimizer noise, fully resolved by the 5-seed re-run.
+CI for L1-raw rel improvement = [−20.81%, −6.00%] (mean −13.41%) —
+entirely below 0, opposite of leak. Single-seed +2.1% from the first
+run was within optimizer noise, fully resolved by the 5-seed re-run.
 - **Check C — One-batch overfit**: GREEN. Loss 1.90 → 0.014 = 0.73% of
-  init in 1000 steps. Hits the <1% threshold around step 350.
+init in 1000 steps. Hits the <1% threshold around step 350.
 - **Check D — Random-init linear-probe floor**: GREEN. 9720 features
-  extracted from 50 HBN subjects, LNSO 70/30 split. 6-task BAC=0.20
-  (chance 0.17), WF1=0.29, k-NN top-1=0.28; CBCL externalizing R²=−0.05,
-  attention R²=−0.32, attention-binary AUROC=0.43. These are the floor.
+extracted from 50 HBN subjects, LNSO 70/30 split. 6-task BAC=0.20
+(chance 0.17), WF1=0.29, k-NN top-1=0.28; CBCL externalizing R²=−0.05,
+attention R²=−0.32, attention-binary AUROC=0.43. These are the floor.
 - **Check E — Shape-and-mask audit**: GREEN. Every shape matches
-  ModelConfig predictions; 7,202,824 trainable params (close to spec's
-  "≈ 8M"). Anti-batch-leak audit shows non-zero diff under perturbation
-  but explained by mask stochasticity (deterministic-mask follow-up
-  TODO'd, not blocking).
+ModelConfig predictions; 7,202,824 trainable params (close to spec's
+"≈ 8M"). Anti-batch-leak audit shows non-zero diff under perturbation
+but explained by mask stochasticity (deterministic-mask follow-up
+TODO'd, not blocking).
 
 **Files written this session** (~2200 LOC):
+
 - `src/exp03/model.py` — configurable Frontend × Backbone × Decoder ×
-  Mask × PosEmb × Paradigm × Target scaffold. §4.2 default concrete
-  (Conv3 + bidirectional Mamba-2 + 2-layer Mamba-2 decoder + RandomPatch
-  50% mask + sinusoidal pos emb + raw target). All other slots raise
-  NotImplementedError pointing at the mini-experiment that owns them.
+Mask × PosEmb × Paradigm × Target scaffold. §4.2 default concrete
+(Conv3 + bidirectional Mamba-2 + 2-layer Mamba-2 decoder + RandomPatch
+50% mask + sinusoidal pos emb + raw target). All other slots raise
+NotImplementedError pointing at the mini-experiment that owns them.
 - `src/exp03/losses.py` — L1RawLoss, L2RawLoss, MRSTFTLogMagLoss
-  (3-resolution torchaudio Spectrogram), L1PlusMRSTFTLoss (§4.2
-  composite), InfoNCELoss. FSQ/JEPA/HuBERT-K-means stubbed for exp18.
+(3-resolution torchaudio Spectrogram), L1PlusMRSTFTLoss (§4.2
+composite), InfoNCELoss. FSQ/JEPA/HuBERT-K-means stubbed for exp18.
 - `src/exp03/data.py` — vectorised AR(1) + constant + Gaussian
-  synthetic_batch helpers; ParquetWindowDataset IterableDataset for the
-  warehouse shards; single_recording_overfit_batch for Check C.
+synthetic_batch helpers; ParquetWindowDataset IterableDataset for the
+warehouse shards; single_recording_overfit_batch for Check C.
 - `src/exp03/sanity.py` — the 5 Karpathy checks, one function each;
-  multi-seed Check B runner with 95% t-CI verdict; typer CLI.
+multi-seed Check B runner with 95% t-CI verdict; typer CLI.
 - `src/exp03/eval.py` — §4.3 Protocol A frozen-probing suite (LNSO splits,
-  sklearn linear/knn probes, 200-sample bootstrap 95% CIs).
+sklearn linear/knn probes, 200-sample bootstrap 95% CIs).
 - `mini_experiments/01_sanity_baselines/results.md` — full writeup of the
-  5-check verdicts with theory-vs-measured tables, optimizer dynamics
-  interpretation, multi-seed Check B numbers, and provenance/library
-  versions.
+5-check verdicts with theory-vs-measured tables, optimizer dynamics
+interpretation, multi-seed Check B numbers, and provenance/library
+versions.
 
 **Key technical decisions made this session** (auditable for future
 mini-experiments):
 
 1. **MAE recon-head zero-init.** Default PyTorch Linear init gave the
-   recon head output variance σ_r² ≈ 0.4 that pushed L2-loss-at-init to
+  recon head output variance σ_r² ≈ 0.4 that pushed L2-loss-at-init to
    ~1.4 (out of Check A's ±20% tolerance). Applied MAE 2022's explicit
    zero-init (weight ~ N(0, 0.01²), bias = 0). After fix, L2 = 1.02
    (within 2% of theory). This is canonical, not a tolerance hack.
 2. **Check B operational definition: `zero_token_content` flag.** A
-   naive "input = all zeros" run lets `predict zero` be the global
+  naive "input = all zeros" run lets `predict zero` be the global
    optimum (target = input in MAE). Implemented the spec's explicit
    risk-mitigation note "use the same positional embedding the real
    model uses, but zero out all token content" via a forward kwarg.
    Encoder then sees only the pos-emb pattern; target stays the real
    signal. The clean test of input-independence.
 3. **Check C uses L1 + FP32, not the §4.2 composite + bf16.** Composite
-   is dominated by MR-STFT log-eps floor (~98% at init) which is hard
+  is dominated by MR-STFT log-eps floor (~98% at init) which is hard
    to drive to zero in 1000 steps even when overfitting cleanly. bf16
-   + Mamba-2 segsum has known numerical instability. L1-only run
+  - Mamba-2 segsum has known numerical instability. L1-only run
    crashes cleanly to 0.7%. Composite + bf16 run recorded as a known-
    failing diagnostic confirming both issues are real.
 4. **Vectorised AR(1) generator.** Original Python `for t in range(T)`
-   was the dominant bottleneck of Check B (32 000 Python iterations
+  was the dominant bottleneck of Check B (32 000 Python iterations
    per step at B=16). Replaced with truncated impulse-response
    convolution via F.conv1d — ~50x faster.
 5. **Zero-copy parquet signal extraction.** `to_pylist()` on a
-   `list<float16>` column round-trips every element through Python.
+  `list<float16>` column round-trips every element through Python.
    Switched to direct ListArray.values buffer access — ~50x faster
    on the per-shard read step.
 6. **Multi-seed Check B over single-seed.** Single-seed +2.1% L1
-   improvement was within optimizer noise (L1 oscillates 0.79–1.45
+  improvement was within optimizer noise (L1 oscillates 0.79–1.45
    across the run, σ ≈ 17% of mean). 5-seed re-run gave 95% CI
    [−20.81%, −6.00%], entirely below 0 — clearly no leak. Adopted
    the multi-seed gating pattern for Check B going forward.
@@ -944,36 +1054,36 @@ mini-experiments):
 **Infrastructure built this session** (durable, paid for once):
 
 - **Custom AMI `ami-0d17022030a88612e`** (`exp03-base-ubuntu2204-cuda129-2026-05-03`)
-  baked from the EBS root. Future GPU launches in *any* us-west-2 AZ
-  can start from this image, sidestepping the `p4de.24xlarge` capacity
-  hunt that triggered today's downsize. ~$2.50/mo storage cost.
+baked from the EBS root. Future GPU launches in *any* us-west-2 AZ
+can start from this image, sidestepping the `p4de.24xlarge` capacity
+hunt that triggered today's downsize. ~$2.50/mo storage cost.
 - **g5.8xlarge instance type swap.** Today's session ran on g5.8xlarge
-  (1× A10G 24GB, $2.45/hr) instead of the original p4de.24xlarge (8×
-  A100-80GB, $32.77/hr) because (a) p4de capacity was unavailable in
-  us-west-2b at session start, and (b) mini-experiment 01 only ever
-  uses 1 GPU at a time so 7 of the 8 A100s would have been idle. Total
-  session cost: ~$15 instead of ~$130. Switch back to p4de from the
-  AMI when mini-exp 02+ launches and we want all 8 GPUs.
+(1× A10G 24GB, $2.45/hr) instead of the original p4de.24xlarge (8×
+A100-80GB, $32.77/hr) because (a) p4de capacity was unavailable in
+us-west-2b at session start, and (b) mini-experiment 01 only ever
+uses 1 GPU at a time so 7 of the 8 A100s would have been idle. Total
+session cost: ~$15 instead of ~$130. Switch back to p4de from the
+AMI when mini-exp 02+ launches and we want all 8 GPUs.
 - **mamba_ssm 2.3.1 + causal_conv1d 1.6.1 installed** in the venv with
-  `--no-build-isolation`. causal-conv1d compiled for sm_62..sm_120 took
-  ~35 min on first install (uv default arch list); recorded
-  `TORCH_CUDA_ARCH_LIST="8.6"` for any future re-installs to cut to
-  ~5 min. mamba-ssm itself used a pre-built wheel.
+`--no-build-isolation`. causal-conv1d compiled for sm_62..sm_120 took
+~35 min on first install (uv default arch list); recorded
+`TORCH_CUDA_ARCH_LIST="8.6"` for any future re-installs to cut to
+~5 min. mamba-ssm itself used a pre-built wheel.
 
 **Cost summary for this session:**
 
 - ~10 hours × $2.45/hr = ~$25 of GPU compute (incl. install time + 5
-  Check B seeds + Check D feature extraction + idle while writing code).
-- + ~$2.50/mo for AMI storage going forward.
+Check B seeds + Check D feature extraction + idle while writing code).
+- - ~$2.50/mo for AMI storage going forward.
 
 **Follow-ups (not blocking mini-exp 02):**
 
 - Add deterministic-mask path to `RandomPatchMask` so Check E's
-  batch-leak audit can run with mask noise removed.
+batch-leak audit can run with mask noise removed.
 - Re-run Check C with the §4.2 composite + bf16 once Mamba-2 segsum
-  FP-stability is addressed in `03_backbone_ablation`.
+FP-stability is addressed in `03_backbone_ablation`.
 - Append TUH Protocol A.4 floor numbers (TUAB AUROC, TUEV BAC + WF1)
-  when NEDC SFTP host arrives.
+when NEDC SFTP host arrives.
 
 **State of the box at session end:**
 
@@ -1015,52 +1125,50 @@ report with proposed mini-experiments and modifications. Synthesized into:
 
 - **4 new mini-experiments**:
   - **exp17 — Generative paradigm for the Mamba backbone** (MAE vs scan-aligned
-    causal AR vs MAR with diffusion head). Triggered by MAP CVPR 2025 finding
-    that MAE is structurally suboptimal for Mamba; **gates everything downstream
-    of exp03** because our §4.2 default is exactly Mamba+MAE.
+  causal AR vs MAR with diffusion head). Triggered by MAP CVPR 2025 finding
+  that MAE is structurally suboptimal for Mamba; **gates everything downstream
+  of exp03** because our §4.2 default is exactly Mamba+MAE.
   - **exp18 — Reconstruction target** (raw / per-token-normalised raw / latent
-    EMA-target / BioCodec RVQ tokens / HuBERT-iterative-k-means / sparsity-
-    regularised raw). The single biggest lever per cross-modal SSL evidence;
-    BioCodec is open-source and pretrained on TUH-EEG so its RVQ tokens are
-    usable as targets without training a new codec.
+  EMA-target / BioCodec RVQ tokens / HuBERT-iterative-k-means / sparsity-
+  regularised raw). The single biggest lever per cross-modal SSL evidence;
+  BioCodec is open-source and pretrained on TUH-EEG so its RVQ tokens are
+  usable as targets without training a new codec.
   - **exp19 — Decoder design** (depth {1, 2, 4, 8} × type {Mamba-2, Transformer,
-    U-Net SAMBA-style}). MAE 2022 found 1≈8 layers for vision linear probe;
-    VideoMAE inverts; bioFAME inverts again — biosignal-specific verdict
-    unknown.
+  U-Net SAMBA-style}). MAE 2022 found 1≈8 layers for vision linear probe;
+  VideoMAE inverts; bioFAME inverts again — biosignal-specific verdict
+  unknown.
   - **exp20 — Position embedding** (none / sinusoidal / learned absolute /
-    RoPE / REVE-style 4D Fourier). REVE NeurIPS 2025 reports their Fourier-4D
-    dominates learned/MLP alternatives on 10 EEG benchmarks; never tested in
-    other EEG-FMs.
-
+  RoPE / REVE-style 4D Fourier). REVE NeurIPS 2025 reports their Fourier-4D
+  dominates learned/MLP alternatives on 10 EEG benchmarks; never tested in
+  other EEG-FMs.
 - **8 existing mini-experiments modified**:
   - **exp01**: reaffirmed mean-pool (vs CLS) as the default linear-probe
-    representation, citing the audio-SSL probing study finding.
+  representation, citing the audio-SSL probing study finding.
   - **exp02**: bumped F2 SincNet and F4 LEAF/GREEN (complex Gabor) to
-    ★ high-priority cells based on 5+ EEG-specific papers each. F1 revised
-    to "F0 + BlurPool only" (Snake activations removed; see exp12).
+  ★ high-priority cells based on 5+ EEG-specific papers each. F1 revised
+  to "F0 + BlurPool only" (Snake activations removed; see exp12).
   - **exp03**: added **B4 FGNO** (Fourier-space Graph Neural Operator) cell
-    based on NeurIPS 2025 +20 % AUROC vs MAE on neural decoding result.
+  based on NeurIPS 2025 +20 % AUROC vs MAE on neural decoding result.
   - **exp04**: clarified scope vs new exp17 — the framework comparison must
-    be re-anchored to the exp17-winner generative paradigm (G0 MAE / G1 AR /
-    G2 MAR), not assumed to be MAE-baseline.
+  be re-anchored to the exp17-winner generative paradigm (G0 MAE / G1 AR /
+  G2 MAR), not assumed to be MAE-baseline.
   - **exp05**: added Phase B disambiguation (M5, M6) to separate the
-    "auxiliary multi-scale loss" axis from the "multi-rate frontend
-    branches" axis — the MR-HuBERT re-analysis suggests the gain is from
-    auxiliary loss, not multi-rate.
+  "auxiliary multi-scale loss" axis from the "multi-rate frontend
+  branches" axis — the MR-HuBERT re-analysis suggests the gain is from
+  auxiliary loss, not multi-rate.
   - **exp08**: added T6 (Wiener filter MMSE-optimal cell) based on classical
-    signal processing + NeurIPS 2025 "Ditch the Denoiser" empirical finding.
+  signal processing + NeurIPS 2025 "Ditch the Denoiser" empirical finding.
   - **exp10**: rewritten as a 4 × 4 strategy × ratio matrix (16 cells with
-    screening + confirmation protocol). Adds wav2vec span masking, drops
-    SSP (redundant with multi-block), tests mask ratios 50/65/75/85%.
+  screening + confirmation protocol). Adds wav2vec span masking, drops
+  SSP (redundant with multi-block), tests mask ratios 50/65/75/85%.
   - **exp12**: dropped W1 Snake activations (empirically defaults to linear
-    per 2022 follow-up). Added high-γ-attenuation diagnostic to W2 BlurPool.
+  per 2022 follow-up). Added high-γ-attenuation diagnostic to W2 BlurPool.
   - **exp14**: added Evo-style 2-stage context-extension recipe (80 % at
-    short window, 20 % at long window with reduced LR + warmup).
-
+  short window, 20 % at long window with reduced LR + warmup).
 - **Master spec `mini_experiments.md` updated**: §2 list expanded from 16 to
-  20 rows, §3 dependency graph redrawn with new gates and parallels, headline
-  block updated with the design-refresh notes. Total compute budget rose from
-  ~264 H100-hours to ~314 H100-hours (~19 % increase).
+20 rows, §3 dependency graph redrawn with new gates and parallels, headline
+block updated with the design-refresh notes. Total compute budget rose from
+~~264 H100-hours to ~314 H100-hours (~~19 % increase).
 
 **Why this matters.** The single most consequential finding from the research
 is **MAP (Liu & Yi, CVPR 2025, arXiv 2410.00871)**: MAE is the wrong
@@ -1076,30 +1184,31 @@ spending 250+ H100-hours on ablations measured against the wrong baseline.
 **Other notable findings:**
 
 - **Mask ratio is contested at 50 % vs 60 % vs 75 % vs 85 %** in EEG-FM
-  literature; ST-EEGFormer (2025 NeurIPS EEG Challenge winner) used 75 %,
-  consistent with the high-redundancy prediction from VideoMAE that 85–90 %
-  may be optimal for EEG at 500 Hz.
+literature; ST-EEGFormer (2025 NeurIPS EEG Challenge winner) used 75 %,
+consistent with the high-redundancy prediction from VideoMAE that 85–90 %
+may be optimal for EEG at 500 Hz.
 - **Span / multi-block masking universally beats random patch** for
-  correlated 1D signals (speech wav2vec finding, vision I-JEPA finding,
-  TS SAMBA finding all converge).
+correlated 1D signals (speech wav2vec finding, vision I-JEPA finding,
+TS SAMBA finding all converge).
 - **Latent-space targets (I-JEPA, EEG2Rep) and codec-token targets (LaBraM,
-  BioCodec) outperform raw-signal targets** by 5–10 pp linear-probe across
-  modalities. exp18 directly tests this.
+BioCodec) outperform raw-signal targets** by 5–10 pp linear-probe across
+modalities. exp18 directly tests this.
 - **Snake activations empirically default to near-linear** per the 2022
-  follow-up; dropped from exp12. If we want periodic inductive bias,
-  SIREN-style sine activations or DONN are the right alternatives —
-  deferred to a future architecture-only mini-experiment.
+follow-up; dropped from exp12. If we want periodic inductive bias,
+SIREN-style sine activations or DONN are the right alternatives —
+deferred to a future architecture-only mini-experiment.
 - **BlurPool may attenuate high-γ neural content** (30–100 Hz, where motor
-  imagery and gamma-attention modulation live); exp12 W2 now has a
-  high-γ-retention diagnostic that disqualifies the cell if retention drops
-  below 90 %.
+imagery and gamma-attention modulation live); exp12 W2 now has a
+high-γ-retention diagnostic that disqualifies the cell if retention drops
+below 90 %.
 
 **No code or compute was spent on this refresh** — pure design-doc work using
 ~30 minutes of subagent web research. The 50 H100-hour added compute budget
 gets spent only when the affected mini-experiments actually run; if exp17 picks
 G0 MAE, the entire exp04 / exp10 / exp18 / exp19 chain runs roughly as
 originally specified and the design refresh has only added 4 new experiments
-+ surfaced findings rather than invalidating prior work.
+
+- surfaced findings rather than invalidating prior work.
 
 **Files changed:**
 
