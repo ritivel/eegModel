@@ -30,3 +30,4 @@ wandb/
 .env
 .env.*
 .envrc
+eval_runs/

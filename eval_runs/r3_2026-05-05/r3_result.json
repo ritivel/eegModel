@@ -1,0 +1,14 @@
+{
+  "test_cohen_kappa": 0.36122294163717705,
+  "test_bac": 0.5211239203568628,
+  "test_weighted_f1": 0.5091299148284377,
+  "best_val_kappa": 0.35021013965406456,
+  "target_kappa": 0.5222,
+  "delta": 0.16097705836282294,
+  "tolerance": 0.02,
+  "passed": false,
+  "n_train": 6300,
+  "n_val": 1734,
+  "n_test": 1803,
+  "elapsed_s": 855.2176711559296
+}
