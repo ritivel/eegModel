@@ -58,12 +58,18 @@ if [[ "$LIVE" == "[]" ]] || [[ -z "$LIVE" ]]; then
 fi
 
 LIVE_FEE=$(echo "$LIVE" | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['UpfrontFee'])")
-if [[ "$LIVE_FEE" != "$CB_UPFRONT_FEE_USD" ]]; then
+# Compare as floats (AWS returns 4 decimal places, .env may carry 2).
+if ! python3 -c "
+import sys
+env_fee = float('$CB_UPFRONT_FEE_USD')
+aws_fee = float('$LIVE_FEE')
+sys.exit(0 if abs(env_fee - aws_fee) < 0.01 else 1)
+"; then
   echo "WARN: price drifted: env says \$$CB_UPFRONT_FEE_USD, AWS says \$$LIVE_FEE."
   echo "      Aborting. Update .env if the new price is acceptable, then retry."
   exit 3
 fi
-echo "      OK — \$$LIVE_FEE matches .env"
+echo "      OK — \$$LIVE_FEE matches .env (within \$0.01)"
 
 # Hard-confirm gate.
 if [[ $YES -ne 1 ]]; then
