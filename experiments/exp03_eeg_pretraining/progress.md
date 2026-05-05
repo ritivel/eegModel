@@ -3,18 +3,139 @@
 > Same chronological-session-log convention as `experiments/exp02_eeg_ctc/progress.md`.
 > Append at the top; oldest entries at the bottom.
 >
-> **Last refreshed:** 2026-05-05 ~07:15 IST / 01:45 UTC
+> **Last refreshed:** 2026-05-05 ~11:45 IST / 06:15 UTC
+
+---
+
+## 2026-05-05T06:15 UTC (11:45 IST) — exp17 v1.5 killed at 6/10 cells; v1 verdict reproduced byte-for-byte; results synced to Notion
+
+**TL;DR.** The v1.5 sanity check produced its answer at cell 6/10 and was
+killed early to free the Lambda box. The headline question — *does the
+canonical MAR diffusion-batch-mul=4 recipe lift MAR off the v1
+random-init floor or break the noise-twin equality?* — answered itself:
+`**mar_eeg_seed0` and `mar_noise_seed0` produce byte-identical Protocol-A
+eval results across all 8 metrics** (externalizing R²/MAE, attention
+R²/MAE/AUROC, task6_BAC/WF1, knn_top1_task6). Across the 5 EEG seeds,
+`task6_BAC = 0.204 ± 0.005` — exactly on the 0.20 random-init floor. Lift
+from mul=1 → mul=4 is within noise of the v1→v1.5 RidgeCV probe fix. The
+hypothesis "MAR was just undertrained on the diffusion side" is
+falsified. v2 (G3 latent-prediction + 10× data + FT eval + TUAB headline)
+is the only forward path.
+
+### What I did this session
+
+1. **Checked Lambda run health** at `06:13 UTC`: 6 of 10 cells `OK`, 0
+  `FAIL`, currently running `mar_noise_seed1` at step 7400/17500
+   (~7.4 step/s, GPU 0 67% util, 7.1/40 GB VRAM). Watchdog (pid
+   `10081`) alive at 4h 37m elapsed.
+2. **Pulled the 6 completed `summary.json`** files and verified
+  pair-byte equality between `mar_eeg_seed0` and `mar_noise_seed0`:
+   v1 had pair-byte-NEAR equality (Δ ≈ 0.0005 on the 5-seed mean per
+   `results.md` §4); v1.5 at mul=4 makes this byte-EXACT at matched
+   seed. The v1 mechanism — *encoder converges to an input-invariant
+   solution because the diffusion head's ε-prediction objective is
+   satisfied equally well regardless of input* — is more, not less, true
+   with 4× the diffusion-sample budget.
+3. **Killed the run** to save ~$5 + ~2.5 h wall:
+  - `tmux kill-session -t exp17b` (stops the launcher's sequential
+   loop)
+  - `kill -TERM 10081` (post-run watchdog)
+  - `kill -TERM 12037` (the in-flight `mar_noise_seed1` python
+  process)
+  - GPU 0 verified back to 0% util / 0 MiB / no compute apps.
+4. **Preserved the 6 cells to S3** at a new partial-run prefix:
+  ```
+   s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-05T01Z_mar_mul4_partial/
+   ├── exp17_lambda.log
+   ├── mar_eeg_seed0/{summary.json, run.log}
+   ├── mar_eeg_seed1/{summary.json, run.log}
+   ├── mar_eeg_seed2/{summary.json, run.log}
+   ├── mar_eeg_seed3/{summary.json, run.log}
+   ├── mar_eeg_seed4/{summary.json, run.log}
+   └── mar_noise_seed0/{summary.json, run.log}
+  ```
+   Excluded `mar_noise_seed1/` (incomplete) and the `wandb/` +
+   `ckpt_final.pt` blobs (570 MB on disk, not worth re-syncing).
+5. **Updated Notion** under the EEG Foundation Models — Operations Hub:
+  - **Experiment row `exp03/17`** — replaced the blank page body with
+   a comprehensive v1+v1.5 writeup (TL;DR, v1 scoreboard, v1.5
+   per-cell numbers, byte-equality block, four-failure-mode table,
+   decision, cost). `Outcome` and `Methodology` properties also
+   updated.
+  - **Runs DB → new row** `exp17b — MAR mul=4 sanity (Lambda 1×A100, partial 6/10)` with `Status=killed`, `Paradigm=mar`,
+  `Region=lambda`, started/ended timestamps, S3 URI, WandB URL,
+  112,400 steps completed.
+  - **Findings DB → new row** *MAR mul=4 reproduces v1 noise-twin
+  equality verbatim — input-space-recon paradigm dead at 100 h
+  scale*, `Confidence=high`, tags `negative_result + decision`,
+  linked to the Experiment + Run, with explicit Action Items
+  covering the standup-deck speaker note + the v2 launch.
+  - **Events DB → 2 new rows**: `run_ended` for the kill, `finding`
+  for the byte-equality verification. Both linked to the new Run.
+
+### Per-cell numbers (5 EEG + 1 noise)
+
+
+| cell            | step/s | task6_bac           | knn_top1        | ext_r2      | att_auroc       |
+| --------------- | ------ | ------------------- | --------------- | ----------- | --------------- |
+| mar_eeg_seed0   | 7.57   | 0.2007              | 0.2854          | +0.0056     | 0.4355          |
+| mar_eeg_seed1   | 7.65   | 0.2120              | 0.2858          | −0.0056     | 0.3541          |
+| mar_eeg_seed2   | 7.59   | 0.2017              | 0.2594          | −0.1262     | 0.5888          |
+| mar_eeg_seed3   | 7.57   | 0.2063              | 0.2846          | (small-α)   | 0.3603          |
+| mar_eeg_seed4   | 7.57   | 0.1978              | 0.2591          | (small-α)   | 0.4252          |
+| **mean ± std**  | —      | **0.2037 ± 0.0050** | 0.2749 ± 0.0143 | (mixed)     | 0.4328 ± 0.0930 |
+| mar_noise_seed0 | 7.55   | **0.2007**          | **0.2854**      | **+0.0056** | **0.4355**      |
+
+
+Random-init Mamba-2 floor (Track A reference): `task6_BAC = 0.20`,
+`knn_top1 = 0.28`, `ext_R² = −0.05`, `att_AUROC = 0.43`. v1.5
+mar_eeg sits exactly on it.
+
+The `attention_binary_auroc` swing 0.35→0.59 across seeds reflects the
+small-N positive class count (`n_pos_test = 240..880`) on the Protocol-A
+eval split, not encoder variance — flag for the v2 eval refactor.
+
+### Cost / cluster state
+
+- **v1.5 spend**: ~$10.44 (5h 15m on Lambda 1× A100 @ $1.99/hr at
+06:20 UTC). Would have been ~$14 had the full 10 cells run.
+- **Lambda instance `ec4e1556faac4ca1872aea2ae1916505` left running**
+(still billing $1.99/hr). Awaiting decision on teardown vs.
+repurposing for v2 prep.
+- **AWS Mumbai capacity-block** (`cb-06acabbeb025ff1d3` /
+`cr-046dd9b338ce74755` / p5.48xlarge / ap-south-1a) opens at
+17:00 IST 2026-05-05 (5 h 15 min from now); v2 spec already
+scaffolded in `mini_experiments/17_generative_paradigm/README.md §v2-design`.
+
+### Decision
+
+1. **No more MAR variants.** Diffusion-sample budget falsified. Other
+  recipe knobs (loss weighting, schedule, decoder depth) would not
+   address §5.2 / §5.4 from `results.md` and are not worth their
+   compute.
+2. **G0 MAE remains the §4.2 default** for `exp04 / exp10 / exp18 /
+  exp19` (per the v1 decision rule, anchored by-default-not-by-evidence
+   until v2 lands). Reproduce the caveat in every downstream writeup.
+3. **v2 launches on the Mumbai capacity-block week** at 17:00 IST today.
+
+### Files changed this session
+
+No code changes. New artefacts:
+
+- S3 partial-run prefix (above)
+- Notion: 1 page rewrite + 4 new DB rows (1 Run + 1 Finding + 2 Events)
+- THIS progress entry
 
 ---
 
 ## 2026-05-05T01:45 UTC (07:15 IST) — exp17 v1.5 MAR-mul=4 sanity-check launched on Lambda
 
 **TL;DR.** Pure cross-cloud pivot session. Tried to restart the
-us-west-2a p4de instance to do the v2 GPU work — `InsufficientInstance
-Capacity` across all 4 us-west-2 AZs for both p4de and p4d. Pivoted to
+us-west-2a p4de instance to do the v2 GPU work — `InsufficientInstance Capacity` across all 4 us-west-2 AZs for both p4de and p4d. Pivoted to
 **Lambda Cloud 1× A100-40GB in us-east-1** ($1.99/hr, vs AWS p4de
 $27.45/hr per-GPU-hour). 30-minute bootstrap (uv venv + torch 2.8+cu128
-+ mamba_ssm/causal_conv1d sm_80 build + 50-subject HBN sync from S3 +
+
+- mamba_ssm/causal_conv1d sm_80 build + 50-subject HBN sync from S3 +
 new ssh key registered with Lambda API). Smoke test passed cleanly,
 **10 step/s steady state at batch=32 / mul=4**.
 
@@ -32,19 +153,19 @@ recipe.
 ### Lambda setup
 
 - **Instance**: `ec4e1556faac4ca1872aea2ae1916505` at `158.101.125.107`,
-  Lambda 1× A100-SXM4-40GB, us-east-1, $1.99/hr.
+Lambda 1× A100-SXM4-40GB, us-east-1, $1.99/hr.
 - **SSH key**: `~/.ssh/id_ed25519_lambda` (new dedicated key, registered
-  with Lambda via API as `eeg-lambda-mar`). Kept separate from the
-  `~/.ssh/id_ed25519` default + the AWS / NEDC keys for independent
-  rotation.
+with Lambda via API as `eeg-lambda-mar`). Kept separate from the
+`~/.ssh/id_ed25519` default + the AWS / NEDC keys for independent
+rotation.
 - **AWS S3 access**: `eegmodel-instance` IAM keys copied to
-  `~/.aws/credentials` on the Lambda box for HBN parquet sync.
+`~/.aws/credentials` on the Lambda box for HBN parquet sync.
 - **Bootstrap timing**: 30 sec uv install + 35 sec uv venv + torch
-  install + 14 min 15 sec mamba_ssm + causal_conv1d build for sm_80
-  (from-source, with `MAX_JOBS=12 TORCH_CUDA_ARCH_LIST=8.0`) + 5 min
-  50-subject HBN sync from `s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`
-  at ~50 MB/s cross-region (us-west-2 → us-east-1). Total ~25 min,
-  $0.83 of compute.
+install + 14 min 15 sec mamba_ssm + causal_conv1d build for sm_80
+(from-source, with `MAX_JOBS=12 TORCH_CUDA_ARCH_LIST=8.0`) + 5 min
+50-subject HBN sync from `s3://eegmodel-warehouse/derived/hbn_minimal_500hz/`
+at ~50 MB/s cross-region (us-west-2 → us-east-1). Total ~25 min,
+$0.83 of compute.
 
 ### Smoke test (G2 MAR mul=4, 30 steps batch=32 on A100-40GB)
 
@@ -68,18 +189,18 @@ near-identical thanks to better MLP utilisation). Per-cell estimate:
 ### Run in flight
 
 - Launched `bash scripts/launch_exp17_lambda.sh mar` at `01:34:46 UTC`
-  inside tmux session `exp17b`.
+inside tmux session `exp17b`.
 - 10 cells (5 mar_eeg + 5 mar_noise) × 17500 steps × batch 32 ×
-  diffusion_batch_mul=4, all sequential on GPU 0.
-- ETA full completion: ~07:00 UTC (~5–7 h wall-clock from launch).
+diffusion_batch_mul=4, all sequential on GPU 0.
+- ETA full completion: ~~07:00 UTC (~~5–7 h wall-clock from launch).
 - Expected total compute cost: ~$10–14 on Lambda.
 - Wandb online mode this time (key was on the box at launch); runs
-  appear at `https://wandb.ai/ritivel-eeg-ritivel/exp03/` filterable by
-  tag `exp17b` or `exp17_mar_mul4`.
+appear at `https://wandb.ai/ritivel-eeg-ritivel/exp03/` filterable by
+tag `exp17b` or `exp17_mar_mul4`.
 - Post-run watchdog (`/tmp/post_run_watchdog.sh`, pid `10081`) waits
-  for `ALL 10 CELLS COMPLETE`, then runs the summarizer, syncs to
-  `s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-05T01Z_mar_mul4/`,
-  and touches `/tmp/POST_DONE`.
+for `ALL 10 CELLS COMPLETE`, then runs the summarizer, syncs to
+`s3://eegmodel-warehouse/runs/exp03/17_generative_paradigm/2026-05-05T01Z_mar_mul4/`,
+and touches `/tmp/POST_DONE`.
 
 ### Caveat — v2 supersedes this run
 
@@ -95,12 +216,12 @@ fix and reinforces the v2 case.**
 ### AWS state
 
 - `i-06c55554892db26bf` still stopped (us-west-2a). One restart attempt
-  this morning at ~07:00 IST: `InsufficientInstanceCapacity`. Retried
-  fresh launches in 2b/2c/2d for both p4de and p4d — all the same.
-  Will retry every 30 min in the background and resume when capacity
-  returns; AMI re-bake + v2 GPU run still pending on AWS capacity.
+this morning at ~07:00 IST: `InsufficientInstanceCapacity`. Retried
+fresh launches in 2b/2c/2d for both p4de and p4d — all the same.
+Will retry every 30 min in the background and resume when capacity
+returns; AMI re-bake + v2 GPU run still pending on AWS capacity.
 - 192-vCPU quota request still `CASE_OPENED` (filed 2026-04-30, day 5).
-  Once approved, p5.48xlarge (8× H100) becomes an option.
+Once approved, p5.48xlarge (8× H100) becomes an option.
 
 ### Files changed this session
 
@@ -262,7 +383,7 @@ masked positions only.
 - `update_target_encoder_from(model)` momentum-updates the target
 encoder + frontend + pos-emb after each optimizer step.
 
-`build_paradigm("jepa", ...)` factory wired up. `EEGSSLModel.__init_`_
+`build_paradigm("jepa", ...)` factory wired up. `EEGSSLModel.__init`__
 extended to construct the deep-copied target modules when
 `cfg.paradigm.kind == "jepa"`. `EEGSSLModel.forward` extended to
 compute `target_full_features` under `torch.no_grad()` from the target
@@ -735,7 +856,7 @@ backward-compatible with the 24,270 HBN parquet shards already in S3:
   at `hbn` to match pre-2026-05-04 behaviour.
   - `exp03 paths` updated to print all four `derived/<pipeline>/` paths
   plus `raw_tuab` / `raw_tuev`.
-- `**src/exp03/eval.py**` (extended, ~330 LOC added) — Protocol A.4 path:
+- `**src/exp03/eval.py`** (extended, ~330 LOC added) — Protocol A.4 path:
   - `ExtractedFeaturesTUH` dataclass mirroring `ExtractedFeatures` with
   TUH-specific label slots (`tuab_label`, `tuev_label`, `tuh_split`).
   - `extract_features_tuh(model, derived_root, corpus="tuab"|"tuev", ...)`
@@ -753,7 +874,7 @@ backward-compatible with the 24,270 HBN parquet shards already in S3:
   optional kwargs — `derived_root_tuab` and `derived_root_tuev`. When
   supplied, runs the A.4 probe on top of the existing HBN A primary
   and merges the metrics into `result.details["metrics_a4"]`.
-- `**src/exp03/sanity.py**` (extended) — Check D's `--derived-root-tuab`,
+- `**src/exp03/sanity.py`** (extended) — Check D's `--derived-root-tuab`,
 `--derived-root-tuev`, `--tuh-max-subjects`, `--output-json` CLI flags
 added to the existing `sanity check-d` typer command. The HBN code
 path is unchanged, so re-running `check-d` without the new flags
