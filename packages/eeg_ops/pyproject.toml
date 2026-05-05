@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eeg-ops"
+version = "0.1.0"
+description = "Cluster-lifecycle CLI for the eegModel project — wraps SkyPilot for short-term GPU rentals (AWS Capacity Blocks, Lambda, GCP), pre-warms regional S3 mirrors, syncs runs back to the warehouse, and emits CloudWatch billing alarms. The single `eeg-ops` entrypoint replaces the per-region shell-script runbooks under infrastructure/."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pavan Kalyan Tankala" }]
+
+dependencies = [
+  # CLI
+  "typer>=0.12",
+  "rich>=13.7",
+  # AWS
+  "boto3>=1.34",
+  "botocore>=1.34",
+  # Cluster orchestration: native AWS Capacity Block support via `aws.specific_reservations`
+  # (https://docs.skypilot.co/en/stable/reservations/reservations.html). 0.10.x is the line
+  # that ships the multi-cloud capacity-reservation optimizer used here.
+  "skypilot[aws]>=0.10,<0.12",
+  # YAML config patching
+  "ruamel.yaml>=0.18",
+  # Date math for reservation windows (zoneinfo is stdlib but avoids tz drama)
+  "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+# `eeg-ops checkpoint` helpers depend on torch + the S3 PyTorch connector.
+# Install on the GPU box only:  uv pip install -e "packages/eeg_ops[checkpoint]"
+checkpoint = [
+  "torch>=2.8",
+  "s3torchconnector[dcp]>=1.4",
+  "accelerate>=1.0",
+]
+# CloudWatch alarm helpers need extra boto3 services; pinned together.
+observability = [
+  "boto3>=1.34",
+]
+
+[project.scripts]
+eeg-ops = "eeg_ops.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

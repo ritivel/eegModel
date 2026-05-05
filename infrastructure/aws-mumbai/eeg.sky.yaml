@@ -1,0 +1,163 @@
+# eeg.sky.yaml — SkyPilot cluster spec for the AWS Mumbai capacity-block week.
+#
+# This is the replacement for `launch-instance.sh` + `bootstrap.sh`. Launch with:
+#
+#   sky launch -c eeg-mumbai-2026w19 \
+#       --infra aws/ap-south-1 \
+#       --gpus H100:8 \
+#       --retry-until-up \
+#       infrastructure/aws-mumbai/eeg.sky.yaml
+#
+# `--retry-until-up` makes SkyPilot wait until the capacity reservation flips
+# from `payment-pending` to `active`, then launches automatically. No need to
+# poll yourself.
+#
+# The reservation is consumed automatically because we registered its
+# `cr-046dd9b338ce74755` ID in `~/.sky/config.yaml` under
+# `aws.specific_reservations` (see `eeg-ops up` which sets that up).
+#
+# Design notes:
+#   * `setup` runs once per cluster lifetime; it bootstraps uv, the venv, the
+#     editable installs, rclone, and the Mumbai-mirror data pull.
+#   * `run` is a dev-server placeholder. For real training, use:
+#         sky exec eeg-mumbai-2026w19 'exp03 train --paradigm mae --steps 17500 ...'
+#     or push managed jobs with `sky jobs launch ...`.
+#   * `file_mounts` rsyncs your local repo onto the box (excludes data/ via
+#     `.skyignore`), so iteration is "edit on Mac → sky exec → see logs" with
+#     no Docker rebuild.
+#   * Storage `mode: MOUNT` exposes the Mumbai S3 cache as a POSIX path on the
+#     box (via Mountpoint for S3); use it for read-only dataset access if you
+#     don't want to copy parquet to NVMe first.
+#   * Workdir is checked out in /home/ubuntu/eegModel (synced); persistent
+#     run outputs live in /opt/dlami/nvme/eeg/runs/ and stream to S3 via the
+#     `s3torchconnector` checkpoint hook in exp03/train.py.
+
+resources:
+  infra: aws/ap-south-1
+  accelerators: H100:8
+  instance_type: p5.48xlarge
+  disk_size: 200          # root EBS; NVMe is separate, 30 TB at /opt/dlami/nvme
+  image_id: ami-0eb5a4f0d81f671e3   # DLAMI PyTorch 2.7 Ubuntu 22.04 (2026-04-28)
+  use_spot: false
+  # Instance profile created by `eeg-ops iam create --region ap-south-1`.
+  # Grants the box S3 RW on eegmodel-warehouse + eeg-mumbai-139156132535 plus
+  # CloudWatch logs/metrics — no need to scp ~/.aws/credentials onto NVMe.
+  iam_instance_profile_arn: arn:aws:iam::139156132535:instance-profile/eeg-ops-instance-profile
+
+# Sync local working tree to /home/ubuntu/sky_workdir on the box. .skyignore
+# excludes large local dirs (data/, .venv*/, etc.) from the rsync.
+workdir: ../..
+
+file_mounts:
+  # Mount the Mumbai S3 mirror as a POSIX path so torch can stream parquet
+  # without an explicit `aws s3 sync` step. Read-only.
+  /mnt/s3-mumbai:
+    source: s3://eeg-mumbai-139156132535
+    mode: MOUNT
+    store: s3
+
+envs:
+  # Set by `eeg-ops up` from your local shell — populated only if non-empty.
+  WANDB_API_KEY: ""
+  HF_TOKEN: ""
+  EXP03_DATA_ROOT: /opt/dlami/nvme/eeg
+  EXP03_S3_BUCKET: eeg-mumbai-139156132535
+  EXP03_S3_REGION: ap-south-1
+  S3_WAREHOUSE_BUCKET: eegmodel-warehouse
+  S3_WAREHOUSE_REGION: us-west-2
+
+setup: |
+  set -euxo pipefail
+
+  # ---- 1. NVMe data root --------------------------------------------------
+  sudo mkdir -p $EXP03_DATA_ROOT
+  sudo chown -R ubuntu:ubuntu $EXP03_DATA_ROOT
+  mkdir -p $EXP03_DATA_ROOT/{raw/hbn,raw/tuab,raw/tuev,derived,runs,models/hf_cache,scratch}
+
+  # ---- 2. uv (fast pip) ---------------------------------------------------
+  if ! command -v uv >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+  # ---- 3. rclone ----------------------------------------------------------
+  if ! command -v rclone >/dev/null 2>&1; then
+    curl -fsSL https://rclone.org/install.sh | sudo bash
+  fi
+  mkdir -p ~/.config/rclone
+  cat > ~/.config/rclone/rclone.conf <<EOF
+  [s3]
+  type = s3
+  provider = AWS
+  env_auth = true
+  region = $EXP03_S3_REGION
+
+  [s3w]
+  type = s3
+  provider = AWS
+  env_auth = true
+  region = $S3_WAREHOUSE_REGION
+  EOF
+
+  # ---- 4. venv + editable installs ---------------------------------------
+  cd ~/sky_workdir
+  if [[ ! -d .venv ]]; then
+    uv venv .venv --python 3.11
+  fi
+  source .venv/bin/activate
+  uv pip install -e packages/eeg_common
+  uv pip install -e packages/eeg_ops
+  for exp in exp01_eeg_to_text exp02_eeg_ctc exp03_eeg_pretraining; do
+    if [[ -f experiments/$exp/pyproject.toml ]]; then
+      uv pip install -e "experiments/$exp[gpu]" || uv pip install -e experiments/$exp
+    fi
+  done
+  # H100 stack: torch + S3 connector for streaming + DCP checkpoints.
+  uv pip install -U \
+      "torch>=2.8" \
+      "s3torchconnector[dcp]>=1.4" \
+      mamba-ssm causal-conv1d \
+      wandb accelerate || true
+
+  # ---- 5. login services (gated on env vars) ------------------------------
+  if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    wandb login --relogin "$WANDB_API_KEY" || true
+  fi
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
+  fi
+
+  # ---- 6. sync derived shards from Mumbai mirror to NVMe -----------------
+  # Mountpoint is fine for streaming, but for the iid-window training loop
+  # rclone copy → NVMe still wins on throughput (parallel chunks). Idempotent.
+  for pl in hbn_minimal_500hz hbn_v2_clean_250hz tuab_v2_clean_250hz tuev_v2_clean_250hz; do
+    if rclone lsd "s3:eeg-mumbai-139156132535/derived/$pl" >/dev/null 2>&1; then
+      rclone copy "s3:eeg-mumbai-139156132535/derived/$pl" \
+                  "$EXP03_DATA_ROOT/derived/$pl/" \
+                  --transfers 64 --checkers 64 --s3-chunk-size 64M \
+                  --no-check-dest --quiet
+    fi
+  done
+
+  # ---- 7. GPU + import sanity --------------------------------------------
+  nvidia-smi
+  python -c "
+  import torch
+  print(f'torch={torch.__version__} cuda={torch.cuda.is_available()} ngpu={torch.cuda.device_count()}')
+  for i in range(torch.cuda.device_count()):
+      p = torch.cuda.get_device_properties(i)
+      print(f'  cuda:{i}  {p.name}  {p.total_memory/2**30:.1f} GB  cc={p.major}.{p.minor}')
+  import s3torchconnector  # sanity: S3 checkpoint connector is importable
+  "
+
+run: |
+  # Default `sky launch` run — keeps the cluster up so you can `sky exec` real
+  # training jobs into it. For unattended training, replace with the actual
+  # `exp03 train …` command and use `sky jobs launch` for managed retries.
+  source ~/sky_workdir/.venv/bin/activate
+  cd ~/sky_workdir
+  echo "Cluster ready. Run training with:"
+  echo "  sky exec eeg-mumbai-2026w19 'exp03 train --paradigm mae --steps 17500 ...'"
+  echo "Hold the cluster open for interactive use:"
+  sleep infinity

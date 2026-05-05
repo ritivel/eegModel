@@ -1,0 +1,25 @@
+.venv*
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+.git/
+.DS_Store
+
+data/
+*.parquet
+*.pt
+wandb/
+runs/
+standups/
+
+# environment files (never sync to box; secrets live in `envs:` in sky.yaml)
+.env
+.env.*
+!infrastructure/**/.env.example

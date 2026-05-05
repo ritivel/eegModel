@@ -719,6 +719,19 @@ def train_cmd(
                                    help="'online' / 'offline' / 'disabled'"),
     wandb_tags: str = typer.Option("", "--wandb-tags",
                                    help="Comma-separated tags."),
+    # ---- s3 checkpoint mirror -----------------------------------------
+    s3_ckpt_bucket: str = typer.Option(None, "--s3-ckpt-bucket",
+                                       help="If set, every ckpt is also pushed to "
+                                            "s3://<bucket>/<prefix>/ via s3torchconnector. "
+                                            "Recommended for capacity-block runs (so an EndDate "
+                                            "force-stop doesn't lose the latest checkpoint)."),
+    s3_ckpt_prefix: str = typer.Option(None, "--s3-ckpt-prefix",
+                                       help="Default: runs/exp03/<wandb_run_name>"),
+    s3_ckpt_region: str = typer.Option("us-west-2", "--s3-ckpt-region",
+                                       help="Region of --s3-ckpt-bucket; default = warehouse."),
+    s3_ckpt_resume: bool = typer.Option(True, "--s3-ckpt-resume/--no-s3-ckpt-resume",
+                                        help="On train start, resume accelerate state from "
+                                             "s3://<bucket>/<prefix>/accelerate/ if it exists."),
 ):
     """Run one SSL pretraining cell.
 
@@ -780,6 +793,10 @@ def train_cmd(
         wandb_mode=wandb_mode,
         wandb_tags=tuple(t.strip() for t in wandb_tags.split(",") if t.strip()),
         noise_twin=noise_twin,
+        s3_ckpt_bucket=s3_ckpt_bucket,
+        s3_ckpt_prefix=s3_ckpt_prefix,
+        s3_ckpt_region=s3_ckpt_region,
+        s3_ckpt_resume=s3_ckpt_resume,
     )
     console.print(f"[cyan]train cell[/cyan] paradigm={paradigm} seed={seed} "
                   f"steps={max_steps} batch={batch_size} -> {output_dir}")

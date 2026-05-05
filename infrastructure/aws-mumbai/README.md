@@ -1,113 +1,127 @@
 # AWS Mumbai capacity-block week (2026-W19)
 
-A self-contained runbook for the **8× H100 80GB capacity block** reserved in
-`ap-south-1` (Mumbai) from **2026-05-05 17:00 IST → 2026-05-12 17:00 IST**.
+Runbook for the **8× H100 80GB** AWS Capacity Block reserved in `ap-south-1` from
+**2026-05-05 17:00 IST → 2026-05-12 17:00 IST**.
 
-## Why this exists
+> **The shell scripts in this directory are deprecated.** They worked, but
+> we rebuilt the lifecycle as a proper Python package: see
+> [`packages/eeg_ops`](../../packages/eeg_ops/). The scripts remain for
+> reference and as a fallback if SkyPilot ever has an outage.
 
-`scripts/track_a_run_on_gpu_box.sh` was written for one-off Lambda / `g5.8xlarge`
-boxes. The capacity-block week is different in three ways that matter:
+## What we use now
 
-1. **Region is `ap-south-1`, warehouse is `us-west-2`.** Pulling 800 GB of
-   derived parquet across regions during the GPU's billable hour costs ~$60
-   in idle H100 time. We pre-warm a Mumbai mirror instead.
-2. **The GPU is a *reservation*, not on-demand.** You launch *into* a
-   `CapacityReservationId`; if you forget that flag the instance fails with
-   "InsufficientInstanceCapacity" even though you've paid.
-3. **The reservation has a hard end-time.** At `2026-05-12T11:30:00Z` AWS
-   force-stops the instance. Anything still on local NVMe is gone.
-   `teardown.sh` runs ~30 min before that.
+| Concern | Tool | Why |
+|---|---|---|
+| Buy / monitor capacity blocks | `eeg-ops capacity find/buy/status` | Boto3-direct, with state.toml memo and PURCHASE-typed gate. |
+| Launch / SSH / re-attach the cluster | **SkyPilot** ([`eeg.sky.yaml`](./eeg.sky.yaml), invoked via `eeg-ops cluster up`) | Native AWS Capacity Block support since v0.7. `--retry-until-up` waits for the reservation to flip from `payment-pending` → `active` automatically; no need to babysit. Falls back across regions if the reservation expires. |
+| Pre-warm in-region S3 mirror | `eeg-ops data prewarm --region ap-south-1` | Idempotent server-side `aws s3 sync` from `eegmodel-warehouse` (us-west-2) to `eeg-mumbai-139156132535` (ap-south-1) so the GPU box pulls in-region. |
+| Box → S3 credentials | IAM instance profile, created via `eeg-ops iam create --region ap-south-1` | Box has S3 RW + CloudWatch via instance role; no `~/.aws/credentials` copy. |
+| Cost backstop | CloudWatch billing alarm via `eeg-ops alarm create --daily-budget-usd 800` | Alerts if estimated charges blow past the budget. |
+| Checkpoint durability across NVMe wipe | [`s3torchconnector`](https://github.com/awslabs/s3-connector-for-pytorch) via `eeg_ops.checkpoint` + `--s3-ckpt-bucket` flag on `exp03 train` | Each ckpt written direct-to-S3 with the AWS CRT (~40 % faster than EBS+sync); on resume, training transparently restores Accelerate state from S3. EndDate force-stop is now recoverable. |
+| Run-history sync at end of week | `eeg-ops cluster down --sync-runs` (calls `eeg-ops checkpoint sync-runs` on the box) | NVMe → warehouse before terminate. |
 
-## The lifecycle
+## Lifecycle, end-to-end
+
+```bash
+# Local Mac, once per rental
+eeg-ops capacity find  --region ap-south-1 --gpus H100:8 --duration-hours 168
+eeg-ops capacity buy   cb-xxx --region ap-south-1 --expected-fee 5285.95
+eeg-ops iam create     --region ap-south-1
+eeg-ops alarm create   --region ap-south-1 --daily-budget-usd 800
+eeg-ops data prewarm   --region ap-south-1                # ~30 min for 800 GB
+
+# Local Mac, at reservation start time (or any time during the window)
+eeg-ops cluster up    --yaml infrastructure/aws-mumbai/eeg.sky.yaml \
+                      --name eeg-mumbai-2026w19
+
+# After cluster is up, run training jobs
+eeg-ops cluster exec 'exp03 train --paradigm mar --steps 17500 \
+                       --wandb-run-name exp17-g2-seed0 \
+                       --s3-ckpt-bucket eegmodel-warehouse \
+                       --s3-ckpt-prefix runs/exp03/exp17-g2-seed0'
+
+# Set a calendar reminder for T+167h
+eeg-ops cluster down  --name eeg-mumbai-2026w19 --sync-runs
+```
+
+## What the SkyPilot task YAML does
+
+[`eeg.sky.yaml`](./eeg.sky.yaml) describes the full cluster:
+
+- **`resources`** — `p5.48xlarge` in `ap-south-1`, the right DLAMI, the IAM
+  instance profile.
+- **`workdir: ../..`** — your local repo gets rsync'd to
+  `/home/ubuntu/sky_workdir` on the box. Edit on Mac, `sky exec` to apply.
+- **`file_mounts`** — `/mnt/s3-mumbai` is the regional cache bucket exposed
+  via Mountpoint for S3 (POSIX read-through cache; alternative to copying
+  parquet to NVMe).
+- **`envs`** — `WANDB_API_KEY` and `HF_TOKEN` are forwarded from your local
+  shell at launch time.
+- **`setup`** — runs once per cluster lifetime. Installs uv, the venv,
+  editable installs of all four packages (`eeg_common`, `eeg_ops`,
+  `exp01-03`), `mamba-ssm`, `s3torchconnector[dcp]`, `wandb`, `accelerate`.
+  Then `rclone copy`s the in-region S3 mirror to NVMe at full bandwidth.
+- **`run`** — keeps the cluster up so you can `sky exec` into it for
+  interactive runs, or push managed jobs.
+
+## Storage diagram (final, as deployed)
 
 ```
-T-9h ── purchase-capacity-block.sh   ── irreversible $5,285.95 charge
-T-1h ── prewarm-data.sh               ── 800 GB warehouse → Mumbai mirror (run earlier; ~30-60 min)
-T+0  ── launch-instance.sh            ── boot p5.48xlarge into the reservation
-T+5m ── ssh + bootstrap.sh            ── repo clone + uv install + sync-derived-down (in-region!)
-T+15m── exp03 train ...               ── you're back to your normal workflow
-…
-T+167h ── teardown.sh                 ── sync runs/ to warehouse, save logs, terminate
-T+168h ── reservation force-stops     ── if teardown didn't run, NVMe is gone
+local Mac
+  ~/.config/eeg-ops/state.toml              ← reservation IDs, cluster name
+  ~/.ssh/eeg-mumbai-2026w19.pem             ← (legacy fallback if you bypass sky)
+  ~/.sky/config.yaml                        ← aws.specific_reservations: [cr-…]
+  /Users/.../eegModel                       ← the repo
+
+       ↓ sky launch (workdir rsync) + IAM instance profile
+
+GPU box (p5.48xlarge in ap-south-1a)
+  /home/ubuntu/sky_workdir/                 ← editable repo
+  /home/ubuntu/sky_workdir/.venv/           ← editable installs
+  /opt/dlami/nvme/eeg/                      ← 30 TB local NVMe
+    derived/<pipeline>/                     ← rcloned from Mumbai mirror
+    runs/<exp>/<id>/                        ← live training outputs
+  /mnt/s3-mumbai/                           ← Mountpoint of S3 (alt POSIX path)
+
+       ↓ s3torchconnector during training (every ckpt_every steps)
+       ↓ rclone at end of week (cluster down --sync-runs)
+
+S3 (us-west-2 — durable warehouse)
+  s3://eegmodel-warehouse/
+    derived/<pipeline>/                     ← canonical preprocessed shards
+    runs/exp03/<run_id>/                    ← all checkpoints for this run
+      ckpt_step{N}.pt                       ← single-file mirror via S3CheckpointSink
+      accelerate/                           ← resume-state synced via accelerate hook
+    models/hf_cache/
+
+S3 (ap-south-1 — this-week regional cache)
+  s3://eeg-mumbai-139156132535/
+    derived/<pipeline>/                     ← refreshed by `eeg-ops data prewarm`
+                                              (one shot per rental)
 ```
+
+## Reproducing the week's outcomes after the cluster terminates
+
+Everything that matters is in `s3://eegmodel-warehouse/runs/exp03/`. If a
+future cluster has the same `s3-ckpt-bucket`/`s3-ckpt-prefix`,
+`exp03 train` will resume mid-step from S3. To re-launch on a different
+provider, change `infra:` in `eeg.sky.yaml` (e.g. `lambda` or `gcp`),
+re-run `eeg-ops cluster up`, and SkyPilot brings you up there with the
+same code and same data.
 
 ## Files in this directory
 
-| File | When to run | Cost impact |
+| File | Purpose | Status |
 |---|---|---|
-| `.env`              | source on local Mac (created from `.env.example`)   | — |
-| `purchase-capacity-block.sh` | once, ~9 h before T+0           | **$5,285.95 non-refundable** |
-| `prewarm-data.sh`   | once, hours before T+0                              | ~$16 transfer + ~$5/wk Mumbai S3 |
-| `launch-instance.sh`| at T+0 (or any time in the 168 h window)            | already paid |
-| `bootstrap.sh`      | runs on the GPU box once at first SSH               | — |
-| `monitor.sh`        | local — shows instance state, h remaining, $/h burn | — |
-| `teardown.sh`       | at T+167h (set a calendar reminder)                 | — |
+| `README.md` | this file | live |
+| `eeg.sky.yaml` | SkyPilot task spec | live (canonical entrypoint) |
+| `.env`, `.env.example` | per-region IDs (legacy; superseded by `state.toml`) | reference |
+| `purchase-capacity-block.sh` | shell version of `eeg-ops capacity buy` | deprecated |
+| `prewarm-data.sh` | shell version of `eeg-ops data prewarm` | deprecated |
+| `launch-instance.sh` | shell version of `eeg-ops cluster up` | deprecated |
+| `bootstrap.sh` | shell version of the SkyPilot YAML's `setup` block | deprecated |
+| `monitor.sh` | shell version of `eeg-ops capacity status` | deprecated |
+| `teardown.sh` | shell version of `eeg-ops cluster down --sync-runs` | deprecated |
 
-## What's where (storage map for the week)
-
-```
-local Mac ──────────────────────────────────────────────────────────┐
-  ~/.ssh/eeg-mumbai-2026w19.pem    SSH key, ed25519                  │
-  /Users/.../eegModel              your working repo, git main       │
-  /tmp/eeg-mumbai-sync.log         pre-warm progress                 │
-                                                                     │
-                                          ┌──────────────────────────┘
-                                          │ ssh -A
-                                          ▼
-GPU box (p5.48xlarge, ap-south-1a) ────────────────────────────────┐
-  /opt/dlami/nvme/eeg/                                              │
-    raw/hbn/                       not here — pull from FCP-INDI    │
-    raw/{tuab,tuev}/               not here — rsync from NEDC if    │
-                                   needed (already warehoused-      │
-                                   derived covers Protocol A.4)     │
-    derived/                       <─ pulled from Mumbai mirror     │
-      hbn_minimal_500hz/                                             │
-      hbn_v2_clean_250hz/                                            │
-      tuab_v2_clean_250hz/                                           │
-      tuev_v2_clean_250hz/                                           │
-    runs/<exp>/<id>/               this week's outputs              │
-    models/hf_cache/               HF model downloads                │
-                                                                     │
-                                          ┌──────────────────────────┘
-                                          │  rclone, in-region, fast
-                                          ▼
-S3 mirror (ap-south-1) ────────────────────────────────────────────┐
-  s3://eeg-mumbai-139156132535/                                     │
-    derived/                       refreshed by prewarm-data.sh     │
-    runs/exp03/                    push here from teardown.sh       │
-                                                                     │
-                                          ┌──────────────────────────┘
-                                          │  one-shot replication at end
-                                          ▼
-S3 warehouse (us-west-2, persistent) ──────────────────────────────┐
-  s3://eegmodel-warehouse/                                          │
-    derived/                       canonical preprocessed shards    │
-    runs/exp03/                    canonical run history            │
-    models/hf_cache/               cached HF weights                │
-─────────────────────────────────────────────────────────────────── ┘
-```
-
-The Mumbai bucket is **a temporary cache for this week**. After
-`teardown.sh` syncs runs/ back to `eegmodel-warehouse`, the Mumbai bucket
-can be emptied and deleted to stop the ~$5/week storage charge. We keep it
-through the week in case a debug session needs to relaunch.
-
-## "Why didn't you use FSx Lustre / SkyPilot / a baked AMI?"
-
-Considered, deferred:
-
-- **FSx Lustre** — adds an AZ-pinned filesystem, $40+ for the week, requires
-  VPC plumbing. The `p5.48xlarge` already ships with **30 TB of local NVMe**
-  (`/opt/dlami/nvme/`), which is bigger than your entire derived corpus and
-  faster than Lustre Scratch_2 for sequential parquet reads. Use NVMe.
-- **SkyPilot** — its strength is multi-cloud auto-failover. You bought a
-  single-region reservation; falling over to GCP is moot. Revisit if you
-  start running multi-week jobs across providers.
-- **Baked AMI / ECR Docker image** — `bootstrap.sh` is currently <10 min on
-  the DLAMI. Bake one if it grows past 20 min or you start launching daily.
-
-## Going from this week to the next
-
-When you grab the next reservation, the only files that change are
-`.env` (new offering ID, new dates, new SG/keypair name, new bucket) and
-`launch-instance.sh`'s subnet ID if the AZ shifts. Everything else is reusable.
+The shell scripts will be deleted once the SkyPilot path has been exercised
+end-to-end on a real run.

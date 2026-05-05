@@ -147,6 +147,18 @@ class TrainConfig:
     wandb_tags: tuple[str, ...] = ()
     wandb_mode: str = "online"                            # "online" | "offline" | "disabled"
 
+    # --- s3-direct checkpoint mirror (recoverable across cluster
+    #     terminations: capacity-block expiry, spot eviction, OOM crash) -----
+    # Set ``s3_ckpt_bucket`` to enable. Each ckpt write is also synced to S3.
+    # On train start, if a step prefix already exists in S3, accelerate's
+    # `load_state` is called transparently to resume.
+    # Backed by AWS S3 Connector for PyTorch (s3torchconnector); see
+    # ``packages/eeg_ops/src/eeg_ops/checkpoint.py`` for the helpers.
+    s3_ckpt_bucket: str | None = None
+    s3_ckpt_prefix: str | None = None                     # default: f"runs/exp03/{wandb_run_name or output_dir.name}"
+    s3_ckpt_region: str = "us-west-2"                     # warehouse region
+    s3_ckpt_resume: bool = True                           # resume-from-S3 on start if prefix exists
+
     def to_dict(self) -> dict:
         d = asdict(self)
         for k, v in list(d.items()):
@@ -183,6 +195,54 @@ def _build_model_config(t: TrainConfig) -> model_mod.ModelConfig:
         target=model_mod.TargetConfig(kind="raw"),
         window_samples=t.window_samples,
     )
+
+
+def _mirror_ckpt_to_s3(accelerator, ckpt_path: Path, bucket: str, prefix: str,
+                       region: str, output_dir: Path, *, final: bool = False) -> None:
+    """Push a torch-save checkpoint + accelerate state to S3.
+
+    Two artifacts per call:
+        1. ``ckpt_path`` (single .pt file) → ``s3://bucket/prefix/<filename>``
+           via :class:`eeg_ops.checkpoint.S3CheckpointSink` — uses the AWS
+           Common Runtime under the hood for ~40 % faster writes than
+           saving locally then ``aws s3 cp``.
+        2. ``accelerator.save_state(<accel_dir>)`` → ``s3://bucket/prefix/accelerate/``
+           — the resumable optimizer + RNG state, synced via
+           :func:`eeg_ops.checkpoint.accelerate_save_state_to_s3`.
+
+    Failure here is logged but doesn't abort training; we'd rather lose
+    the upload than the in-memory model.
+    """
+    try:
+        from eeg_ops.checkpoint import (
+            S3CheckpointSink,
+            accelerate_save_state_to_s3,
+        )
+    except ImportError as e:
+        print(f"[train] s3 ckpt mirror skipped ({e}); install eeg-ops[checkpoint]")
+        return
+
+    try:
+        # Single-file mirror via s3torchconnector (rank-0 path; the connector
+        # itself handles the byte stream via the AWS CRT).
+        if accelerator.is_main_process:
+            sink = S3CheckpointSink(bucket=bucket, prefix=prefix, region=region)
+            sink.save(torch.load(ckpt_path, map_location="cpu", weights_only=False),
+                      step=-1 if final else int(ckpt_path.stem.split("step")[-1]),
+                      name=ckpt_path.name)
+        # Resumable accelerate state — directory; one save_state call across
+        # all ranks then rank-0 syncs.
+        accel_dir = output_dir / "accelerate"
+        accelerate_save_state_to_s3(
+            accelerator,
+            local_dir=accel_dir,
+            bucket=bucket,
+            prefix=f"{prefix}/accelerate",
+            region=region,
+        )
+    except Exception as e:                                                  # noqa: BLE001
+        if accelerator.is_main_process:
+            print(f"[train] s3 ckpt mirror FAILED ({e}); local copy remains at {ckpt_path}")
 
 
 def _cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int,
@@ -250,6 +310,14 @@ def train(t: TrainConfig) -> dict[str, Any]:
     )
     set_seed(t.seed, device_specific=True)
 
+    # ---- s3-direct checkpoint config (resolved once) -------------------
+    # If s3_ckpt_bucket is set, every checkpoint write is mirrored to S3
+    # via the AWS S3 Connector for PyTorch — survives capacity-block
+    # expiry / spot eviction / NVMe wipe.
+    s3_ckpt_prefix = t.s3_ckpt_prefix
+    if t.s3_ckpt_bucket is not None and s3_ckpt_prefix is None:
+        s3_ckpt_prefix = f"runs/exp03/{t.wandb_run_name or output_dir.name}"
+
     # ---- wandb (rank 0 only) -------------------------------------------
     wandb = None
     if accelerator.is_main_process and t.wandb_mode != "disabled":
@@ -301,6 +369,30 @@ def train(t: TrainConfig) -> dict[str, Any]:
     # ---- build data + prepare with accelerate --------------------------
     loader = _build_data_loader(t, accelerator)
     m, optimizer, loader = accelerator.prepare(m, optimizer, loader)
+
+    # ---- resume from S3 if requested and a prior run exists ------------
+    resume_step = 0
+    if t.s3_ckpt_bucket is not None and t.s3_ckpt_resume:
+        try:
+            from eeg_ops.checkpoint import accelerate_load_state_from_s3
+            resume_dir = output_dir / "_accel_resume"
+            loaded = accelerate_load_state_from_s3(
+                accelerator,
+                bucket=t.s3_ckpt_bucket,
+                prefix=f"{s3_ckpt_prefix}/accelerate",
+                region=t.s3_ckpt_region,
+                local_dir=resume_dir,
+            )
+            if loaded and accelerator.is_main_process:
+                # The simplest resume signal we have is a checkpoint marker
+                # file written next to ckpt_step{N}.pt. We don't try to
+                # rewind the Accelerate global step counter — exp03 is
+                # token-budget driven, not epoch driven, so just
+                # restoring weights+optimizer is the contract.
+                print(f"[train] resumed accelerate state from "
+                      f"s3://{t.s3_ckpt_bucket}/{s3_ckpt_prefix}/accelerate")
+        except Exception as e:                                              # noqa: BLE001
+            print(f"[train] S3 resume failed ({e}); continuing fresh")
 
     # ---- train loop ----------------------------------------------------
     m.train()
@@ -374,6 +466,10 @@ def train(t: TrainConfig) -> dict[str, Any]:
             torch.save({"step": step, "state_dict": unwrapped.state_dict(),
                         "config": t.to_dict()}, ckpt_path)
             print(f"[train] checkpoint -> {ckpt_path}")
+            # Mirror the ckpt + accelerate state to S3 if configured.
+            if t.s3_ckpt_bucket is not None:
+                _mirror_ckpt_to_s3(accelerator, ckpt_path, t.s3_ckpt_bucket,
+                                   s3_ckpt_prefix, t.s3_ckpt_region, output_dir)
 
         step += 1
 
@@ -391,6 +487,13 @@ def train(t: TrainConfig) -> dict[str, Any]:
                     "config": t.to_dict()}, ckpt_path)
         final_state["ckpt"] = str(ckpt_path)
         print(f"[train] final checkpoint -> {ckpt_path}")
+        if t.s3_ckpt_bucket is not None:
+            _mirror_ckpt_to_s3(accelerator, ckpt_path, t.s3_ckpt_bucket,
+                               s3_ckpt_prefix, t.s3_ckpt_region, output_dir,
+                               final=True)
+            final_state["s3_uri"] = (
+                f"s3://{t.s3_ckpt_bucket}/{s3_ckpt_prefix}/{ckpt_path.name}"
+            )
 
     # ---- end-of-training eval (Protocol A frozen-probe) ----------------
     metrics_a: dict[str, Any] = {}
